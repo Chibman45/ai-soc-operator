@@ -1,0 +1,57 @@
+{
+  "rule": {
+    "id": "100201",
+    "name": "Brute Force Detection",
+    "level": 12,
+    "description": "Multiple failed login attempts followed by successful login from external IP",
+    "groups": ["authentication", " brute_force", "sshd"],
+    "firedtimes": 3,
+    "mail": true
+  },
+  "agent": {
+    "id": "003",
+    "name": "web-server-01",
+    "ip": "10.0.1.50",
+    "os": {
+      "name": "Ubuntu",
+      "version": "22.04"
+    }
+  },
+  "source": {
+    "ip": "203.0.113.42",
+    "geoip": {
+      "country_code": "RU",
+      "city_name": "Moscow"
+    }
+  },
+  "user": {
+    "name": "admin",
+    "email": "admin@corp.com"
+  },
+  "data": {
+    "src_ip": "203.0.113.42",
+    "dst_ip": "10.0.1.50",
+    "src_port": 44832,
+    "dst_port": 22,
+    "protocol": "tcp"
+  },
+  "timestamp": "2026-07-17T08:45:12.345Z",
+  "mitre": {
+    "techniques": ["T1110", "T1078"],
+    "tactics": ["credential-access", "initial-access"]
+  },
+  "tags": ["authentication", "brute-force", "ssh", "external-ip"],
+  "previous_login": {
+    "timestamp": "2026-07-16T14:22:00Z",
+    "source_ip": "10.0.0.15",
+    "successful": true,
+    "location": "office"
+  },
+  "failed_attempts": {
+    "count": 15,
+    "time_window_minutes": 5,
+    "first_attempt": "2026-07-17T08:40:00Z",
+    "last_failed": "2026-07-17T08:44:58Z",
+    "successful_login": "2026-07-17T08:45:12Z"
+  }
+}
