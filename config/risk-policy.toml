@@ -1,0 +1,93 @@
+# AI SOC Operator — Risk Policy
+# Defines risk tiers and categories for action classification.
+
+version = 1
+
+[forbidden_commands]
+# Commands that are never allowed through the playbook runner
+commands = [
+  "bash", "sh", "zsh", "node", "perl", "ruby", "python", "python3",
+  "powershell", "pwsh", "shred", "wipefs", "mkfs", "fdisk", "parted",
+]
+
+[forbidden_argument_sequences]
+# Argument patterns that are always blocked
+patterns = [
+  "rm -rf /",
+  "rm -rf -- /",
+  "dd if=",
+  "history -c",
+]
+
+[tiers]
+local_read_only = 0
+local_analysis = 1
+active_discovery = 2
+intrusive_validation = 3
+forbidden = 4
+
+[categories.passive]
+tier = 0
+scope_required = false
+snapshot_required = false
+approval_required = false
+
+[categories.local_analysis]
+tier = 1
+scope_required = false
+snapshot_required = false
+approval_required = false
+
+[categories.active_discovery]
+tier = 2
+scope_required = true
+snapshot_required = false
+approval_required = true
+approval_token_prefix = "RUN"
+
+[categories.online_research]
+tier = 2
+scope_required = false
+snapshot_required = false
+approval_required = true
+approval_token_prefix = "ONLINE"
+
+[categories.online_active_testing]
+tier = 3
+scope_required = true
+snapshot_required = true
+approval_required = true
+approval_token_prefix = "REMOTE-ACTION"
+engagement_rule = "online_active_testing"
+
+[categories.credential_testing]
+tier = 3
+scope_required = true
+snapshot_required = true
+approval_required = true
+approval_token_prefix = "ELEVATED"
+engagement_rule = "credential_testing"
+
+[categories.exploitation]
+tier = 3
+scope_required = true
+snapshot_required = true
+approval_required = true
+approval_token_prefix = "ELEVATED"
+engagement_rule = "exploitation"
+
+[categories.system_change]
+tier = 3
+scope_required = true
+snapshot_required = true
+approval_required = true
+approval_token_prefix = "ELEVATED"
+engagement_rule = "system_changes"
+
+[categories.destructive]
+tier = 4
+scope_required = true
+snapshot_required = true
+approval_required = true
+approval_token_prefix = "DESTROY"
+engagement_rule = "data_destruction"

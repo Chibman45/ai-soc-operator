@@ -1,0 +1,130 @@
+id: identity-compromise-v1
+name: Identity Compromise Triage
+version: 1
+description: >
+  Response playbook for suspected credential compromise,
+  unauthorized access, or identity-based attack patterns.
+  Covers brute force, credential stuffing, impossible travel,
+  and valid accounts abuse.
+
+triggers:
+  - alert_rule: "Brute Force Detection"
+  - alert_rule: "Impossible Travel"
+  - alert_rule: "Multiple Failed Logins"
+  - alert_rule: "Suspicious Authentication"
+  - mitre_technique: "T1078"
+  - mitre_technique: "T1110"
+  - mitre_technique: "T1557"
+  - tags: ["identity", "credential", "auth-anomaly", "brute-force", "password-spray"]
+
+inputs:
+  - name: alert
+    required: true
+  - name: observables
+    required: true
+    default: []
+  - name: host_context
+    required: false
+  - name: user_context
+    required: false
+
+steps:
+  - id: classify
+    type: llm
+    prompt: >
+      Analyze this security alert and classify the incident.
+      Extract ALL indicators of compromise (IOCs): IPs, usernames,
+      hostnames, file hashes, domains, timestamps.
+      Determine:
+      1. Incident type (brute-force, credential-stuffing, impossible-travel, valid-accounts, unknown)
+      2. Confidence level (low, medium, high)
+      3. False positive probability (0.0-1.0)
+      4. Severity (info, low, medium, high, critical)
+      Return structured JSON with: incident_type, confidence, false_positive_probability, severity, iocs[], summary.
+
+  - id: check_false_positive
+    type: rule
+    when:
+      condition: "classify.false_positive_probability > 0.7"
+    action: skip_to
+    target: generate_report
+    comment: "Likely false positive — skip enrichment and case creation"
+
+  - id: enrich
+    type: toolchain
+    description: "Enrich all extracted IOCs through threat intelligence platforms."
+    run:
+      - tool: virustotal
+        operation: "{ioc.type}"
+        target: "{ioc.value}"
+        condition: "{ioc.type in ['ip', 'domain', 'hash', 'url']}"
+      - tool: abuseipdb
+        operation: check
+        target: "{ioc.value}"
+        condition: "{ioc.type == 'ip'}"
+      - tool: shodan
+        operation: host
+        target: "{ioc.value}"
+        condition: "{ioc.type == 'ip'}"
+    outputs:
+      - enriched_iocs
+      - threat_score
+
+  - id: map_mitre
+    type: mitre_mapping
+    description: "Map observed behavior to MITRE ATT&CK techniques."
+    input: "{classify.iocs}"
+    outputs:
+      - techniques
+      - tactics
+
+  - id: decide
+    type: llm
+    prompt: >
+      Based on the classification, enrichment results, and MITRE ATT&CK mapping,
+      produce an analyst summary with:
+      1. One-paragraph incident narrative
+      2. Severity rating (info/low/medium/high/critical)
+      3. List of affected assets (users, hosts, IPs)
+      4. Containment recommendations (what to do now)
+      5. Business impact assessment
+      6. Recommended next steps for the response team
+      Be specific and actionable. Reference actual IOCs and enrichment data.
+
+  - id: write_case
+    type: thehive
+    action: create_or_update_case
+    inputs:
+      title: "{classify.incident_type} — {alert.rule.name}"
+      severity: "{decide.severity}"
+      tags: "{map_mitre.techniques}"
+      description: "{decide.summary}"
+      observables: "{enrich.enriched_iocs}"
+
+  - id: attach_iocs
+    type: thehive
+    action: add_observables
+    case_id: "{write_case.case_id}"
+    observables: "{enrich.enriched_iocs}"
+
+  - id: case_comment
+    type: thehive
+    action: add_comment
+    case_id: "{write_case.case_id}"
+    message: "{decide.summary}"
+
+  - id: generate_report
+    type: report
+    report_type: soc
+    session: "{session.id}"
+
+  - id: escalate
+    type: approval
+    when:
+      condition: "decide.severity in ['high', 'critical']"
+    actions:
+      - isolate_host
+      - disable_account
+      - reset_credentials
+    approver: "senior_analyst"
+    comment: "High/critical severity — requires human approval for containment actions"

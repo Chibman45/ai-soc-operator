@@ -1,0 +1,42 @@
+# AI SOC Operator — Scope Configuration
+# Define authorized targets for active operations.
+# Edit this file before any active scanning or testing.
+
+# Allowed hosts (IP addresses)
+allowed_hosts = [
+  # "192.168.1.0",
+  # "10.0.0.1",
+]
+
+# Allowed CIDR ranges
+allowed_cidrs = [
+  # "192.168.1.0/24",
+  # "10.0.0.0/8",
+]
+
+# Allowed domains (supports wildcards)
+allowed_domains = [
+  # "*.example.com",
+  # "test.local",
+]
+
+# Excluded hosts (always blocked, even if in allowed range)
+excluded_hosts = []
+
+# Excluded CIDRs
+excluded_cidrs = []
+
+# Excluded domains
+excluded_domains = [
+  "*.example.com",
+  "localhost",
+]
+
+# Engagement rules (set to true only with written authorization)
+[rules]
+online_active_testing = false
+credential_testing = false
+exploitation = false
+traffic_interception = false
+system_changes = false
+data_destruction = false

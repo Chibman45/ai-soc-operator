@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Generated config (contains credentials)
+config/platforms.toml
+config/scope.toml
+
+# Runtime artifacts
+audit/
+evidence/
+outputs/
+scans/
+reports/generated/
+snapshots/exports/
+.current_session
+*.tar.gz
+
+# Environment files
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
