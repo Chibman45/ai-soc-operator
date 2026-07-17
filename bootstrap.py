@@ -47,21 +47,21 @@ RESET = "\033[0m"
 
 
 def status(msg: str) -> None:
-    print(f"{GREEN}✓{RESET} {msg}")
+    print(f"  [OK] {msg}")
 
 
 def warn(msg: str) -> None:
-    print(f"{YELLOW}⚠{RESET} {msg}")
+    print(f"  [!!] {msg}")
 
 
 def error(msg: str) -> None:
-    print(f"{RED}✗{RESET} {msg}")
+    print(f"  [XX] {msg}")
 
 
 def header(msg: str) -> None:
-    print(f"\n{BOLD}{CYAN}{'─' * 60}{RESET}")
+    print(f"\n{BOLD}{CYAN}{'=' * 60}{RESET}")
     print(f"{BOLD}{CYAN}  {msg}{RESET}")
-    print(f"{BOLD}{CYAN}{'─' * 60}{RESET}\n")
+    print(f"{BOLD}{CYAN}{'=' * 60}{RESET}\n")
 
 
 # ── Step 1: System checks ──
