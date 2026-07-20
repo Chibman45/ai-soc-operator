@@ -166,6 +166,45 @@ python3 -m pytest tests/ -v
 python3 -m compileall scripts/ tests/
 ```
 
+## Built with Codex
+
+This project was built entirely using OpenAI Codex as the primary development partner. Here's how Codex accelerated the workflow and where key decisions were made.
+
+### Architecture decisions with Codex
+
+**Playbook engine design.** Codex proposed the YAML-based step runner with `llm | toolchain | rule | thehive | mitre_mapping | approval` step types. I provided the safety requirements (tiered risk, scope enforcement, approval gates) and Codex translated them into the `operator_core.py` classification system and `risk-policy.toml` configuration.
+
+**TheHive write integration.** The original codebase had read-only TheHive queries. Codex designed the full write API client (`thehive.py`) — case CRUD, observable attachment, comment threading, alert handling — following the same safety model as the read operations. Every write is scope-checked, approval-gated, and audit-logged.
+
+**Variable resolution and branching.** Codex built the `{dotted.path}` variable resolution system and conditional branching (`skip_to`, `in [...]`, numeric comparisons). The key insight was storing step results under a `steps` namespace to avoid overwriting explicit context — a bug Codex caught during testing.
+
+### What Codex built
+
+| Component | Codex contribution |
+|---|---|
+| `playbook_engine.py` | YAML loader, variable resolver, step runner, branching logic |
+| `orchestrator.py` | End-to-end pipeline, playbook auto-selection, report generation |
+| `soc_client/thehive.py` | Full TheHive 5 write API (cases, alerts, observables, comments) |
+| `soc_client/cortex.py` | Cortex analyzer/responder client |
+| `soc_client/wazuh.py` | Wazuh Manager + Indexer clients |
+| `soc_client/enrichment.py` | Multi-platform threat intel aggregation |
+| `soc_client/openai.py` | GPT-5.6 direct API client for LLM steps |
+| `bootstrap.py` | 8-step interactive setup CLI |
+| `scripts/load_secrets.sh` | Credential loading from external file |
+| 3 playbooks | Identity compromise, phishing, malware outbreak |
+| 113 tests | Engine, orchestrator, all clients, integration |
+
+### Where I made key decisions
+
+- **YAML over code:** Chose YAML playbooks so SOC teams can define procedures without writing Python. Codex implemented the engine; I decided the abstraction level.
+- **Safety by default:** Required approval gates for every write operation, not just "dangerous" ones. This made the demo more convincing to security-focused judges.
+- **Agent-as-orchestrator:** The Codex agent executes playbook steps — it reads the YAML, calls the right scripts, makes judgment calls. The code provides tools; the agent provides reasoning.
+- **GPT-5.6 for LLM steps:** Direct API calls for classification and analysis ensure judges can see the model in action, not just Codex's internal model.
+
+### Codex session
+
+The majority of core functionality was built in Codex session: `[PASTE YOUR CODEX SESSION ID HERE]`
+
 ## License
 
 MIT. This project is a workflow and automation framework, not authorization

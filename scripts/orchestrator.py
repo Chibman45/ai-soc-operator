@@ -57,6 +57,12 @@ def build_clients(config: dict[str, Any]) -> dict[str, Any]:
     clients: dict[str, Any] = {}
     platforms = config.get("platforms", {})
 
+    # OpenAI GPT-5.6 for LLM steps
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if openai_key:
+        from .soc_client.openai import OpenAIClient
+        clients["openai"] = OpenAIClient(openai_key)
+
     # TheHive
     thehive_cfg = platforms.get("thehive", {})
     if thehive_cfg.get("enabled"):

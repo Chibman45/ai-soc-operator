@@ -10,6 +10,7 @@
 set -euo pipefail
 
 REQUIRED_VARS=(
+    "OPENAI_API_KEY"
     "SHODAN_API_KEY"
     "CENSYS_PAT"
     "VIRUSTOTAL_API_KEY"

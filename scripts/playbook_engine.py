@@ -286,6 +286,24 @@ class PlaybookRunner:
 
     def _run_llm(self, step: dict[str, Any]) -> dict[str, Any]:
         prompt = render(step.get("prompt", ""), self.context)
+
+        # Try direct GPT-5.6 API call if OpenAI client is available
+        openai_client = self.clients.get("openai")
+        if openai_client:
+            try:
+                response = openai_client.chat(prompt, temperature=0.2)
+                audit("playbook_llm_gpt56", step=step.get("id"), model="gpt-5.6")
+                return {
+                    "type": "llm",
+                    "model": "gpt-5.6",
+                    "prompt": prompt,
+                    "response": response,
+                    "status": "completed",
+                }
+            except Exception as e:
+                audit("playbook_llm_fallback", step=step.get("id"), error=str(e))
+                # Fall through to agent execution
+
         return {
             "type": "llm",
             "prompt": prompt,
