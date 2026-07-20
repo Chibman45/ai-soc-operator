@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Cases — AI SOC Operator{% endblock %}
+{% block content %}
+<div class="space-y-6">
+    <h2 class="text-xl font-bold">Cases</h2>
+
+    <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <table class="w-full">
+            <thead>
+                <tr class="border-b border-gray-800 text-left text-sm text-gray-500">
+                    <th class="px-4 py-3">Title</th>
+                    <th class="px-4 py-3">Severity</th>
+                    <th class="px-4 py-3">Status</th>
+                    <th class="px-4 py-3">Created</th>
+                    <th class="px-4 py-3"></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for case in cases %}
+                <tr class="border-b border-gray-800/50 hover:bg-gray-800/30 transition">
+                    <td class="px-4 py-3 font-medium">{{ case.title }}</td>
+                    <td class="px-4 py-3">
+                        <span class="px-2 py-0.5 rounded text-xs
+                            {% if case.severity == 'critical' %}bg-red-900 text-red-300
+                            {% elif case.severity == 'high' %}bg-orange-900 text-orange-300
+                            {% elif case.severity == 'medium' %}bg-yellow-900 text-yellow-300
+                            {% else %}bg-gray-700 text-gray-300{% endif %}">
+                            {{ case.severity }}
+                        </span>
+                    </td>
+                    <td class="px-4 py-3">
+                        <span class="px-2 py-0.5 rounded text-xs
+                            {% if case.status == 'open' %}bg-blue-900 text-blue-300
+                            {% elif case.status == 'closed' %}bg-green-900 text-green-300
+                            {% else %}bg-gray-700 text-gray-300{% endif %}">
+                            {{ case.status }}
+                        </span>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-500">{{ case.created_at }}</td>
+                    <td class="px-4 py-3">
+                        <a href="{{ url_for('case_detail', case_id=case.id) }}" class="text-blue-400 hover:text-blue-300 text-sm">View →</a>
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not cases %}
+                <tr>
+                    <td colspan="5" class="px-4 py-12 text-center text-gray-600">
+                        No cases yet. Run a playbook to create one.
+                    </td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

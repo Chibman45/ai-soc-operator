@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Case {{ case.title }} — AI SOC Operator{% endblock %}
+{% block content %}
+<div class="space-y-6">
+    <div class="flex items-center gap-3">
+        <a href="{{ url_for('cases') }}" class="text-gray-500 hover:text-gray-300">← Cases</a>
+        <h2 class="text-xl font-bold">{{ case.title }}</h2>
+        <span class="px-2 py-0.5 rounded text-xs
+            {% if case.severity == 'critical' %}bg-red-900 text-red-300
+            {% elif case.severity == 'high' %}bg-orange-900 text-orange-300
+            {% elif case.severity == 'medium' %}bg-yellow-900 text-yellow-300
+            {% else %}bg-gray-700 text-gray-300{% endif %}">
+            {{ case.severity }}
+        </span>
+    </div>
+
+    <div class="grid grid-cols-3 gap-6">
+        <!-- Case Info -->
+        <div class="col-span-2 space-y-4">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+                <h3 class="font-medium mb-3">Summary</h3>
+                <div class="text-sm text-gray-300 whitespace-pre-wrap">{{ case.summary or 'No summary available.' }}</div>
+            </div>
+
+            {% if run %}
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+                <h3 class="font-medium mb-3">Execution Result</h3>
+                <pre class="text-xs text-gray-400 bg-gray-800 rounded-lg p-4 overflow-x-auto max-h-64">{{ run.result_json or 'No output.' }}</pre>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Activity Timeline -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+            <h3 class="font-medium mb-3">Activity Timeline</h3>
+            <div class="space-y-3">
+                {% for entry in activity %}
+                <div class="flex items-start gap-2 text-sm">
+                    <span class="{% if entry.status == 'done' %}text-green-400{% elif entry.status == 'failed' %}text-red-400{% elif entry.status == 'running' %}text-yellow-400{% else %}text-gray-500{% endif %} mt-0.5">
+                        {% if entry.status == 'done' %}✓{% elif entry.status == 'failed' %}✗{% elif entry.status == 'running' %}●{% else %}○{% endif %}
+                    </span>
+                    <div class="flex-1 min-w-0">
+                        <div class="text-gray-300">{{ entry.step }}</div>
+                        <div class="text-xs text-gray-500">{{ entry.detail }}</div>
+                    </div>
+                </div>
+                {% endfor %}
+                {% if not activity %}
+                <div class="text-gray-600 text-sm">No activity recorded.</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

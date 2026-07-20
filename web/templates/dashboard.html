@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — AI SOC Operator{% endblock %}
+{% block content %}
+<div class="space-y-6">
+    <div class="flex items-center justify-between">
+        <h2 class="text-xl font-bold">Dashboard</h2>
+        <form method="POST" action="{{ url_for('run_agent') }}" class="flex gap-2" id="run-form">
+            <select name="playbook" class="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm">
+                {% for pb in playbooks if playbooks is defined else [] %}
+                <option value="{{ pb.name }}">{{ pb.name }}</option>
+                {% endfor %}
+                <option value="identity-compromise.yaml">identity-compromise.yaml</option>
+                <option value="phishing-response.yaml">phishing-response.yaml</option>
+                <option value="malware-outbreak.yaml">malware-outbreak.yaml</option>
+            </select>
+            <button type="submit" class="px-4 py-2 bg-green-600 hover:bg-green-500 rounded-lg text-sm font-medium transition">
+                ▶ Run Agent
+            </button>
+        </form>
+    </div>
+
+    <!-- Stats -->
+    <div class="grid grid-cols-4 gap-4">
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div class="text-2xl font-bold text-blue-400">{{ runs|length }}</div>
+            <div class="text-xs text-gray-500">Total Runs</div>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div class="text-2xl font-bold text-green-400">{{ runs|selectattr('status', 'equalto', 'completed')|list|length }}</div>
+            <div class="text-xs text-gray-500">Completed</div>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div class="text-2xl font-bold text-yellow-400">{{ cases|selectattr('status', 'equalto', 'open')|list|length }}</div>
+            <div class="text-xs text-gray-500">Open Cases</div>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div class="text-2xl font-bold text-purple-400">{{ activity|length }}</div>
+            <div class="text-xs text-gray-500">Log Entries</div>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-2 gap-6">
+        <!-- Recent Activity -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl">
+            <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+                <h3 class="font-medium">Activity Feed</h3>
+                <span class="text-xs text-gray-500" id="activity-count">{{ activity|length }} entries</span>
+            </div>
+            <div class="p-4 max-h-96 overflow-y-auto space-y-2" id="activity-feed">
+                {% for entry in activity %}
+                <div class="flex items-start gap-3 text-sm fade-in">
+                    <span class="{% if entry.status == 'done' %}text-green-400{% elif entry.status == 'failed' %}text-red-400{% elif entry.status == 'running' %}text-yellow-400 pulse{% else %}text-gray-400{% endif %}">
+                        {% if entry.status == 'done' %}✓{% elif entry.status == 'failed' %}✗{% elif entry.status == 'running' %}●{% else %}○{% endif %}
+                    </span>
+                    <div class="flex-1 min-w-0">
+                        <div class="text-gray-300">{{ entry.step }}</div>
+                        <div class="text-xs text-gray-500 truncate">{{ entry.detail }}</div>
+                    </div>
+                    <div class="text-xs text-gray-600 whitespace-nowrap">{{ entry.timestamp }}</div>
+                </div>
+                {% endfor %}
+                {% if not activity %}
+                <div class="text-center text-gray-600 py-8">No activity yet. Run the agent to get started.</div>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Recent Cases -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl">
+            <div class="px-4 py-3 border-b border-gray-800">
+                <h3 class="font-medium">Recent Cases</h3>
+            </div>
+            <div class="p-4 space-y-2">
+                {% for case in cases %}
+                <a href="{{ url_for('case_detail', case_id=case.id) }}"
+                   class="block p-3 bg-gray-800/50 rounded-lg hover:bg-gray-800 transition">
+                    <div class="flex items-center justify-between">
+                        <span class="font-medium text-sm">{{ case.title }}</span>
+                        <span class="px-2 py-0.5 rounded text-xs
+                            {% if case.severity == 'critical' %}bg-red-900 text-red-300
+                            {% elif case.severity == 'high' %}bg-orange-900 text-orange-300
+                            {% elif case.severity == 'medium' %}bg-yellow-900 text-yellow-300
+                            {% else %}bg-gray-700 text-gray-300{% endif %}">
+                            {{ case.severity }}
+                        </span>
+                    </div>
+                    <div class="text-xs text-gray-500 mt-1">{{ case.created_at }} · {{ case.status }}</div>
+                </a>
+                {% endfor %}
+                {% if not cases %}
+                <div class="text-center text-gray-600 py-8">No cases yet.</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Poll for activity updates every 5 seconds
+setInterval(async () => {
+    try {
+        const resp = await fetch('/api/activity');
+        const data = await resp.json();
+        const feed = document.getElementById('activity-feed');
+        if (data.length > 0) {
+            document.getElementById('activity-count').textContent = data.length + ' entries';
+        }
+    } catch (e) {}
+}, 5000);
+</script>
+{% endblock %}

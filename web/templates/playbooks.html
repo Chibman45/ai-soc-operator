@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Playbooks — AI SOC Operator{% endblock %}
+{% block content %}
+<div class="space-y-6">
+    <h2 class="text-xl font-bold">Playbooks</h2>
+    <p class="text-gray-400 text-sm">Select a playbook to run against an alert. Each playbook defines the step-by-step response procedure.</p>
+
+    <div class="grid grid-cols-3 gap-4">
+        {% for pb in playbooks %}
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 hover:border-blue-600 transition cursor-pointer"
+             onclick="runPlaybook('{{ pb.name }}')">
+            <div class="text-lg font-medium mb-2">📋 {{ pb.name }}</div>
+            <div class="text-sm text-gray-400 mb-4">Click to run this playbook</div>
+            <button class="w-full py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition">
+                ▶ Execute
+            </button>
+        </div>
+        {% endfor %}
+
+        <div class="bg-gray-900/50 border border-gray-700 border-dashed rounded-xl p-5 flex flex-col items-center justify-center text-gray-600">
+            <div class="text-3xl mb-2">+</div>
+            <div class="text-sm">Upload custom playbook</div>
+            <div class="text-xs mt-1">YAML format</div>
+        </div>
+    </div>
+</div>
+
+<script>
+function runPlaybook(name) {
+    if (confirm('Run playbook ' + name + '?')) {
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '/run';
+        form.innerHTML = '<input type="hidden" name="playbook" value="' + name + '">';
+        document.body.appendChild(form);
+        form.submit();
+    }
+}
+</script>
+{% endblock %}

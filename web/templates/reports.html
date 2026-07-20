@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Reports — AI SOC Operator{% endblock %}
+{% block content %}
+<div class="space-y-6">
+    <h2 class="text-xl font-bold">Reports</h2>
+
+    <div class="grid grid-cols-2 gap-4">
+        {% for case in cases %}
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="font-medium">{{ case.title }}</h3>
+                <span class="px-2 py-0.5 rounded text-xs
+                    {% if case.severity == 'critical' %}bg-red-900 text-red-300
+                    {% elif case.severity == 'high' %}bg-orange-900 text-orange-300
+                    {% elif case.severity == 'medium' %}bg-yellow-900 text-yellow-300
+                    {% else %}bg-gray-700 text-gray-300{% endif %}">
+                    {{ case.severity }}
+                </span>
+            </div>
+            <div class="text-xs text-gray-500 mb-3">{{ case.created_at }}</div>
+            <div class="text-sm text-gray-300 bg-gray-800 rounded-lg p-3 max-h-32 overflow-y-auto">
+                {{ case.summary or 'No summary available.' }}
+            </div>
+        </div>
+        {% endfor %}
+        {% if not cases %}
+        <div class="col-span-2 bg-gray-900/50 border border-gray-700 border-dashed rounded-xl p-12 text-center text-gray-600">
+            <div class="text-3xl mb-2">📄</div>
+            <div>No reports generated yet.</div>
+            <div class="text-sm mt-1">Run a playbook to generate a report.</div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
