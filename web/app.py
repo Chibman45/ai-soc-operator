@@ -414,6 +414,150 @@ def playbooks():
     return render_template("playbooks.html", playbooks=playbooks)
 
 
+# ── Routes: Playbook Upload ──
+
+@app.route("/playbooks/upload", methods=["POST"])
+@login_required
+def upload_playbook():
+    if "playbook" not in request.files:
+        flash("No file selected", "error")
+        return redirect(url_for("playbooks"))
+
+    file = request.files["playbook"]
+    if not file.filename:
+        flash("No file selected", "error")
+        return redirect(url_for("playbooks"))
+
+    if not file.filename.endswith((".yaml", ".yml")):
+        flash("Only YAML files are accepted", "error")
+        return redirect(url_for("playbooks"))
+
+    # Validate YAML
+    import yaml
+    try:
+        content = file.read().decode("utf-8")
+        parsed = yaml.safe_load(content)
+        if not isinstance(parsed, dict) or "steps" not in parsed:
+            flash("Invalid playbook: must have 'steps' key", "error")
+            return redirect(url_for("playbooks"))
+    except Exception as e:
+        flash(f"Invalid YAML: {e}", "error")
+        return redirect(url_for("playbooks"))
+
+    # Save to playbooks directory
+    dest = ROOT / "playbooks" / file.filename
+    dest.write_text(content, encoding="utf-8")
+
+    # Record in DB
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO activity_log (step, status, detail) VALUES (?, 'done', ?)",
+        ("upload_playbook", f"Uploaded playbook: {file.filename}"),
+    )
+    conn.commit()
+    conn.close()
+
+    flash(f"Playbook uploaded: {file.filename}", "success")
+    return redirect(url_for("playbooks"))
+
+
+# ── Routes: Run Approve/Reject ──
+
+@app.route("/api/runs/<int:run_id>/approve", methods=["POST"])
+@login_required
+def api_run_approve(run_id: int):
+    conn = get_db()
+    run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if not run:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute(
+        "UPDATE runs SET status = 'approved' WHERE id = ?",
+        (run_id,),
+    )
+    conn.execute(
+        "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'approval', 'done', 'Run approved by operator')",
+        (run_id,),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "approved", "run_id": run_id})
+
+
+@app.route("/api/runs/<int:run_id>/reject", methods=["POST"])
+@login_required
+def api_run_reject(run_id: int):
+    reason = request.json.get("reason", "") if request.is_json else ""
+    conn = get_db()
+    conn.execute(
+        "UPDATE runs SET status = 'rejected' WHERE id = ?",
+        (run_id,),
+    )
+    conn.execute(
+        "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'approval', 'failed', ?)",
+        (run_id, f"Run rejected: {reason}" if reason else "Run rejected by operator"),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "rejected", "run_id": run_id})
+
+
+# ── Routes: Secrets Status & Test ──
+
+@app.route("/api/secrets/status")
+@login_required
+def api_secrets_status():
+    conn = get_db()
+    creds = conn.execute("SELECT key_name FROM credentials").fetchall()
+    conn.close()
+    configured = [c["key_name"] for c in creds]
+    required = [
+        "OPENAI_API_KEY", "THEHIVE_API_KEY", "CORTEX_API_KEY",
+        "VIRUSTOTAL_API_KEY", "ABUSEIPDB_API_KEY",
+    ]
+    optional = [
+        "SHODAN_API_KEY", "URLSCAN_API_KEY", "HYBRID_ANALYSIS_API_KEY",
+        "CENSYS_PAT", "WAZUH_API_TOKEN",
+    ]
+    return jsonify({
+        "configured": configured,
+        "required": {k: k in configured for k in required},
+        "optional": {k: k in configured for k in optional},
+        "all_required_met": all(k in configured for k in required),
+    })
+
+
+@app.route("/api/secrets/test", methods=["POST"])
+@login_required
+def api_secrets_test():
+    platform = request.json.get("platform", "") if request.is_json else ""
+    if not platform:
+        return jsonify({"error": "platform required"}), 400
+
+    # Simple connectivity test
+    import urllib.request
+    import ssl
+    test_urls = {
+        "VIRUSTOTAL": "https://www.virustotal.com",
+        "ABUSEIPDB": "https://api.abuseipdb.com",
+        "SHODAN": "https://api.shodan.io",
+        "THEHIVE": None,  # Needs URL from config
+        "CORTEX": None,
+    }
+    url = test_urls.get(platform.upper())
+    if url is None:
+        return jsonify({"status": "unknown", "message": "Platform requires base URL configuration"})
+
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, method="HEAD")
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        opener.open(req, timeout=5)
+        return jsonify({"status": "reachable", "platform": platform})
+    except Exception as e:
+        return jsonify({"status": "unreachable", "error": str(e)[:200]})
+
+
 # ── Main ──
 
 if __name__ == "__main__":

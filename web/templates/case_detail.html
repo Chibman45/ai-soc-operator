@@ -20,6 +20,17 @@
             <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
                 <h3 class="font-medium mb-3">Summary</h3>
                 <div class="text-sm text-gray-300 whitespace-pre-wrap">{{ case.summary or 'No summary available.' }}</div>
+
+            {% if case.status == 'open' %}
+            <div class="flex gap-2 mt-4">
+                <button onclick="approveCase({{ case.id }})" class="px-4 py-2 bg-green-600 hover:bg-green-500 rounded-lg text-sm font-medium transition">
+                    ✓ Approve Actions
+                </button>
+                <button onclick="rejectCase({{ case.id }})" class="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-lg text-sm font-medium transition">
+                    ✗ Reject
+                </button>
+            </div>
+            {% endif %}
             </div>
 
             {% if run %}
@@ -52,4 +63,32 @@
         </div>
     </div>
 </div>
+
+<script>
+async function approveCase(caseId) {
+    if (!confirm('Approve all recommended actions for this case?')) return;
+    const resp = await fetch(`/api/runs/${caseId}/approve`, {method: 'POST'});
+    const data = await resp.json();
+    if (data.status === 'approved') {
+        location.reload();
+    } else {
+        alert('Error: ' + (data.error || 'unknown'));
+    }
+}
+
+async function rejectCase(caseId) {
+    const reason = prompt('Reason for rejection (optional):');
+    const resp = await fetch(`/api/runs/${caseId}/reject`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({reason: reason || ''})
+    });
+    const data = await resp.json();
+    if (data.status === 'rejected') {
+        location.reload();
+    } else {
+        alert('Error: ' + (data.error || 'unknown'));
+    }
+}
+</script>
 {% endblock %}
