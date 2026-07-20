@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# ai-soc-operator — system command wrapper
+# Install: cp this file /usr/local/bin/ai-soc-operator && chmod +x /usr/local/bin/ai-soc-operator
+#
+# Usage:
+#   ai-soc-operator              # Start the web UI
+#   ai-soc-operator --port 8080  # Start on custom port
+#   ai-soc-operator --check      # Check dependencies only
+
+set -euo pipefail
+
+# Find the repo directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${AI_SOC_HOME:-$HOME/ai-soc-operator}"
+
+# If run from inside the repo, use current directory
+if [ -f "./web/app.py" ] && [ -f "./scripts/orchestrator.py" ]; then
+    REPO_DIR="$(pwd)"
+elif [ -f "$REPO_DIR/web/app.py" ]; then
+    REPO_DIR="$REPO_DIR"
+else
+    echo "Error: Cannot find ai-soc-operator repository."
+    echo "Set AI_SOC_HOME or run from inside the repo directory."
+    exit 1
+fi
+
+cd "$REPO_DIR"
+
+# Parse arguments
+PORT=5000
+CHECK_ONLY=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --port) PORT="$2"; shift 2 ;;
+        --check) CHECK_ONLY=true; shift ;;
+        --help|-h)
+            echo "AI SOC Operator"
+            echo ""
+            echo "Usage: ai-soc-operator [options]"
+            echo ""
+            echo "Options:"
+            echo "  --port PORT    Start on custom port (default: 5000)"
+            echo "  --check        Check dependencies only"
+            echo "  --help         Show this help"
+            echo ""
+            echo "Environment:"
+            echo "  AI_SOC_HOME    Path to repo (default: ~/ai-soc-operator)"
+            exit 0
+            ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# Check dependencies
+echo "Checking dependencies..."
+
+# Python
+if ! command -v python3 &>/dev/null; then
+    echo "Error: python3 not found"
+    exit 1
+fi
+
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+echo "  Python: $PYTHON_VERSION"
+
+# Required packages
+python3 -c "import yaml, flask" 2>/dev/null || {
+    echo "  Installing Python dependencies..."
+    python3 -m pip install -q -r requirements.txt
+}
+
+echo "  Dependencies: OK"
+
+if [ "$CHECK_ONLY" = true ]; then
+    echo "Check complete. All dependencies satisfied."
+    exit 0
+fi
+
+# Detect local IP
+LOCAL_IP=$(python3 -c "
+import socket
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(('8.8.8.8', 80))
+    print(s.getsockname()[0])
+    s.close()
+except:
+    print('127.0.0.1')
+")
+
+# Initialize database
+python3 -c "from web.app import init_db; init_db()"
+
+# Start server
+echo ""
+echo "=================================================="
+echo "  AI SOC Operator"
+echo "  Local:   http://localhost:$PORT"
+echo "  Network: http://$LOCAL_IP:$PORT"
+echo "=================================================="
+echo ""
+echo "Open the Network URL from any device on your LAN."
+echo "Press Ctrl+C to stop."
+echo ""
+
+python3 web/app.py

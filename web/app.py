@@ -560,6 +560,26 @@ def api_secrets_test():
 
 # ── Main ──
 
+def get_local_ip() -> str:
+    """Detect the machine's local IP address."""
+    import socket as _socket
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    ip = get_local_ip()
+    port = 5000
+    print(f"\n{'='*50}")
+    print(f"  AI SOC Operator")
+    print(f"  Local:   http://localhost:{port}")
+    print(f"  Network: http://{ip}:{port}")
+    print(f"{'='*50}\n")
+    app.run(host="0.0.0.0", port=port, debug=True)

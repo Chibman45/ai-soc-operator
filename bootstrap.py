@@ -393,6 +393,21 @@ def install_skills() -> bool:
         status(f"{installed} skill(s) installed to {SKILLS_DEST}")
     else:
         status("All skills already installed")
+
+    # Install system command
+    bin_src = ROOT / "bin" / "ai-soc-operator"
+    bin_dest = Path("/usr/local/bin/ai-soc-operator")
+    if bin_src.is_file() and not bin_dest.exists():
+        try:
+            import shutil as _shutil
+            _shutil.copy2(bin_src, bin_dest)
+            bin_dest.chmod(0o755)
+            status(f"Installed system command: {bin_dest}")
+        except PermissionError:
+            warn(f"Could not install to {bin_dest} (permission denied)")
+            warn(f"Run manually: sudo cp {bin_src} /usr/local/bin/")
+    elif bin_dest.exists():
+        status("System command already installed")
     return True
 
 
