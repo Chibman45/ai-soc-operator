@@ -428,25 +428,65 @@ def upload_playbook():
         flash("No file selected", "error")
         return redirect(url_for("playbooks"))
 
-    if not file.filename.endswith((".yaml", ".yml")):
-        flash("Only YAML files are accepted", "error")
+    allowed = {".yaml", ".yml", ".pdf", ".docx", ".md", ".txt"}
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in allowed:
+        flash(f"Unsupported file type. Allowed: {', '.join(sorted(allowed))}", "error")
         return redirect(url_for("playbooks"))
 
-    # Validate YAML
-    import yaml
-    try:
-        content = file.read().decode("utf-8")
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict) or "steps" not in parsed:
-            flash("Invalid playbook: must have 'steps' key", "error")
+    # Save uploaded file temporarily
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    file.save(tmp.name)
+    tmp.close()
+
+    from scripts.playbook_parser import parse_playbook_document
+
+    # For YAML, parse directly; for PDF/DOCX/MD, use LLM parser
+    openai_client = None
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if openai_key and suffix not in (".yaml", ".yml"):
+        from scripts.soc_client.openai import OpenAIClient
+        openai_client = OpenAIClient(openai_key)
+
+    if openai_client:
+        def llm_callback(system_prompt, user_prompt):
+            return openai_client.chat(user_prompt, system=system_prompt)
+    else:
+        llm_callback = None
+
+    if suffix in (".yaml", ".yml"):
+        # Direct YAML parse
+        import yaml
+        try:
+            content = Path(tmp.name).read_text(encoding="utf-8")
+            parsed = yaml.safe_load(content)
+            if not isinstance(parsed, dict) or "steps" not in parsed:
+                flash("Invalid playbook: must have 'steps' key", "error")
+                return redirect(url_for("playbooks"))
+            dest = ROOT / "playbooks" / file.filename
+            dest.write_text(content, encoding="utf-8")
+        except Exception as e:
+            flash(f"YAML parse error: {e}", "error")
             return redirect(url_for("playbooks"))
-    except Exception as e:
-        flash(f"Invalid YAML: {e}", "error")
-        return redirect(url_for("playbooks"))
+    else:
+        # Non-YAML: extract → LLM → validate → save
+        if not llm_callback:
+            flash("PDF/DOCX parsing requires an OpenAI API key. Set OPENAI_API_KEY.", "error")
+            return redirect(url_for("playbooks"))
+        result = parse_playbook_document(Path(tmp.name), llm_callback)
+        if not result["valid"]:
+            flash(f"Parsing errors: {'; '.join(result['errors'])}", "error")
+            return redirect(url_for("playbooks"))
+        # Save parsed playbook as YAML
+        import yaml
+        safe_name = Path(file.filename).stem.replace(" ", "-").lower()
+        dest = ROOT / "playbooks" / f"{safe_name}.yaml"
+        dest.write_text(yaml.dump(result["playbook"], default_flow_style=False), encoding="utf-8")
+        file.filename = f"{safe_name}.yaml"
 
-    # Save to playbooks directory
-    dest = ROOT / "playbooks" / file.filename
-    dest.write_text(content, encoding="utf-8")
+    # Cleanup temp file
+    Path(tmp.name).unlink(missing_ok=True)
 
     # Record in DB
     conn = get_db()
