@@ -76,6 +76,47 @@ def check_python() -> bool:
     return True
 
 
+def check_system_commands() -> bool:
+    required = {"git": "version control", "curl": "HTTP client"}
+    optional = {"python3-venv": "virtual environment support"}
+    missing_required = []
+    for cmd, desc in required.items():
+        if shutil.which(cmd):
+            status(f"{cmd:20s} — {desc}")
+        else:
+            error(f"{cmd:20s} — MISSING ({desc})")
+            missing_required.append(cmd)
+    for cmd, desc in optional.items():
+        if shutil.which(cmd):
+            status(f"{cmd:20s} — {desc}")
+        else:
+            warn(f"{cmd:20s} — not found ({desc})")
+    if missing_required:
+        error(f"Install missing commands: {', '.join(missing_required)}")
+        return False
+    return True
+
+
+def create_venv() -> bool:
+    venv_dir = ROOT / ".venv"
+    if venv_dir.is_dir():
+        status(f"Virtual environment exists: {venv_dir}")
+        return True
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        status(f"Created virtual environment: {venv_dir}")
+        return True
+    except subprocess.CalledProcessError as e:
+        # Common on Kali: missing python3-venv
+        warn(f"venv creation failed: {e.stderr}")
+        warn("Try: sudo apt-get install -y python3-venv python3-pip python3-dev")
+        warn("Then re-run bootstrap.")
+        return False
+
+
 def check_dependencies() -> bool:
     missing = []
     for pkg in ["yaml", "tomllib"]:
@@ -100,13 +141,17 @@ def install_python_deps() -> bool:
     if not req.is_file():
         warn("requirements.txt not found, skipping pip install")
         return True
+    # Use venv pip if available, otherwise fall back to system pip
+    venv_pip = ROOT / ".venv" / "bin" / "python"
+    pip_target = str(venv_pip) if venv_pip.is_file() else sys.executable
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "-r", str(req)],
+        [pip_target, "-m", "pip", "install", "-q", "-r", str(req)],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         error(f"pip install failed:\n{result.stderr}")
+        warn("On Kali, you may need: sudo apt-get install -y build-essential libssl-dev libffi-dev")
         return False
     status("Python dependencies installed")
     return True
@@ -580,7 +625,11 @@ def main() -> int:
     # ── Full bootstrap ──
     if not check_python():
         return 1
+    if not check_system_commands():
+        return 1
     check_dependencies()
+    if not create_venv():
+        return 1
     install_python_deps()
     detect_tools()
     config = prompt_platform_config()
