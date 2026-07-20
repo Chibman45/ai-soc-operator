@@ -29,6 +29,7 @@ try:
     from .soc_client.cortex import CortexClient
     from .soc_client.wazuh import WazuhManagerClient, WazuhIndexerClient
     from .soc_client.enrichment import EnrichmentClient
+    from .soc_client.scoring import triage
 except ImportError:
     from scripts.common import ROOT, Session, audit, utc_now
     from scripts.playbook_engine import PlaybookRunner, load_playbook
@@ -219,6 +220,16 @@ def execute_playbook(
         context["rule"] = alert["rule"]
     if "agent" in alert:
         context["agent"] = alert["agent"]
+
+    # Run deterministic scoring before playbook execution
+    triage_result = triage(alert)
+    context["triage_result"] = triage_result
+    audit(
+        "triage_scored",
+        score=triage_result["score"],
+        tier=triage_result["tier"],
+        should_trigger_llm=triage_result["should_trigger_llm"],
+    )
 
     # Run the playbook
     runner = PlaybookRunner(playbook, context, clients)
