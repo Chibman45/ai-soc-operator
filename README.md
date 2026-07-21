@@ -10,7 +10,8 @@ Built for competitive hackathon demonstration. Production-grade safety model.
 ## Quick start
 
 ```bash
-git clone git@github.com:Chibman45/ai-soc-operator.git
+cd ~
+git clone https://github.com/Chibman45/ai-soc-operator.git
 cd ai-soc-operator
 python3 bootstrap.py
 ```
