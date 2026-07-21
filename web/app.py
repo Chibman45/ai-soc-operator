@@ -66,6 +66,13 @@ def init_db() -> None:
             key_value TEXT NOT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS platform_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT UNIQUE,
+            base_url TEXT,
+            enabled INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             playbook TEXT,
@@ -112,6 +119,114 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, stored: str) -> bool:
     salt = stored.split(":")[-1]
     return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest() == stored.split(":")[0]
+
+
+PLATFORM_DEFAULTS = {
+    "thehive": "https://thehive.example.com",
+    "cortex": "https://cortex.example.com",
+    "wazuh_manager": "https://wazuh-manager.example.com:55000",
+    "wazuh_indexer": "https://wazuh-indexer.example.com:9200",
+    "virustotal": "https://www.virustotal.com",
+    "abuseipdb": "https://api.abuseipdb.com",
+    "shodan": "https://api.shodan.io",
+    "urlscan": "https://urlscan.io",
+    "hybrid_analysis": "https://www.hybrid-analysis.com",
+    "misp": "https://misp.example.com",
+}
+
+PLATFORM_CREDENTIAL_KEYS = [
+    ("OPENAI_API_KEY", None),
+    ("THEHIVE_API_KEY", "thehive"),
+    ("CORTEX_API_KEY", "cortex"),
+    ("WAZUH_API_TOKEN", "wazuh_manager"),
+    ("VIRUSTOTAL_API_KEY", "virustotal"),
+    ("ABUSEIPDB_API_KEY", "abuseipdb"),
+    ("SHODAN_API_KEY", "shodan"),
+    ("URLSCAN_API_KEY", "urlscan"),
+    ("HYBRID_ANALYSIS_API_KEY", "hybrid_analysis"),
+    ("MISP_API_KEY", "misp"),
+]
+
+
+def _platform_rows() -> list[dict[str, Any]]:
+    return [
+        {"platform": platform, "base_url": base_url, "enabled": 0}
+        for platform, base_url in PLATFORM_DEFAULTS.items()
+    ]
+
+
+def save_platform_settings(conn: sqlite3.Connection, form: Any) -> None:
+    for key_name, platform in PLATFORM_CREDENTIAL_KEYS:
+        value = form.get(key_name, "").strip()
+        if value:
+            conn.execute("DELETE FROM credentials WHERE key_name = ?", (key_name,))
+            conn.execute(
+                "INSERT INTO credentials (platform, key_name, key_value) VALUES (?, ?, ?)",
+                ((platform or key_name.split("_")[0].lower()), key_name, value),
+            )
+    for platform, default_url in PLATFORM_DEFAULTS.items():
+        form_key = {
+            "thehive": "THEHIVE_URL",
+            "cortex": "CORTEX_URL",
+            "wazuh_manager": "WAZUH_URL",
+            "wazuh_indexer": "WAZUH_INDEXER_URL",
+            "misp": "MISP_URL",
+            "virustotal": "VIRUSTOTAL_URL",
+            "abuseipdb": "ABUSEIPDB_URL",
+            "shodan": "SHODAN_URL",
+            "urlscan": "URLSCAN_URL",
+            "hybrid_analysis": "HYBRID_ANALYSIS_URL",
+        }.get(platform)
+        if form_key:
+            base_url = form.get(form_key, "").strip() or default_url
+            enabled = 1 if base_url else 0
+            conn.execute(
+                "INSERT INTO platform_config (platform, base_url, enabled, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)"
+                " ON CONFLICT(platform) DO UPDATE SET base_url = excluded.base_url, enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP",
+                (platform, base_url, enabled),
+            )
+
+
+def build_platforms_toml() -> str:
+    conn = get_db()
+    creds = {row["key_name"]: row["key_value"] for row in conn.execute("SELECT key_name, key_value FROM credentials").fetchall()}
+    rows = conn.execute("SELECT platform, base_url, enabled FROM platform_config ORDER BY platform").fetchall()
+    conn.close()
+    lines = [
+        "# AI SOC Operator — Platform Configuration",
+        "# Auto-generated from the web portal",
+        "",
+    ]
+    for row in rows:
+        platform = row["platform"]
+        enabled = int(row["enabled"] or 0)
+        key_name = {
+            "thehive": "THEHIVE_API_KEY",
+            "cortex": "CORTEX_API_KEY",
+            "wazuh_manager": "WAZUH_API_TOKEN",
+            "virustotal": "VIRUSTOTAL_API_KEY",
+            "abuseipdb": "ABUSEIPDB_API_KEY",
+            "shodan": "SHODAN_API_KEY",
+            "urlscan": "URLSCAN_API_KEY",
+            "hybrid_analysis": "HYBRID_ANALYSIS_API_KEY",
+            "misp": "MISP_API_KEY",
+        }.get(platform)
+        if not key_name:
+            continue
+        lines.extend([
+            f"[platforms.{platform}]",
+            f"enabled = {str(bool(enabled and creds.get(key_name))).lower()}",
+            f'base_url = "{row["base_url"] or PLATFORM_DEFAULTS.get(platform, "")}"',
+            f'credential_env = "{key_name}"',
+            "",
+        ])
+    return "\n".join(lines)
+
+
+def write_platforms_toml() -> None:
+    output = ROOT / "config" / "platforms.toml"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(build_platforms_toml(), encoding="utf-8")
 
 
 def login_required(f):
@@ -183,27 +298,21 @@ def logout():
 def credentials():
     conn = get_db()
     if request.method == "POST":
-        for key in [
-            "OPENAI_API_KEY", "THEHIVE_API_KEY", "CORTEX_API_KEY",
-            "WAZUH_API_TOKEN", "VIRUSTOTAL_API_KEY", "ABUSEIPDB_API_KEY",
-            "SHODAN_API_KEY", "URLSCAN_API_KEY", "HYBRID_ANALYSIS_API_KEY",
-        ]:
-            value = request.form.get(key, "").strip()
-            if value:
-                conn.execute(
-                    "INSERT OR REPLACE INTO credentials (platform, key_name, key_value) VALUES (?, ?, ?)",
-                    (key.split("_")[0].lower(), key, value),
-                )
+        save_platform_settings(conn, request.form)
         conn.commit()
-        flash("Credentials saved", "success")
+        flash("Credentials and platform connections saved", "success")
         return redirect(url_for("dashboard"))
 
     existing = {
         row["key_name"]: row["key_value"][:8] + "****"
         for row in conn.execute("SELECT key_name, key_value FROM credentials").fetchall()
     }
+    platform_existing = {
+        row["platform"]: {"base_url": row["base_url"], "enabled": bool(row["enabled"])}
+        for row in conn.execute("SELECT platform, base_url, enabled FROM platform_config").fetchall()
+    }
     conn.close()
-    return render_template("credentials.html", existing=existing)
+    return render_template("credentials.html", existing=existing, platform_existing=platform_existing)
 
 
 # ── Routes: Dashboard ──
@@ -232,6 +341,7 @@ def dashboard():
 @app.route("/run", methods=["POST"])
 @login_required
 def run_agent():
+    write_platforms_toml()
     playbook = request.form.get("playbook", "identity-compromise.yaml")
     alert_file = request.form.get("alert_file", "")
 
@@ -255,6 +365,7 @@ def run_agent():
 
 def _execute_run(run_id: int, playbook: str, alert_file: str) -> None:
     """Execute the agent in a background thread."""
+    write_platforms_toml()
     conn = get_db()
     try:
         # Load credentials from DB into environment

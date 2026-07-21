@@ -11,30 +11,38 @@ After cloning the repo, run this once. It will:
 1. Check Python version and system requirements
 2. Install Python dependencies
 3. Detect already-installed security tools
-4. Prompt for platform credentials (TheHive, Cortex, Wazuh, threat intel)
-5. Generate config/platforms.toml from your answers
-6. Validate connectivity to configured platforms
-7. Install the Codex skill to ~/.agents/skills/
-8. Run a self-test
+4. Configure the web portal admin account
+5. Validate connectivity to configured platforms
+6. Install the Codex skill to ~/.agents/skills/
+7. Run a self-test
 """
 
 from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import platform
+import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
+import venv
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "config"
+DATA_DIR = ROOT / "data"
+DB_PATH = DATA_DIR / "soc_operator.db"
+VENV_DIR = ROOT / ".venv"
 SKILLS_SRC = ROOT / "skills"
 SKILLS_DEST = Path.home() / ".agents" / "skills"
+VENV_PYTHON: Path | None = None
 
 # ── Colors ──
 
@@ -47,21 +55,21 @@ RESET = "\033[0m"
 
 
 def status(msg: str) -> None:
-    print(f"  [OK] {msg}")
+    print(f"{GREEN}✓{RESET} {msg}")
 
 
 def warn(msg: str) -> None:
-    print(f"  [!!] {msg}")
+    print(f"{YELLOW}⚠{RESET} {msg}")
 
 
 def error(msg: str) -> None:
-    print(f"  [XX] {msg}")
+    print(f"{RED}✗{RESET} {msg}")
 
 
 def header(msg: str) -> None:
-    print(f"\n{BOLD}{CYAN}{'=' * 60}{RESET}")
+    print(f"\n{BOLD}{CYAN}{'─' * 60}{RESET}")
     print(f"{BOLD}{CYAN}  {msg}{RESET}")
-    print(f"{BOLD}{CYAN}{'=' * 60}{RESET}\n")
+    print(f"{BOLD}{CYAN}{'─' * 60}{RESET}\n")
 
 
 # ── Step 1: System checks ──
@@ -74,47 +82,6 @@ def check_python() -> bool:
         return False
     status(f"Python {major}.{minor}.{sys.version_info[2]}")
     return True
-
-
-def check_system_commands() -> bool:
-    required = {"git": "version control", "curl": "HTTP client"}
-    optional = {"python3-venv": "virtual environment support"}
-    missing_required = []
-    for cmd, desc in required.items():
-        if shutil.which(cmd):
-            status(f"{cmd:20s} — {desc}")
-        else:
-            error(f"{cmd:20s} — MISSING ({desc})")
-            missing_required.append(cmd)
-    for cmd, desc in optional.items():
-        if shutil.which(cmd):
-            status(f"{cmd:20s} — {desc}")
-        else:
-            warn(f"{cmd:20s} — not found ({desc})")
-    if missing_required:
-        error(f"Install missing commands: {', '.join(missing_required)}")
-        return False
-    return True
-
-
-def create_venv() -> bool:
-    venv_dir = ROOT / ".venv"
-    if venv_dir.is_dir():
-        status(f"Virtual environment exists: {venv_dir}")
-        return True
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "venv", str(venv_dir)],
-            capture_output=True, text=True, check=True,
-        )
-        status(f"Created virtual environment: {venv_dir}")
-        return True
-    except subprocess.CalledProcessError as e:
-        # Common on Kali: missing python3-venv
-        warn(f"venv creation failed: {e.stderr}")
-        warn("Try: sudo apt-get install -y python3-venv python3-pip python3-dev")
-        warn("Then re-run bootstrap.")
-        return False
 
 
 def check_dependencies() -> bool:
@@ -136,22 +103,62 @@ def check_dependencies() -> bool:
     return True
 
 
+def _venv_python() -> Path:
+    if platform.system() == "Windows":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
+
+
+def create_venv() -> Path | None:
+    global VENV_PYTHON
+    py = _venv_python()
+    if py.is_file():
+        VENV_PYTHON = py
+        return py
+
+    def _attempt_create() -> bool:
+        try:
+            builder = venv.EnvBuilder(with_pip=True, clear=False, symlinks=True)
+            builder.create(VENV_DIR)
+            return py.is_file()
+        except Exception as exc:
+            warn(f"venv creation failed: {exc}")
+            return False
+
+    if _attempt_create():
+        VENV_PYTHON = py
+        status(f"Virtual environment created at {VENV_DIR}")
+        return py
+
+    if platform.system() == "Linux":
+        warn("Trying to install python3-venv and python3-pip, then retrying venv creation")
+        result = subprocess.run(
+            ["sudo", "apt-get", "install", "-y", "python3-venv", "python3-pip"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and _attempt_create():
+            VENV_PYTHON = py
+            status(f"Virtual environment created at {VENV_DIR}")
+            return py
+        if result.returncode != 0:
+            error(f"Unable to install python3-venv/python3-pip:\n{result.stderr}")
+    return None
+
+
 def install_python_deps() -> bool:
     req = ROOT / "requirements.txt"
     if not req.is_file():
         warn("requirements.txt not found, skipping pip install")
         return True
-    # Use venv pip if available, otherwise fall back to system pip
-    venv_pip = ROOT / ".venv" / "bin" / "python"
-    pip_target = str(venv_pip) if venv_pip.is_file() else sys.executable
+    python_bin = VENV_PYTHON or sys.executable
     result = subprocess.run(
-        [pip_target, "-m", "pip", "install", "-q", "-r", str(req)],
+        [str(python_bin), "-m", "pip", "install", "-q", "-r", str(req)],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         error(f"pip install failed:\n{result.stderr}")
-        warn("On Kali, you may need: sudo apt-get install -y build-essential libssl-dev libffi-dev")
         return False
     status("Python dependencies installed")
     return True
@@ -160,220 +167,131 @@ def install_python_deps() -> bool:
 # ── Step 2: Detect installed tools ──
 
 KNOWN_TOOLS = {
-    "nmap": "Network discovery and port scanning",
-    "masscan": "Fast port scanner",
-    "whatweb": "Web fingerprinting",
-    "nikto": "Web vulnerability scanner",
-    "gobuster": "Content discovery",
-    "ffuf": "Fuzzing and content discovery",
-    "enum4linux-ng": "SMB enumeration",
-    "snmpwalk": "SNMP enumeration",
-    "hydra": "Credential testing",
-    "sqlmap": "SQL injection testing",
-    "semgrep": "Static analysis",
-    "bandit": "Python security linting",
-    "yara": "Malware triage rules",
-    "vol": "Memory forensics",
-    "tshark": "Packet analysis",
-    "lynis": "System hardening audit",
-    "pandoc": "Document conversion",
-    "shellcheck": "Shell script linting",
+    "nmap": {"apt": "nmap", "brew": "nmap", "desc": "Network discovery and port scanning"},
+    "masscan": {"apt": "masscan", "brew": "masscan", "desc": "Fast port scanner"},
+    "whatweb": {"apt": "whatweb", "brew": "whatweb", "desc": "Web fingerprinting"},
+    "nikto": {"apt": "nikto", "brew": "nikto", "desc": "Web vulnerability scanner"},
+    "gobuster": {"apt": "gobuster", "brew": "gobuster", "desc": "Content discovery"},
+    "ffuf": {"apt": None, "brew": "ffuf", "desc": "Fuzzing and content discovery"},
+    "enum4linux-ng": {"apt": "enum4linux-ng", "brew": None, "desc": "SMB enumeration"},
+    "snmpwalk": {"apt": "snmp", "brew": "net-snmp", "desc": "SNMP enumeration"},
+    "hydra": {"apt": "hydra", "brew": "hydra", "desc": "Credential testing"},
+    "sqlmap": {"apt": "sqlmap", "brew": "sqlmap", "desc": "SQL injection testing"},
+    "semgrep": {"apt": None, "brew": "semgrep", "desc": "Static analysis"},
+    "bandit": {"apt": None, "brew": None, "desc": "Python security linting"},
+    "yara": {"apt": "yara", "brew": "yara", "desc": "Malware triage rules"},
+    "vol": {"apt": None, "brew": None, "desc": "Memory forensics"},
+    "tshark": {"apt": "tshark", "brew": "wireshark", "desc": "Packet analysis"},
+    "lynis": {"apt": "lynis", "brew": "lynis", "desc": "System hardening audit"},
+    "pandoc": {"apt": "pandoc", "brew": "pandoc", "desc": "Document conversion"},
+    "shellcheck": {"apt": "shellcheck", "brew": "shellcheck", "desc": "Shell script linting"},
 }
 
 
 def detect_tools() -> dict[str, bool]:
-    header("Step 2/8 — Installed Tools Detection")
+    header("Step 2/6 — Installed Tools Detection")
     found = {}
-    for tool, desc in KNOWN_TOOLS.items():
+    for tool, meta in KNOWN_TOOLS.items():
         path = shutil.which(tool)
         if path:
-            status(f"{tool:20s} — {desc}")
+            status(f"{tool:20s} — {meta['desc']}")
             found[tool] = True
         else:
-            warn(f"{tool:20s} — not found ({desc})")
+            warn(f"{tool:20s} — not found ({meta['desc']})")
             found[tool] = False
     installed = sum(found.values())
     print(f"\n  {installed}/{len(found)} tools detected")
     return found
 
 
-# ── Step 3: Credential prompts ──
+def install_tools(found: dict[str, bool]) -> None:
+    missing = [tool for tool, present in found.items() if not present]
+    if not missing:
+        status("All required tools already installed")
+        return
 
-def prompt_credential(env_name: str, description: str, required: bool = False) -> str | None:
-    value = os.environ.get(env_name, "")
-    if value:
-        status(f"{env_name} already set in environment")
-        return value
-    if required:
-        value = getpass.getpass(f"  {description} ({env_name}): ")
-    else:
-        value = input(f"  {description} ({env_name}, Enter to skip): ").strip()
-    return value or None
+    print("\nMissing tools:")
+    for tool in missing:
+        print(f"  - {tool}")
 
+    answer = input("Install missing tools now? [y/N] ").strip().lower()
+    if answer not in {"y", "yes"}:
+        warn("Skipping tool installation")
+        return
 
-def prompt_platform_config() -> dict[str, Any]:
-    header("Step 3/8 — Platform Credentials")
-    print("Enter credentials for the platforms you want to configure.")
-    print("Press Enter to skip any platform you don't need yet.\n")
+    if platform.system() == "Darwin":
+        warn("macOS detected — install these with Homebrew:")
+        for tool in missing:
+            pkg = KNOWN_TOOLS.get(tool, {}).get("brew")
+            if pkg:
+                print(f"  brew install {pkg}")
+            else:
+                warn(f"No Homebrew package mapping for {tool}")
+        return
 
-    config: dict[str, Any] = {"platforms": {}}
+    if platform.system() != "Linux":
+        warn("Automatic tool installation is only implemented for Linux")
+        return
 
-    # ── TheHive ──
-    print(f"{BOLD}TheHive (case management):{RESET}")
-    th_url = input("  Base URL (https://thehive.example.com): ").strip()
-    if th_url:
-        th_key = prompt_credential("THEHIVE_API_KEY", "API key", required=True)
-        if th_key:
-            config["platforms"]["thehive"] = {
-                "enabled": True,
-                "base_url": th_url,
-                "credential_env": "THEHIVE_API_KEY",
-            }
-            os.environ["THEHIVE_API_KEY"] = th_key
-            status("TheHive configured")
-    print()
+    apt_packages = []
+    for tool in missing:
+        pkg = KNOWN_TOOLS.get(tool, {}).get("apt")
+        if pkg:
+            apt_packages.append(pkg)
+        else:
+            warn(f"No apt package mapping for {tool} — skipping")
 
-    # ── Cortex ──
-    print(f"{BOLD}Cortex (analyzer/responder engine):{RESET}")
-    cx_url = input("  Base URL (https://cortex.example.com): ").strip()
-    if cx_url:
-        cx_key = prompt_credential("CORTEX_API_KEY", "API key", required=True)
-        if cx_key:
-            config["platforms"]["cortex"] = {
-                "enabled": True,
-                "base_url": cx_url,
-                "credential_env": "CORTEX_API_KEY",
-            }
-            os.environ["CORTEX_API_KEY"] = cx_key
-            status("Cortex configured")
-    print()
+    if not apt_packages:
+        warn("No installable packages found")
+        return
 
-    # ── Wazuh Manager ──
-    print(f"{BOLD}Wazuh Manager:{RESET}")
-    wazuh_url = input("  Base URL (https://wazuh-manager.example.com:55000): ").strip()
-    if wazuh_url:
-        wazuh_key = prompt_credential("WAZUH_API_TOKEN", "API token", required=True)
-        if wazuh_key:
-            config["platforms"]["wazuh_manager"] = {
-                "enabled": True,
-                "base_url": wazuh_url,
-                "credential_env": "WAZUH_API_TOKEN",
-            }
-            os.environ["WAZUH_API_TOKEN"] = wazuh_key
-            status("Wazuh Manager configured")
-    print()
-
-    # ── Wazuh Indexer ──
-    print(f"{BOLD}Wazuh Indexer (Elasticsearch-compatible):{RESET}")
-    idx_url = input("  Base URL (https://wazuh-indexer.example.com:9200): ").strip()
-    if idx_url:
-        idx_user = input("  Username: ").strip()
-        idx_pass = getpass.getpass("  Password: ")
-        if idx_user and idx_pass:
-            config["platforms"]["wazuh_indexer"] = {
-                "enabled": True,
-                "base_url": idx_url,
-                "username_env": "WAZUH_INDEXER_USERNAME",
-                "password_env": "WAZUH_INDEXER_PASSWORD",
-            }
-            os.environ["WAZUH_INDEXER_USERNAME"] = idx_user
-            os.environ["WAZUH_INDEXER_PASSWORD"] = idx_pass
-            status("Wazuh Indexer configured")
-    print()
-
-    # ── Threat Intelligence ──
-    print(f"{BOLD}Threat Intelligence Platforms:{RESET}")
-
-    vt_key = prompt_credential("VIRUSTOTAL_API_KEY", "VirusTotal API key")
-    if vt_key:
-        config["platforms"]["virustotal"] = {
-            "enabled": True,
-            "credential_env": "VIRUSTOTAL_API_KEY",
-        }
-        os.environ["VIRUSTOTAL_API_KEY"] = vt_key
-
-    abuse_key = prompt_credential("ABUSEIPDB_API_KEY", "AbuseIPDB API key")
-    if abuse_key:
-        config["platforms"]["abuseipdb"] = {
-            "enabled": True,
-            "credential_env": "ABUSEIPDB_API_KEY",
-        }
-        os.environ["ABUSEIPDB_API_KEY"] = abuse_key
-
-    shodan_key = prompt_credential("SHODAN_API_KEY", "Shodan API key")
-    if shodan_key:
-        config["platforms"]["shodan"] = {
-            "enabled": True,
-            "credential_env": "SHODAN_API_KEY",
-        }
-        os.environ["SHODAN_API_KEY"] = shodan_key
-
-    urlscan_key = prompt_credential("URLSCAN_API_KEY", "urlscan.io API key")
-    if urlscan_key:
-        config["platforms"]["urlscan"] = {
-            "enabled": True,
-            "credential_env": "URLSCAN_API_KEY",
-        }
-        os.environ["URLSCAN_API_KEY"] = urlscan_key
-
-    ha_key = prompt_credential("HYBRID_ANALYSIS_API_KEY", "Hybrid Analysis API key")
-    if ha_key:
-        config["platforms"]["hybrid_analysis"] = {
-            "enabled": True,
-            "credential_env": "HYBRID_ANALYSIS_API_KEY",
-        }
-        os.environ["HYBRID_ANALYSIS_API_KEY"] = ha_key
-
-    misp_url = input("  MISC base URL (https://misp.example.com, Enter to skip): ").strip()
-    if misp_url:
-        misp_key = prompt_credential("MISP_API_KEY", "MISP API key", required=True)
-        if misp_key:
-            config["platforms"]["misp"] = {
-                "enabled": True,
-                "base_url": misp_url,
-                "credential_env": "MISP_API_KEY",
-            }
-            os.environ["MISP_API_KEY"] = misp_key
-
-    enabled = [k for k, v in config["platforms"].items() if v.get("enabled")]
-    print(f"\n  {len(enabled)} platform(s) configured: {', '.join(enabled) or 'none'}")
-    return config
+    cmd = ["sudo", "apt-get", "install", "-y", *sorted(set(apt_packages))]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        error(f"Tool installation failed:\n{result.stderr}")
+        return
+    status("Missing tools installed")
 
 
-# ── Step 4: Write config ──
 
-def write_platform_config(config: dict[str, Any]) -> bool:
-    header("Step 4/8 — Generating Configuration")
+PLATFORM_DEFAULTS = {
+    "thehive": "https://thehive.example.com",
+    "cortex": "https://cortex.example.com",
+    "wazuh_manager": "https://wazuh-manager.example.com:55000",
+    "wazuh_indexer": "https://wazuh-indexer.example.com:9200",
+    "virustotal": "https://www.virustotal.com",
+    "abuseipdb": "https://api.abuseipdb.com",
+    "shodan": "https://api.shodan.io",
+    "urlscan": "https://urlscan.io",
+    "hybrid_analysis": "https://www.hybrid-analysis.com",
+    "misp": "https://misp.example.com",
+}
+
+
+def write_blank_platform_config() -> None:
     output = CONFIG_DIR / "platforms.toml"
     lines = [
         "# AI SOC Operator — Platform Configuration",
         "# Generated by bootstrap.py",
-        "# Do not commit this file with real credentials.",
+        "# Edit platform connections in the web portal settings.",
         "",
     ]
-    for name, platform_cfg in sorted(config.get("platforms", {}).items()):
-        lines.append(f"[platforms.{name}]")
-        lines.append(f"enabled = {str(platform_cfg.get('enabled', False)).lower()}")
-        if "base_url" in platform_cfg:
-            lines.append(f'base_url = "{platform_cfg["base_url"]}"')
-        if "credential_env" in platform_cfg:
-            lines.append(f'credential_env = "{platform_cfg["credential_env"]}"')
-        if "username_env" in platform_cfg:
-            lines.append(f'username_env = "{platform_cfg["username_env"]}"')
-        if "password_env" in platform_cfg:
-            lines.append(f'password_env = "{platform_cfg["password_env"]}"')
-        lines.append("")
-
+    for name, base_url in PLATFORM_DEFAULTS.items():
+        lines.extend([
+            f"[platforms.{name}]",
+            "enabled = false",
+            f'base_url = "{base_url}"',
+            "",
+        ])
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines), encoding="utf-8")
-    status(f"Configuration written to {output}")
-    return True
+    status(f"Blank platform config written to {output}")
 
 
 # ── Step 5: Validate connectivity ──
 
 def validate_connectivity(config: dict[str, Any]) -> None:
-    header("Step 5/8 — Connectivity Validation")
+    header("Step 5/6 — Connectivity Validation")
     import ssl
     import urllib.error
     import urllib.request
@@ -411,7 +329,7 @@ def validate_connectivity(config: dict[str, Any]) -> None:
 # ── Step 6: Install Codex skills ──
 
 def install_skills() -> bool:
-    header("Step 6/8 — Installing Codex Skills")
+    header("Step 3/6 — Installing Codex Skills")
     if not SKILLS_SRC.is_dir():
         warn(f"Skills source not found: {SKILLS_SRC}")
         return False
@@ -438,28 +356,13 @@ def install_skills() -> bool:
         status(f"{installed} skill(s) installed to {SKILLS_DEST}")
     else:
         status("All skills already installed")
-
-    # Install system command
-    bin_src = ROOT / "bin" / "ai-soc-operator"
-    bin_dest = Path("/usr/local/bin/ai-soc-operator")
-    if bin_src.is_file() and not bin_dest.exists():
-        try:
-            import shutil as _shutil
-            _shutil.copy2(bin_src, bin_dest)
-            bin_dest.chmod(0o755)
-            status(f"Installed system command: {bin_dest}")
-        except PermissionError:
-            warn(f"Could not install to {bin_dest} (permission denied)")
-            warn(f"Run manually: sudo cp {bin_src} /usr/local/bin/")
-    elif bin_dest.exists():
-        status("System command already installed")
     return True
 
 
 # ── Step 7: Scope configuration ──
 
 def configure_scope() -> None:
-    header("Step 7/8 — Target Scope")
+    header("Step 4/6 — Target Scope")
     scope_file = CONFIG_DIR / "scope.toml"
     if scope_file.exists():
         status(f"Scope already configured: {scope_file}")
@@ -515,10 +418,66 @@ def configure_scope() -> None:
     status(f"Scope written to {scope_file}")
 
 
-# ── Step 8: Self-test ──
+# ── Step 8: Web credentials ──
+
+def hash_password(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest() + f":{salt}"
+
+
+def setup_web_credentials() -> None:
+    header("Step 5/6 — Web Portal Admin Account")
+    create_account = input("Create web portal admin account? [Y/n] ").strip().lower()
+    if create_account in {"n", "no"}:
+        warn("Skipping web portal setup")
+        return
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT
+            )
+            """
+        )
+        existing = conn.execute("SELECT username FROM users ORDER BY id LIMIT 1").fetchone()
+        if existing:
+            status(f"Web user already exists: {existing[0]} — skipping")
+            return
+
+        username = input("  Username [admin]: ").strip() or "admin"
+        while True:
+            password = getpass.getpass("  Password (min 8 chars): ")
+            confirm = getpass.getpass("  Confirm password: ")
+            if len(password) < 8:
+                warn("Password must be at least 8 characters")
+                continue
+            if password != confirm:
+                warn("Passwords do not match")
+                continue
+            break
+
+        password_hash = hash_password(password)
+        conn.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (username, password_hash, datetime.utcnow().isoformat() + "Z"),
+        )
+        conn.commit()
+        status(f"Created web portal admin account: {username}")
+        print("Web portal ready — run: python3 web/app.py")
+    finally:
+        conn.close()
+
+
+# ── Step 9: Self-test ──
 
 def run_self_test() -> bool:
-    header("Step 8/8 — Self-Test")
+    header("Step 6/6 — Self-Test")
     # Test playbook loading
     try:
         sys.path.insert(0, str(ROOT))
@@ -625,30 +584,27 @@ def main() -> int:
     # ── Full bootstrap ──
     if not check_python():
         return 1
-    if not check_system_commands():
-        return 1
     check_dependencies()
-    if not create_venv():
-        return 1
+    create_venv()
     install_python_deps()
-    detect_tools()
-    config = prompt_platform_config()
-    write_platform_config(config)
-    validate_connectivity(config)
+    found = detect_tools()
+    install_tools(found)
+    write_blank_platform_config()
     install_skills()
     configure_scope()
+    setup_web_credentials()
     run_self_test()
 
     header("Bootstrap Complete")
     print(f"{GREEN}AI SOC Operator is ready.{RESET}")
     print(f"\nNext steps:")
     print(f"  1. Review config/platforms.toml and config/scope.toml")
-    print(f"  2. Set platform credentials in your shell profile:")
-    print(f"     export THEHIVE_API_KEY=your-key-here")
-    print(f"     export CORTEX_API_KEY=your-key-here")
-    print(f"  3. Run an alert through the orchestrator:")
+    print(f"  2. Open the web portal → Settings → Platform Connections to add your API keys and base URLs")
+    print(f"  3. Activate the virtual environment:")
+    print(f"     source .venv/bin/activate")
+    print(f"  4. Run an alert through the orchestrator:")
     print(f"     python3 -m scripts.orchestrator --alert alert.json")
-    print(f"  4. Or use a specific playbook:")
+    print(f"  5. Or use a specific playbook:")
     print(f"     python3 -m scripts.orchestrator --alert alert.json --playbook playbooks/identity-compromise.yaml")
     print()
     return 0
