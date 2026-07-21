@@ -6,7 +6,7 @@
         <h2 class="text-xl font-bold">Dashboard</h2>
         <form method="POST" action="{{ url_for('run_agent') }}" class="flex gap-2" id="run-form">
             <select name="playbook" class="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm">
-                {% for pb in playbooks if playbooks is defined else [] %}
+                {% for pb in (playbooks if playbooks is defined else []) %}
                 <option value="{{ pb.name }}">{{ pb.name }}</option>
                 {% endfor %}
                 <option value="identity-compromise.yaml">identity-compromise.yaml</option>
