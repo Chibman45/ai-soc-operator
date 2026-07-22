@@ -734,3 +734,5 @@ if __name__ == "__main__":
     print(f"  Network: http://{ip}:{port}")
     print(f"{'='*50}\n")
     app.run(host="0.0.0.0", port=port, debug=True)
+from web.routes.chat import chat_bp  
+app.register_blueprint(chat_bp) 
