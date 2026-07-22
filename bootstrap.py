@@ -72,6 +72,18 @@ def header(msg: str) -> None:
     print(f"{BOLD}{CYAN}{'─' * 60}{RESET}\n")
 
 
+def sudo_available() -> bool:
+    if platform.system() != "Linux":
+        return False
+    result = subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def print_manual_sudo(command: list[str]) -> None:
+    print("Run this manually with sudo, then re-run bootstrap:")
+    print("  " + " ".join(command))
+
+
 # ── Step 1: System checks ──
 
 def check_python() -> bool:
@@ -131,12 +143,13 @@ def create_venv() -> Path | None:
         return py
 
     if platform.system() == "Linux":
+        command = ["sudo", "apt-get", "install", "-y", "python3-venv", "python3-pip"]
+        if not sudo_available():
+            warn("sudo is not available non-interactively for python3-venv installation")
+            print_manual_sudo(command)
+            return None
         warn("Trying to install python3-venv and python3-pip, then retrying venv creation")
-        result = subprocess.run(
-            ["sudo", "apt-get", "install", "-y", "python3-venv", "python3-pip"],
-            capture_output=True,
-            text=True,
-        )
+        result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode == 0 and _attempt_create():
             VENV_PYTHON = py
             status(f"Virtual environment created at {VENV_DIR}")
@@ -246,6 +259,10 @@ def install_tools(found: dict[str, bool]) -> None:
         return
 
     cmd = ["sudo", "apt-get", "install", "-y", *sorted(set(apt_packages))]
+    if not sudo_available():
+        warn("sudo is not available non-interactively for tool installation")
+        print_manual_sudo(cmd)
+        return
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         error(f"Tool installation failed:\n{result.stderr}")
@@ -357,6 +374,54 @@ def install_skills() -> bool:
     else:
         status("All skills already installed")
     return True
+
+
+def install_system_command() -> None:
+    source = ROOT / "bin" / "ai-soc-operator"
+    if not source.is_file():
+        warn(f"Command template not found: {source}")
+        return
+
+    script = source.read_text(encoding="utf-8")
+    script = script.replace('REPO_DIR="${AI_SOC_HOME:-$HOME/ai-soc-operator}"', f'REPO_DIR="{ROOT}"')
+
+    target_dir = Path("/usr/local/bin")
+    target = target_dir / "ai-soc-operator"
+    local_target_dir = Path.home() / ".local" / "bin"
+    local_target = local_target_dir / "ai-soc-operator"
+
+    def write_target(dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(script, encoding="utf-8")
+        dest.chmod(0o755)
+
+    if sudo_available():
+        tmp = Path("/tmp") / "ai-soc-operator"
+        tmp.write_text(script, encoding="utf-8")
+        tmp.chmod(0o755)
+        result = subprocess.run(["sudo", "cp", str(tmp), str(target)], capture_output=True, text=True)
+        if result.returncode != 0:
+            error(f"Failed to install command to {target}:\n{result.stderr}")
+            return
+        subprocess.run(["sudo", "chmod", "+x", str(target)], capture_output=True, text=True)
+        status(f"Installed command to {target}")
+    else:
+        write_target(local_target)
+        bashrc = Path.home() / ".bashrc"
+        zshrc = Path.home() / ".zshrc"
+        path_line = 'export PATH="$HOME/.local/bin:$PATH"'
+        for shell_rc in [bashrc, zshrc if zshrc.exists() else None]:
+            if shell_rc is None:
+                continue
+            content = shell_rc.read_text(encoding="utf-8") if shell_rc.exists() else ""
+            if path_line not in content:
+                with shell_rc.open("a", encoding="utf-8") as handle:
+                    handle.write("\n" + path_line + "\n")
+        print("Added ~/.local/bin to PATH — run: source ~/.bashrc")
+        status(f"Installed command to {local_target}")
+
+    print("Command installed: ai-soc-operator")
+    print("Run it from anywhere to start the web portal.")
 
 
 # ── Step 7: Scope configuration ──
@@ -577,8 +642,7 @@ def main() -> int:
     if args.validate:
         config = load_existing_config()
         if config:
-            validate_connectivity(config)
-        run_self_test()
+                run_self_test()
         return 0
 
     # ── Full bootstrap ──
@@ -591,6 +655,7 @@ def main() -> int:
     install_tools(found)
     write_blank_platform_config()
     install_skills()
+    install_system_command()
     configure_scope()
     setup_web_credentials()
     run_self_test()
