@@ -1,0 +1,188 @@
+<!-- Chat panel for case detail page -->
+<div class="bg-gray-900 border border-gray-800 rounded-xl flex flex-col" style="height: 600px;">
+    <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+        <h3 class="font-medium">💬 SOC Copilot</h3>
+        <span class="text-xs text-gray-500" id="chat-status">Ready</span>
+    </div>
+
+    <!-- Messages -->
+    <div class="flex-1 overflow-y-auto p-4 space-y-3" id="chat-messages">
+        <div class="text-center text-gray-600 text-sm py-8">
+            Ask about this case — the AI analyst will analyze it and suggest actions.
+        </div>
+    </div>
+
+    <!-- Suggested Actions -->
+    <div id="chat-actions" class="px-4 py-2 border-t border-gray-800 hidden">
+        <div class="text-xs text-gray-500 mb-2">Suggested Actions</div>
+        <div class="flex flex-wrap gap-2" id="chat-actions-list"></div>
+    </div>
+
+    <!-- Input -->
+    <div class="px-4 py-3 border-t border-gray-800">
+        <div class="flex gap-2">
+            <input type="text" id="chat-input" placeholder="Ask about this case..."
+                class="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 text-sm focus:outline-none focus:border-blue-500"
+                onkeypress="if(event.key==='Enter')sendChat()">
+            <button onclick="sendChat()" id="chat-send"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition">
+                Send
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+const CASE_ID = {{ case.id }};
+
+async function sendChat() {
+    const input = document.getElementById('chat-input');
+    const msg = input.value.trim();
+    if (!msg) return;
+
+    input.value = '';
+    appendMessage('user', msg);
+
+    document.getElementById('chat-status').textContent = 'Thinking...';
+    document.getElementById('chat-send').disabled = true;
+
+    try {
+        const resp = await fetch(`/api/chat/${CASE_ID}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({message: msg})
+        });
+        const data = await resp.json();
+
+        if (data.ok) {
+            appendMessage('assistant', data.answer, data.citations);
+            if (data.suggested_actions && data.suggested_actions.length > 0) {
+                showActions(data.suggested_actions);
+            }
+        } else {
+            appendMessage('system', 'Error: ' + (data.error || 'unknown'));
+        }
+    } catch (e) {
+        appendMessage('system', 'Connection error: ' + e.message);
+    }
+
+    document.getElementById('chat-status').textContent = 'Ready';
+    document.getElementById('chat-send').disabled = false;
+}
+
+function appendMessage(type, content, citations) {
+    const container = document.getElementById('chat-messages');
+    // Remove placeholder on first message
+    if (container.children.length === 1 && container.children[0].classList.contains('text-center')) {
+        container.innerHTML = '';
+    }
+
+    const div = document.createElement('div');
+    div.className = 'fade-in';
+
+    const colors = {
+        'user': 'bg-blue-600 text-white ml-12',
+        'assistant': 'bg-gray-800 text-gray-100 mr-12',
+        'system': 'bg-yellow-900/50 text-yellow-300 text-sm',
+    };
+
+    const labels = {
+        'user': 'You',
+        'assistant': '🤖 SOC Copilot',
+        'system': 'System',
+    };
+
+    div.innerHTML = `
+        <div class="text-xs text-gray-500 mb-1">${labels[type] || type}</div>
+        <div class="px-4 py-3 rounded-xl text-sm whitespace-pre-wrap ${colors[type] || 'bg-gray-800'}">${escapeHtml(content)}</div>
+        ${citations && citations.length > 0 ? '<div class="text-xs text-gray-600 mt-1">📎 ' + citations.map(c => c.label || c.ref).join(', ') + '</div>' : ''}
+    `;
+
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+}
+
+function showActions(actions) {
+    const container = document.getElementById('chat-actions');
+    const list = document.getElementById('chat-actions-list');
+    list.innerHTML = '';
+    container.classList.remove('hidden');
+
+    actions.forEach(action => {
+        const btn = document.createElement('button');
+        btn.className = `px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+            action.requires_approval
+                ? 'bg-yellow-900 text-yellow-300 hover:bg-yellow-800'
+                : 'bg-green-900 text-green-300 hover:bg-green-800'
+        }`;
+        btn.textContent = `${action.requires_approval ? '🔐 ' : '▶ '}${action.label}`;
+        btn.onclick = () => executeAction(action);
+        list.appendChild(btn);
+    });
+}
+
+async function executeAction(action) {
+    if (action.requires_approval) {
+        if (!confirm(`Approve: ${action.description}?`)) return;
+    }
+
+    document.getElementById('chat-status').textContent = `Running ${action.label}...`;
+
+    try {
+        // Create the action
+        const createResp = await fetch(`/api/chat/${CASE_ID}/action`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                action_type: action.action_type,
+                label: action.label,
+                description: action.description,
+                tool_name: action.tool_name,
+                tool_args: action.tool_args,
+                requires_approval: action.requires_approval
+            })
+        });
+        const createAction = await createResp.json();
+
+        if (createAction.ok) {
+            // Approve it
+            const approveResp = await fetch(`/api/chat/${CASE_ID}/action/${createAction.action.id}/approve`, {
+                method: 'POST'
+            });
+            const result = await approveResp.json();
+
+            if (result.ok && result.result) {
+                const r = result.result;
+                appendMessage('system', `✅ ${action.label}\nCommand: ${r.command_preview}\nExit: ${r.exit_code}\n\n${r.stdout || r.stderr || '(no output)'}`);
+            } else {
+                appendMessage('system', `✅ ${action.label} completed`);
+            }
+        }
+    } catch (e) {
+        appendMessage('system', `❌ Error: ${e.message}`);
+    }
+
+    document.getElementById('chat-status').textContent = 'Ready';
+    // Clear actions
+    document.getElementById('chat-actions').classList.add('hidden');
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Load history on page load
+(async function() {
+    try {
+        const resp = await fetch(`/api/chat/${CASE_ID}/history`);
+        const data = await resp.json();
+        if (data.ok && data.messages && data.messages.length > 0) {
+            data.messages.forEach(msg => {
+                appendMessage(msg.sender_type, msg.content, msg.citations);
+            });
+        }
+    } catch (e) {}
+})();
+</script>
