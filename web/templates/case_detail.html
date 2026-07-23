@@ -15,7 +15,7 @@
     </div>
 
     <div class="grid grid-cols-3 gap-6">
-        <!-- Case Info -->
+        <!-- Case Info + Chat Copilot -->
         <div class="col-span-2 space-y-4">
             <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
                 <h3 class="font-medium mb-3">Summary</h3>
@@ -39,6 +39,11 @@
                 <pre class="text-xs text-gray-400 bg-gray-800 rounded-lg p-4 overflow-x-auto max-h-64">{{ run.result_json or 'No output.' }}</pre>
             </div>
             {% endif %}
+
+            <!-- SOC Copilot Chat -->
+            <div data-case-id="{{ case.id }}">
+                {% include 'chat_panel.html' %}
+            </div>
         </div>
 
         <!-- Activity Timeline -->
