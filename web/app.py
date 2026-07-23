@@ -44,7 +44,26 @@ app.secret_key = secrets.token_hex(32)
 # ── Database ──
 
 def get_db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    data_dir = DB_PATH.parent
+    data_dir.mkdir(parents=True, exist_ok=True)
+    # Check writability — common failure when bootstrap ran as root
+    import os
+    if data_dir.exists() and not os.access(data_dir, os.W_OK):
+        print(
+            f"\n[ERROR] Cannot write to {data_dir}\n"
+            f"  Fix with: sudo chown -R $USER {data_dir}\n"
+            f"  Then re-run: ai-soc-operator\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if DB_PATH.exists() and not os.access(DB_PATH, os.W_OK):
+        print(
+            f"\n[ERROR] Database file is not writable: {DB_PATH}\n"
+            f"  Fix with: sudo chown $USER {DB_PATH}\n"
+            f"  Then re-run: ai-soc-operator\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn

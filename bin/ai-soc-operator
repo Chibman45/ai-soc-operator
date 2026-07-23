@@ -12,4 +12,43 @@ if [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
 fi
 
 cd "$REPO_DIR"
+
+# Ensure data/ directory exists and is owned by the current user.
+# Bootstrap may have created it as root if run with sudo.
+DATA_DIR="$REPO_DIR/data"
+if [[ ! -d "$DATA_DIR" ]]; then
+  mkdir -p "$DATA_DIR"
+elif [[ ! -w "$DATA_DIR" ]]; then
+  echo ""
+  echo "[ERROR] $DATA_DIR is not writable by $(whoami)."
+  echo "  Fix with:  sudo chown -R \$USER \"$DATA_DIR\""
+  echo "  Then re-run: ai-soc-operator"
+  echo ""
+  exit 1
+fi
+
+# Detect local IP for display
+LOCAL_IP=$(python3 -c "
+import socket
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(('8.8.8.8', 80))
+    print(s.getsockname()[0])
+    s.close()
+except Exception:
+    print('127.0.0.1')
+" 2>/dev/null || echo "127.0.0.1")
+
+PORT="${AI_SOC_PORT:-5000}"
+
+echo ""
+echo "=================================================="
+echo "  AI SOC Operator"
+echo "  Local:   http://localhost:$PORT"
+echo "  Network: http://$LOCAL_IP:$PORT"
+echo "=================================================="
+echo ""
+echo "Press Ctrl+C to stop."
+echo ""
+
 exec "$PYTHON" -m web.app
