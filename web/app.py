@@ -244,8 +244,14 @@ def build_platforms_toml() -> str:
 
 def write_platforms_toml() -> None:
     output = ROOT / "config" / "platforms.toml"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(build_platforms_toml(), encoding="utf-8")
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(build_platforms_toml(), encoding="utf-8")
+    except PermissionError:
+        raise PermissionError(
+            f"Cannot write to {output}. "
+            f"Fix with: sudo chown -R $USER {output.parent}"
+        )
 
 
 def login_required(f):
@@ -360,7 +366,10 @@ def dashboard():
 @app.route("/run", methods=["POST"])
 @login_required
 def run_agent():
-    write_platforms_toml()
+    try:
+        write_platforms_toml()
+    except PermissionError as e:
+        return jsonify({"error": str(e), "fix": "sudo chown -R $USER config/"}), 500
     playbook = request.form.get("playbook", "identity-compromise.yaml")
     alert_file = request.form.get("alert_file", "")
 
