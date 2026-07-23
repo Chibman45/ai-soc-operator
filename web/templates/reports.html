@@ -21,6 +21,14 @@
             <div class="text-sm text-gray-300 bg-gray-800 rounded-lg p-3 max-h-32 overflow-y-auto">
                 {{ case.summary or 'No summary available.' }}
             </div>
+            <div class="flex gap-2 mt-3">
+                <a href="/api/cases/{{ case.id }}/export/md" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-lg text-xs transition">
+                    📄 Export Markdown
+                </a>
+                <a href="/api/cases/{{ case.id }}/export/pdf" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-lg text-xs transition">
+                    📑 Export PDF
+                </a>
+            </div>
         </div>
         {% endfor %}
         {% if not cases %}

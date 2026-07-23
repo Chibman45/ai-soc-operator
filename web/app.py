@@ -736,3 +736,5 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=port, debug=True)
 from web.routes.chat import chat_bp  
 app.register_blueprint(chat_bp) 
+from web.routes.export import export_bp  
+app.register_blueprint(export_bp) 
