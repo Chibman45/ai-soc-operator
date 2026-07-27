@@ -594,50 +594,62 @@ def upload_playbook():
     else:
         llm_callback = None
 
-    if suffix in (".yaml", ".yml"):
-        # Direct YAML parse
-        import yaml
-        try:
-            content = Path(tmp.name).read_text(encoding="utf-8")
-            parsed = yaml.safe_load(content)
-            if not isinstance(parsed, dict) or "steps" not in parsed:
-                flash("Invalid playbook: must have 'steps' key", "error")
+    try:
+        if suffix in (".yaml", ".yml"):
+            # Direct YAML parse
+            import yaml
+            try:
+                content = Path(tmp.name).read_text(encoding="utf-8")
+                parsed = yaml.safe_load(content)
+                if not isinstance(parsed, dict) or "steps" not in parsed:
+                    flash("Invalid playbook: must have 'steps' key", "error")
+                    return redirect(url_for("playbooks"))
+                # Sanitize filename to prevent path traversal
+                safe_name = Path(file.filename).name
+                if ".." in safe_name or "/" in safe_name or "\\" in safe_name:
+                    flash("Invalid filename", "error")
+                    return redirect(url_for("playbooks"))
+                dest = ROOT / "playbooks" / safe_name
+                dest.write_text(content, encoding="utf-8")
+                file.filename = safe_name
+            except Exception as e:
+                flash(f"YAML parse error: {e}", "error")
                 return redirect(url_for("playbooks"))
-            dest = ROOT / "playbooks" / file.filename
-            dest.write_text(content, encoding="utf-8")
-        except Exception as e:
-            flash(f"YAML parse error: {e}", "error")
-            return redirect(url_for("playbooks"))
-    else:
-        # Non-YAML: extract → LLM → validate → save
-        if not llm_callback:
-            flash("PDF/DOCX parsing requires an OpenAI API key. Set OPENAI_API_KEY.", "error")
-            return redirect(url_for("playbooks"))
-        result = parse_playbook_document(Path(tmp.name), llm_callback)
-        if not result["valid"]:
-            flash(f"Parsing errors: {'; '.join(result['errors'])}", "error")
-            return redirect(url_for("playbooks"))
-        # Save parsed playbook as YAML
-        import yaml
-        safe_name = Path(file.filename).stem.replace(" ", "-").lower()
-        dest = ROOT / "playbooks" / f"{safe_name}.yaml"
-        dest.write_text(yaml.dump(result["playbook"], default_flow_style=False), encoding="utf-8")
-        file.filename = f"{safe_name}.yaml"
+        else:
+            # Non-YAML: extract → LLM → validate → save
+            if not llm_callback:
+                flash("PDF/DOCX parsing requires an OpenAI API key. Set OPENAI_API_KEY.", "error")
+                return redirect(url_for("playbooks"))
+            result = parse_playbook_document(Path(tmp.name), llm_callback)
+            if not result["valid"]:
+                flash(f"Parsing errors: {'; '.join(result['errors'])}", "error")
+                return redirect(url_for("playbooks"))
+            # Save parsed playbook as YAML
+            import yaml
+            safe_name = Path(file.filename).stem.replace(" ", "-").lower()
+            # Sanitize to prevent path traversal
+            if ".." in safe_name or "/" in safe_name or "\\" in safe_name:
+                flash("Invalid filename", "error")
+                return redirect(url_for("playbooks"))
+            dest = ROOT / "playbooks" / f"{safe_name}.yaml"
+            dest.write_text(yaml.dump(result["playbook"], default_flow_style=False), encoding="utf-8")
+            file.filename = f"{safe_name}.yaml"
 
-    # Cleanup temp file
-    Path(tmp.name).unlink(missing_ok=True)
+        # Record in DB
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, ?, 'done', ?)",
+            (None, "upload_playbook", f"Uploaded playbook: {file.filename}"),
+        )
+        conn.commit()
+        conn.close()
 
-    # Record in DB
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO activity_log (step, status, detail) VALUES (?, 'done', ?)",
-        ("upload_playbook", f"Uploaded playbook: {file.filename}"),
-    )
-    conn.commit()
-    conn.close()
+        flash(f"Playbook uploaded: {file.filename}", "success")
+        return redirect(url_for("playbooks"))
 
-    flash(f"Playbook uploaded: {file.filename}", "success")
-    return redirect(url_for("playbooks"))
+    finally:
+        # Cleanup temp file
+        Path(tmp.name).unlink(missing_ok=True)
 
 
 # ── Routes: Run Approve/Reject ──
@@ -763,4 +775,4 @@ if __name__ == "__main__":
     print(f"{'='*50}\n")
     app.run(host="0.0.0.0", port=port, debug=True)
 from web.routes.chat import chat_bp  
-app.register_blueprint(chat_bp) 
+app.register_blueprint(chat_bp)
