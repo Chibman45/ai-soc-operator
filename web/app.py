@@ -15,10 +15,7 @@ import json
 import os
 import secrets
 import sqlite3
-import subprocess
 import sys
-import threading
-import time
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -34,11 +31,15 @@ from flask import (
     url_for,
 )
 
+from scripts.job_queue import JobQueue
+from scripts.learning import LearningStore, learn_alert, learn_case, learn_playbook_result
+
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "soc_operator.db"
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
+job_queue = JobQueue(DB_PATH)
 
 
 # ── Database ──
@@ -372,95 +373,159 @@ def run_agent():
         return jsonify({"error": str(e), "fix": "sudo chown -R $USER config/"}), 500
     playbook = request.form.get("playbook", "identity-compromise.yaml")
     alert_file = request.form.get("alert_file", "")
+    playbook_path = ROOT / "playbooks" / playbook
+    if not playbook_path.is_file():
+        return jsonify({"error": f"Playbook not found: {playbook}"}), 400
+
+    try:
+        alert = _load_alert_payload(alert_file)
+    except Exception as e:
+        return jsonify({"error": f"Unable to load alert: {str(e)[:200]}"}), 400
 
     conn = get_db()
     cursor = conn.execute(
         "INSERT INTO runs (playbook, alert_file, status) VALUES (?, ?, 'running')",
-        (playbook, alert_file),
+        (playbook, alert_file or "demo/brute-force-alert.json"),
     )
     run_id = cursor.lastrowid
+    conn.execute(
+        "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'queue', 'running', ?)",
+        (run_id, f"Queued playbook: {playbook}"),
+    )
     conn.commit()
     conn.close()
 
-    # Run agent in background thread
-    thread = threading.Thread(
-        target=_execute_run, args=(run_id, playbook, alert_file), daemon=True
+    config = load_config_for_web()
+    job_id = job_queue.create_job(
+        run_id=run_id,
+        playbook_path=str(playbook_path),
+        alert=alert,
+        config=config,
     )
-    thread.start()
+    learn_alert(alert, source="manual_run", playbook=playbook)
+    job_queue.execute_job(
+        job_id,
+        lambda alert_data, progress_cb: _execute_run_job(
+            run_id,
+            playbook_path,
+            alert_data,
+            config,
+            progress_cb,
+        ),
+    )
 
-    return jsonify({"run_id": run_id, "status": "running"})
+    return jsonify({"run_id": run_id, "job_id": job_id, "status": "queued"})
 
 
-def _execute_run(run_id: int, playbook: str, alert_file: str) -> None:
-    """Execute the agent in a background thread."""
-    write_platforms_toml()
+def load_config_for_web() -> dict[str, Any]:
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib  # type: ignore
+    config_path = ROOT / "config" / "platforms.toml"
+    if not config_path.is_file():
+        return {}
+    with config_path.open("rb") as f:
+        return tomllib.load(f)
+
+
+def _load_alert_payload(alert_file: str) -> dict[str, Any]:
+    raw = (alert_file or "").strip()
+    if not raw:
+        raw = str(ROOT / "demo" / "brute-force-alert.json")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = ROOT / path
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    alert = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(alert, dict):
+        raise ValueError("alert JSON must be an object")
+    return alert
+
+
+def _execute_run_job(
+    run_id: int,
+    playbook_path: Path,
+    alert: dict[str, Any],
+    config: dict[str, Any],
+    progress_cb,
+) -> dict[str, Any]:
+    """Execute a web-submitted run through the persistent job queue."""
+    from scripts.common import Session
+    from scripts.orchestrator import build_clients, execute_playbook
+
+    progress_cb(0.05)
     conn = get_db()
     try:
-        # Load credentials from DB into environment
         creds = conn.execute("SELECT key_name, key_value FROM credentials").fetchall()
         for cred in creds:
             os.environ[cred["key_name"]] = cred["key_value"]
 
-        # Log start
         conn.execute(
             "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'start', 'running', ?)",
-            (run_id, f"Starting playbook: {playbook}"),
+            (run_id, f"Starting playbook: {playbook_path.name}"),
+        )
+        conn.commit()
+        progress_cb(0.15)
+
+        clients = build_clients(config)
+        progress_cb(0.25)
+
+        alert_title = alert.get("rule", {}).get("name", alert.get("title", "Unknown alert"))
+        session_obj = Session(
+            mode="SOC_ANALYST",
+            target=alert.get("agent", {}).get("name", "manual-run"),
+            purpose=f"Web run for: {alert_title}",
+        )
+        try:
+            progress_cb(0.35)
+            result = execute_playbook(playbook_path, alert, clients, session_obj)
+            progress_cb(0.9)
+        finally:
+            session_obj.finish()
+
+        result_json = json.dumps(result, indent=2)
+        conn.execute(
+            "UPDATE runs SET status = 'completed', finished_at = CURRENT_TIMESTAMP, result_json = ?, report_path = ? WHERE id = ?",
+            (result_json, result.get("report_path"), run_id),
+        )
+        case_title = f"Auto-created from {playbook_path.name}"
+        case_summary = result_json[:500]
+        cursor = conn.execute(
+            "INSERT INTO cases (run_id, title, severity, status, summary, report_path) VALUES (?, ?, 'medium', 'open', ?, ?)",
+            (run_id, case_title, case_summary, result.get("report_path")),
+        )
+        case_id = cursor.lastrowid
+        conn.execute(
+            "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'complete', 'done', 'Playbook execution completed')",
+            (run_id,),
         )
         conn.commit()
 
-        # Build command
-        cmd = [
-            sys.executable, "-m", "scripts.orchestrator",
-            "--playbook", str(ROOT / "playbooks" / playbook),
-        ]
-        if alert_file:
-            cmd.extend(["--alert", alert_file])
-
-        # Execute
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(ROOT),
-            timeout=300,
+        learn_playbook_result(playbook_path.name, result, alert)
+        learn_case(
+            {
+                "id": case_id,
+                "title": case_title,
+                "severity": "medium",
+                "status": "open",
+                "summary": case_summary,
+            }
         )
-
-        # Parse output and create case
-        if result.returncode == 0:
-            conn.execute(
-                "UPDATE runs SET status = 'completed', finished_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ?",
-                (result.stdout, run_id),
-            )
-            # Create a case entry
-            conn.execute(
-                "INSERT INTO cases (run_id, title, severity, status, summary) VALUES (?, ?, 'medium', 'open', ?)",
-                (run_id, f"Auto-created from {playbook}", result.stdout[:500]),
-            )
-            conn.execute(
-                "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'complete', 'done', 'Playbook execution completed')",
-                (run_id,),
-            )
-        else:
-            conn.execute(
-                "UPDATE runs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ?",
-                (result.stderr[:2000], run_id),
-            )
-            conn.execute(
-                "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'error', 'failed', ?)",
-                (run_id, result.stderr[:500]),
-            )
-        conn.commit()
-
+        progress_cb(1.0)
+        return result
     except Exception as e:
         conn.execute(
-            "UPDATE runs SET status = 'failed', finished_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (run_id,),
+            "UPDATE runs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ?",
+            (str(e)[:2000], run_id),
         )
         conn.execute(
             "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'error', 'failed', ?)",
             (run_id, str(e)[:500]),
         )
         conn.commit()
+        raise
     finally:
         conn.close()
 
@@ -522,13 +587,24 @@ def api_run_status(run_id: int):
         "SELECT * FROM activity_log WHERE run_id = ? ORDER BY timestamp",
         (run_id,),
     ).fetchall()
+    job = conn.execute(
+        "SELECT id, status, progress, error_message, finished_at FROM jobs WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
     conn.close()
     if not run:
         return jsonify({"error": "not found"}), 404
     return jsonify({
         "status": run["status"],
+        "job": dict(job) if job else None,
         "log": [dict(row) for row in log],
     })
+
+
+@app.route("/api/learning/suggestions")
+@login_required
+def api_learning_suggestions():
+    return jsonify(LearningStore().list_skill_suggestions())
 
 
 @app.route("/api/activity")
@@ -764,6 +840,13 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+from web.routes.chat import chat_bp
+from scripts.webhooks import webhooks_bp
+
+app.register_blueprint(chat_bp)
+app.register_blueprint(webhooks_bp)
+
+
 if __name__ == "__main__":
     init_db()
     ip = get_local_ip()
@@ -774,5 +857,3 @@ if __name__ == "__main__":
     print(f"  Network: http://{ip}:{port}")
     print(f"{'='*50}\n")
     app.run(host="0.0.0.0", port=port, debug=True)
-from web.routes.chat import chat_bp  
-app.register_blueprint(chat_bp)

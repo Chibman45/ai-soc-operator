@@ -170,6 +170,7 @@ def _route_alert(alert: dict[str, Any], source: str) -> tuple[Any, int]:
 
         # Create database entry for run
         from web.app import get_db
+        from scripts.learning import learn_alert
         conn = get_db()
         try:
             cursor = conn.execute(
@@ -189,39 +190,19 @@ def _route_alert(alert: dict[str, Any], source: str) -> tuple[Any, int]:
             alert=alert,
             config=config,
         )
+        learn_alert(alert, source=source, playbook=playbook_path.name)
 
         # Execute asynchronously
         def execute(alert_data: dict, progress_cb):
-            from scripts.orchestrator import execute_playbook, build_clients
-            from scripts.playbook_engine import load_playbook
-            
-            progress_cb(0.1)  # Started
-            
-            # Load playbook
-            playbook = load_playbook(playbook_path)
-            progress_cb(0.2)
-            
-            # Build clients
-            clients = build_clients(config)
-            progress_cb(0.3)
-            
-            # Create session
-            alert_title = alert.get("rule", {}).get("name", alert.get("title", "Webhook Alert"))
-            session = Session(
-                mode="SOC_ANALYST",
-                target=alert.get("agent", {}).get("name", "webhook"),
-                purpose=f"Webhook alert: {alert_title}",
+            from web.app import _execute_run_job
+
+            return _execute_run_job(
+                run_id,
+                playbook_path,
+                alert_data,
+                config,
+                progress_cb,
             )
-            progress_cb(0.4)
-            
-            # Execute
-            result = execute_playbook(playbook_path, alert_data, clients, session)
-            progress_cb(0.9)
-            
-            session.finish()
-            progress_cb(1.0)
-            
-            return result
 
         job_queue.execute_job(job_id, execute)
 

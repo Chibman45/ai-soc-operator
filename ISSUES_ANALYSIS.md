@@ -1,5 +1,18 @@
 # AI SOC Operator - Issues Analysis
 
+## Current Remediation Note
+
+The following items have been addressed in the current implementation pass:
+
+- Platform HTTP requests now build headers correctly in `scripts/soc_client/base.py`.
+- Chat and webhook blueprints are registered before Flask starts, so `/api/chat/*` and `/api/webhooks/*` routes are reachable in the normal app path.
+- `/run` now creates a persistent `JobQueue` job instead of launching an untracked daemon thread.
+- Job queue SQLite initialization creates the runtime data directory before opening the database.
+- Manual runs and webhook-ingested alerts now feed the local learning store.
+- Learning events create reviewable Codex skill draft suggestions under `data/learning/skill_drafts/`; drafts are not auto-installed.
+
+Remaining work from this issue file should be revalidated against the current code before being treated as open, because the webhook and job queue sections were partly stale.
+
 ## Critical Issues Found
 
 ### 1. ❌ Alert Ingestion (Partial - Missing Webhooks)

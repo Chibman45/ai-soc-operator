@@ -90,7 +90,7 @@ class PlatformClient:
             url += "?" + urllib.parse.urlencode(query, doseq=True)
 
         data = json.dumps(body).encode("utf-8") if body else None
-        request_headers = self._build_headers**(headers or {})
+        request_headers = self._build_headers(**(headers or {}))
         if body:
             request_headers["Content-Type"] = "application/json"
 
