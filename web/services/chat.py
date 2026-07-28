@@ -196,7 +196,7 @@ def execute_tool(
 # ── Context Builder ──
 
 def build_chat_context(conn, case_id: int, user_message: str) -> dict[str, Any]:
-    """Build context for the LLM from case data and playbook."""
+    """Build context for the LLM from case data, playbook, and observables."""
     case = conn.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
     if not case:
         return {"error": "Case not found"}
@@ -207,13 +207,64 @@ def build_chat_context(conn, case_id: int, user_message: str) -> dict[str, Any]:
         (case_id,),
     ).fetchall()
 
-    # Get observables from the case
-    iocs = []
+    # Get observables from the observables table (real data)
+    observables = []
+    try:
+        obs_rows = conn.execute(
+            "SELECT * FROM observables WHERE case_id = ? ORDER BY created_at DESC",
+            (case_id,),
+        ).fetchall()
+        observables = [{"type": r["type"], "value": r["value"], "source": r["source"]} for r in obs_rows]
+    except Exception:
+        pass  # Table may not exist yet
+
+    # Get related cases sharing observables (IOC correlation)
+    related_cases = []
+    if observables:
+        for obs in observables[:5]:
+            try:
+                related = conn.execute(
+                    "SELECT DISTINCT c.id, c.title, c.severity FROM observables o JOIN cases c ON o.case_id = c.id WHERE o.value = ? AND o.case_id != ? LIMIT 3",
+                    (obs["value"], case_id),
+                ).fetchall()
+                for r in related:
+                    if r["id"] not in [rc["id"] for rc in related_cases]:
+                        related_cases.append({"id": r["id"], "title": r["title"], "severity": r["severity"]})
+            except Exception:
+                pass
+
+    # Get triage result from the run if available
+    triage_result = None
+    if case["run_id"]:
+        try:
+            run = conn.execute("SELECT result_json FROM runs WHERE id = ?", (case["run_id"],)).fetchone()
+            if run and run["result_json"]:
+                import json as _json
+                run_data = _json.loads(run["result_json"])
+                triage_result = run_data.get("triage_result")
+        except Exception:
+            pass
+
+    # Get playbook results
+    playbook_results = {}
+    if case["run_id"]:
+        try:
+            run = conn.execute("SELECT result_json FROM runs WHERE id = ?", (case["run_id"],)).fetchone()
+            if run and run["result_json"]:
+                import json as _json
+                run_data = _json.loads(run["result_json"])
+                playbook_results = run_data.get("steps", {})
+        except Exception:
+            pass
+
+    # Extract additional IOCs from summary
+    iocs_from_summary = []
     if case["summary"]:
-        # Extract IPs from summary
         import re
         ips = re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", case["summary"])
-        iocs.extend([{"type": "ip", "value": ip} for ip in ips])
+        iocs_from_summary.extend([{"type": "ip", "value": ip} for ip in ips])
+        domains = re.findall(r"\b([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b", case["summary"])
+        iocs_from_summary.extend([{"type": "domain", "value": d[0]} for d in domains[:5]])
 
     return {
         "case": {
@@ -223,11 +274,14 @@ def build_chat_context(conn, case_id: int, user_message: str) -> dict[str, Any]:
             "status": case["status"],
             "summary": case["summary"] or "",
         },
+        "triage": triage_result,
         "activity": [
             {"step": row["step"], "status": row["status"], "detail": row["detail"]}
             for row in activity
         ],
-        "observables": iocs,
+        "observables": observables or iocs_from_summary,
+        "related_cases": related_cases,
+        "playbook_results": {k: v for k, v in list(playbook_results.items())[:5]},
         "allowed_tools": list(ALLOWED_TOOLS.keys()),
     }
 

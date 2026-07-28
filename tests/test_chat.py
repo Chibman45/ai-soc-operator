@@ -135,7 +135,7 @@ class BuildChatContextTests(TestCase):
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT, severity TEXT, status TEXT, summary TEXT
+                title TEXT, severity TEXT, status TEXT, summary TEXT, run_id INTEGER
             )
         """)
         conn.execute("""
