@@ -314,6 +314,8 @@ class PlaybookRunner:
     def _run_toolchain(self, step: dict[str, Any]) -> dict[str, Any]:
         tools = step.get("run", [])
         results = []
+        enrichment_client = self.clients.get("enrichment")
+
         for tool_def in tools:
             tool = render(tool_def.get("tool", ""), self.context)
             operation = render(tool_def.get("operation", ""), self.context)
@@ -321,12 +323,36 @@ class PlaybookRunner:
             condition = tool_def.get("condition")
             if condition and not evaluate_condition(condition, self.context):
                 continue
-            results.append({
-                "tool": tool,
-                "operation": operation,
-                "target": target,
-                "status": "queued",
-            })
+
+            # Actually execute enrichment if client is available
+            if enrichment_client and tool in ("virustotal", "abuseipdb", "shodan", "urlscan", "hybrid-analysis"):
+                try:
+                    ioc_type = operation if operation in ("ip", "domain", "hash", "url") else "ip"
+                    api_result = enrichment_client.enrich(ioc_type, target)
+                    results.append({
+                        "tool": tool,
+                        "operation": operation,
+                        "target": target,
+                        "status": "completed",
+                        "result": api_result,
+                    })
+                    audit("playbook_enrichment", tool=tool, target=target[:100])
+                except Exception as e:
+                    results.append({
+                        "tool": tool,
+                        "operation": operation,
+                        "target": target,
+                        "status": "failed",
+                        "error": str(e)[:200],
+                    })
+            else:
+                results.append({
+                    "tool": tool,
+                    "operation": operation,
+                    "target": target,
+                    "status": "queued",
+                })
+
         return {"results": results, "count": len(results)}
 
     def _run_rule(
@@ -343,10 +369,39 @@ class PlaybookRunner:
 
     def _run_thehive(self, step: dict[str, Any]) -> dict[str, Any]:
         action = step.get("action", "")
+        inputs = render(step.get("inputs", {}), self.context)
+        thehive_client = self.clients.get("thehive")
+
+        if thehive_client and action == "create_or_update_case":
+            try:
+                case_result = thehive_client.create_case(
+                    title=inputs.get("title", "Auto-created case"),
+                    description=inputs.get("description", ""),
+                    severity=inputs.get("severity", 2),
+                    tags=inputs.get("tags", []),
+                )
+                audit("playbook_thehive_case_created", case_id=case_result.get("id"))
+                return {
+                    "type": "thehive",
+                    "action": action,
+                    "inputs": inputs,
+                    "status": "completed",
+                    "case_id": case_result.get("id"),
+                    "result": case_result,
+                }
+            except Exception as e:
+                return {
+                    "type": "thehive",
+                    "action": action,
+                    "inputs": inputs,
+                    "status": "failed",
+                    "error": str(e)[:200],
+                }
+
         return {
             "type": "thehive",
             "action": action,
-            "inputs": render(step.get("inputs", {}), self.context),
+            "inputs": inputs,
             "status": "pending_execution",
         }
 
