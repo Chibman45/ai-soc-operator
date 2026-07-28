@@ -492,8 +492,9 @@ def _execute_run_job(
         )
         case_title = f"Auto-created from {playbook_path.name}"
         case_summary = result_json[:500]
+        severity = result.get("triage_result", {}).get("tier", "medium")
         cursor = conn.execute(
-            "INSERT INTO cases (run_id, title, severity, status, summary, report_path) VALUES (?, ?, 'medium', 'open', ?, ?)",
+            "INSERT INTO cases (run_id, title, severity, status, summary, report_path) VALUES (?, ?, severity, 'open', ?, ?)",
             (run_id, case_title, case_summary, result.get("report_path")),
         )
         case_id = cursor.lastrowid
@@ -508,7 +509,7 @@ def _execute_run_job(
             {
                 "id": case_id,
                 "title": case_title,
-                "severity": "medium",
+                "severity": severity,
                 "status": "open",
                 "summary": case_summary,
             }

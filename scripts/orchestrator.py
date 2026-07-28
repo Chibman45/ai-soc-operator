@@ -235,6 +235,13 @@ def execute_playbook(
     runner = PlaybookRunner(playbook, context, clients)
     result = runner.run()
 
+    # Include triage result in output for severity mapping
+    result["triage_result"] = {
+        "score": triage_result["score"],
+        "tier": triage_result["tier"],
+        "should_trigger_llm": triage_result["should_trigger_llm"],
+    }
+
     # Post-execution: generate report if not already done
     if "generate_report" not in result.get("steps", {}):
         report_path = session.path("reports") / "soc-report.md"
