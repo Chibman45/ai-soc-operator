@@ -14,10 +14,7 @@ import urllib.request
 import ssl
 from typing import Any
 
-try:
-    from .common import audit, utc_now
-except ImportError:
-    from common import audit, utc_now
+from ..common import audit, utc_now
 
 
 # The model string used for all direct LLM calls.
