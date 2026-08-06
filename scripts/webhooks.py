@@ -8,24 +8,16 @@ Supports:
 
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
 from typing import Any
 
 from flask import Blueprint, jsonify, request
 
 try:
-    from .common import ROOT, Session, audit, utc_now
-    from .job_queue import JobQueue
-    from .orchestrator import auto_select_playbook, extract_iocs, load_config
+    from .common import audit, utc_now
 except ImportError:
-    from scripts.common import ROOT, Session, audit, utc_now
-    from scripts.job_queue import JobQueue
-    from scripts.orchestrator import auto_select_playbook, extract_iocs, load_config
+    from scripts.common import audit, utc_now
 
 webhooks_bp = Blueprint("webhooks", __name__, url_prefix="/api/webhooks")
-job_queue = JobQueue()
 
 
 @webhooks_bp.route("/wazuh", methods=["POST"])
@@ -53,16 +45,8 @@ def webhook_wazuh():
         if not payload:
             return jsonify({"error": "Empty payload"}), 400
 
-        # Extract alert from Wazuh wrapper
-        alert = payload.get("alert", payload)
-        if not alert:
-            return jsonify({"error": "No alert data found"}), 400
-
-        # Normalize to internal format
-        normalized_alert = _normalize_wazuh_alert(alert)
-        
-        # Route to appropriate playbook
-        return _route_alert(normalized_alert, source="wazuh")
+        # Normalization + routing is handled by the shared ingestion path.
+        return _route_alert("wazuh", payload)
 
     except Exception as e:
         audit("webhook_wazuh_error", error=str(e))
@@ -88,7 +72,7 @@ def webhook_generic():
         if not alert:
             return jsonify({"error": "Empty payload"}), 400
 
-        return _route_alert(alert, source="generic")
+        return _route_alert("generic", alert)
 
     except Exception as e:
         audit("webhook_generic_error", error=str(e))
@@ -105,121 +89,50 @@ def webhook_test():
     })
 
 
-def _normalize_wazuh_alert(alert: dict[str, Any]) -> dict[str, Any]:
-    """Normalize Wazuh alert to internal format."""
-    normalized = {
-        "title": alert.get("title", alert.get("description", "Wazuh Alert")),
-        "description": alert.get("description", ""),
-        "severity": _map_wazuh_severity(alert.get("level", 3)),
-        "rule": alert.get("rule", {}),
-        "agent": alert.get("agent", {}),
-        "tags": alert.get("tags", []),
-        "timestamp": alert.get("timestamp", utc_now()),
-    }
+def _route_alert(source: str, payload: dict[str, Any]) -> tuple[Any, int]:
+    """Normalize, store, correlate, and queue an alert via the shared path.
 
-    # Extract observables from data
-    data = alert.get("data", {})
-    if data:
-        normalized["source"] = {}
-        normalized["destination"] = {}
-        
-        if "srcip" in data:
-            normalized["source"]["ip"] = data["srcip"]
-        if "dstip" in data:
-            normalized["destination"]["ip"] = data["dstip"]
-        if "user" in data:
-            normalized["user"] = {"name": data["user"]}
-        if "file" in data:
-            normalized["file"] = data["file"]
+    Delegates to web.services.alert_ingest.ingest_alert_record so webhook and
+    manual ingestion share one implementation: normalization, observable
+    correlation, alert-table lifecycle, and background job execution.
 
-    return normalized
-
-
-def _map_wazuh_severity(level: int) -> str:
-    """Map Wazuh alert level (1-15) to severity."""
-    if level >= 12:
-        return "critical"
-    elif level >= 9:
-        return "high"
-    elif level >= 6:
-        return "medium"
-    elif level >= 3:
-        return "low"
-    else:
-        return "info"
-
-
-def _route_alert(alert: dict[str, Any], source: str) -> tuple[Any, int]:
-    """Route alert to appropriate playbook and create execution job.
-    
     Returns:
         (JSON response, HTTP status)
     """
     try:
-        # Find best matching playbook
-        playbook_dir = ROOT / "playbooks"
-        playbook_path = auto_select_playbook(alert, playbook_dir)
-        
-        if not playbook_path:
-            audit("alert_no_playbook_match", source=source, alert=alert.get("title", ""))
-            return jsonify({
-                "status": "no_playbook",
-                "message": "No matching playbook found for this alert",
-                "alert": alert,
-            }), 202  # Accepted but not processed
-
-        # Create database entry for run
         from web.app import get_db
-        from scripts.learning import learn_alert
+        from web.services.alert_ingest import ingest_alert_record
+        from web.services.schema_features import init_feature_db
+
+        source_alert_id = (
+            payload.get("source_alert_id") if isinstance(payload, dict) else None
+        )
         conn = get_db()
         try:
-            cursor = conn.execute(
-                "INSERT INTO runs (playbook, status, alert_file) VALUES (?, ?, ?)",
-                (playbook_path.name, "ingested", json.dumps(alert)),
+            init_feature_db(conn)
+            result = ingest_alert_record(
+                conn,
+                source=source,
+                source_alert_id=source_alert_id,
+                payload=payload,
             )
-            run_id = cursor.lastrowid
-            conn.commit()
         finally:
             conn.close()
 
-        # Create job
-        config = load_config()
-        job_id = job_queue.create_job(
-            run_id=run_id,
-            playbook_path=str(playbook_path),
-            alert=alert,
-            config=config,
-        )
-        learn_alert(alert, source=source, playbook=playbook_path.name)
-
-        # Execute asynchronously
-        def execute(alert_data: dict, progress_cb):
-            from web.app import _execute_run_job
-
-            return _execute_run_job(
-                run_id,
-                playbook_path,
-                alert_data,
-                config,
-                progress_cb,
-            )
-
-        job_queue.execute_job(job_id, execute)
-
-        audit(
-            "alert_ingested",
-            source=source,
-            alert_title=alert.get("title", ""),
-            playbook=playbook_path.name,
-            run_id=run_id,
-            job_id=job_id,
-        )
+        if not result.get("playbook"):
+            audit("alert_no_playbook_match", source=source, alert_id=result.get("alert_id"))
+            return jsonify({
+                "status": "no_playbook",
+                "message": "No matching playbook found for this alert",
+                "alert_id": result.get("alert_id"),
+            }), 202  # Accepted but not processed
 
         return jsonify({
-            "status": "queued",
-            "run_id": run_id,
-            "job_id": job_id,
-            "playbook": playbook_path.name,
+            "status": result.get("status", "queued"),
+            "alert_id": result.get("alert_id"),
+            "case_id": result.get("case_id"),
+            "job_id": result.get("job_id"),
+            "playbook": result.get("playbook"),
             "message": "Alert queued for processing",
         }), 202
 

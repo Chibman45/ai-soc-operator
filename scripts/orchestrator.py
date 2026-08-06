@@ -97,10 +97,19 @@ def build_clients(config: dict[str, Any]) -> dict[str, Any]:
                 wazuh_idx["base_url"], username, password
             )
 
+    # MISP (threat intel platform) — exposed both standalone and via enrichment
+    misp_cfg = platforms.get("misp", {})
+    if misp_cfg.get("enabled"):
+        key = os.environ.get(misp_cfg.get("credential_env", ""), "")
+        base_url = misp_cfg.get("base_url", "")
+        if key and base_url:
+            from .soc_client.enrichment import MISPClient
+            clients["misp"] = MISPClient(base_url, key)
+
     # Enrichment (aggregates all threat intel platforms)
     if any(
         platforms.get(p, {}).get("enabled")
-        for p in ["virustotal", "abuseipdb", "shodan", "urlscan", "hybrid_analysis"]
+        for p in ["virustotal", "abuseipdb", "shodan", "urlscan", "hybrid_analysis", "misp"]
     ):
         clients["enrichment"] = EnrichmentClient(config)
 

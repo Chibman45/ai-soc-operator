@@ -33,9 +33,76 @@
             {% endif %}
             </div>
 
+            {% if steps %}
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+                <h3 class="font-medium mb-3">Investigation Steps</h3>
+                <div class="space-y-4">
+                    {% for step in steps %}
+                    <div class="border border-gray-800 rounded-lg p-4">
+                        <div class="flex items-center gap-2 mb-2">
+                            <span class="text-sm font-medium text-gray-200">{{ step.id }}</span>
+                            <span class="px-2 py-0.5 rounded text-xs bg-gray-800 text-gray-400">{{ step.kind }}</span>
+                            {% if step.model %}<span class="px-2 py-0.5 rounded text-xs bg-indigo-900 text-indigo-300">{{ step.model }}</span>{% endif %}
+                            {% if step.status %}
+                            <span class="px-2 py-0.5 rounded text-xs
+                                {% if step.status == 'completed' %}bg-green-900 text-green-300
+                                {% elif step.status == 'failed' %}bg-red-900 text-red-300
+                                {% else %}bg-gray-700 text-gray-300{% endif %}">{{ step.status }}</span>
+                            {% endif %}
+                        </div>
+
+                        {% if step.kind == 'llm' %}
+                            {% if step.thought %}
+                            <div class="text-sm text-gray-300 whitespace-pre-wrap bg-gray-800 rounded-lg p-3">{{ step.thought }}</div>
+                            {% else %}
+                            <div class="text-xs text-gray-500 italic">No model output captured. Check that OPENAI_API_KEY is configured in Settings.</div>
+                            {% endif %}
+                            {% if step.prompt %}
+                            <details class="mt-2">
+                                <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300">View prompt</summary>
+                                <div class="text-xs text-gray-400 whitespace-pre-wrap mt-1 bg-gray-800 rounded p-2">{{ step.prompt }}</div>
+                            </details>
+                            {% endif %}
+
+                        {% elif step.kind == 'toolchain' %}
+                            {% if step.tool_results %}
+                            <div class="space-y-1">
+                                {% for tr in step.tool_results %}
+                                <div class="flex items-center gap-2 text-sm">
+                                    <span class="{% if tr.status == 'completed' %}text-green-400{% elif tr.status == 'failed' %}text-red-400{% else %}text-gray-500{% endif %}">●</span>
+                                    <span class="text-gray-300">{{ tr.tool }}</span>
+                                    <span class="text-gray-500 text-xs">{{ tr.operation }}</span>
+                                    <code class="text-xs text-gray-400">{{ tr.target }}</code>
+                                    <span class="text-xs text-gray-500 ml-auto">{{ tr.status }}</span>
+                                </div>
+                                {% if tr.error %}<div class="text-xs text-red-400 ml-5">{{ tr.error }}</div>{% endif %}
+                                {% endfor %}
+                            </div>
+                            {% else %}
+                            <div class="text-xs text-gray-500 italic">No tool results.</div>
+                            {% endif %}
+
+                        {% elif step.kind == 'thehive' %}
+                            <div class="text-sm text-gray-300">Action: {{ step.action }}
+                            {% if step.case_ref %}<span class="text-gray-500">→ case {{ step.case_ref }}</span>{% endif %}
+                            </div>
+
+                        {% else %}
+                            <pre class="text-xs text-gray-400 bg-gray-800 rounded p-2 overflow-x-auto">{{ step.raw }}</pre>
+                        {% endif %}
+
+                        {% if step.error %}
+                        <div class="text-xs text-red-400 mt-2">Error: {{ step.error }}</div>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+
             {% if run %}
             <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-                <h3 class="font-medium mb-3">Execution Result</h3>
+                <h3 class="font-medium mb-3">Raw Execution Result</h3>
                 <pre class="text-xs text-gray-400 bg-gray-800 rounded-lg p-4 overflow-x-auto max-h-64">{{ run.result_json or 'No output.' }}</pre>
             </div>
             {% endif %}

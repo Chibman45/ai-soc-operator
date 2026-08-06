@@ -33,6 +33,7 @@ from flask import (
 
 from scripts.job_queue import JobQueue
 from scripts.learning import LearningStore, learn_alert, learn_case, learn_playbook_result
+from scripts.common import audit
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "soc_operator.db"
@@ -126,6 +127,12 @@ def init_db() -> None:
         );
     """)
     conn.commit()
+    # Initialize feature tables (alerts, roles, observables, responders, etc.)
+    try:
+        from web.services.schema_features import init_feature_db
+        init_feature_db(conn)
+    except Exception as e:
+        print(f"[WARN] Feature schema init failed: {e}", file=sys.stderr)
     conn.close()
 
 
@@ -462,6 +469,15 @@ def _execute_run_job(
         for cred in creds:
             os.environ[cred["key_name"]] = cred["key_value"]
 
+        # Regenerate platforms.toml from the DB and re-read it, so client
+        # construction always reflects the credentials/URLs saved in the
+        # portal — never a stale or empty config passed in by the caller.
+        try:
+            write_platforms_toml()
+            config = load_config_for_web() or config
+        except Exception as cfg_err:
+            audit("web_run_config_reload_failed", run_id=run_id, error=str(cfg_err)[:200])
+
         conn.execute(
             "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'start', 'running', ?)",
             (run_id, f"Starting playbook: {playbook_path.name}"),
@@ -494,8 +510,8 @@ def _execute_run_job(
         case_summary = result_json[:500]
         severity = result.get("triage_result", {}).get("tier", "medium")
         cursor = conn.execute(
-            "INSERT INTO cases (run_id, title, severity, status, summary, report_path) VALUES (?, ?, severity, 'open', ?, ?)",
-            (run_id, case_title, case_summary, result.get("report_path")),
+            "INSERT INTO cases (run_id, title, severity, status, summary, report_path) VALUES (?, ?, ?, 'open', ?, ?)",
+            (run_id, case_title, severity, case_summary, result.get("report_path")),
         )
         case_id = cursor.lastrowid
         conn.execute(
@@ -551,17 +567,79 @@ def case_detail(case_id: int):
     case = conn.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
     run = None
     activity = []
+    steps = []
     if case and case["run_id"]:
         run = conn.execute("SELECT * FROM runs WHERE id = ?", (case["run_id"],)).fetchone()
         activity = conn.execute(
             "SELECT * FROM activity_log WHERE run_id = ? ORDER BY timestamp",
             (case["run_id"],),
         ).fetchall()
+        steps = _extract_run_steps(run)
     conn.close()
     if not case:
         flash("Case not found", "error")
         return redirect(url_for("cases"))
-    return render_template("case_detail.html", case=case, run=run, activity=activity)
+    return render_template(
+        "case_detail.html", case=case, run=run, activity=activity, steps=steps
+    )
+
+
+def _extract_run_steps(run) -> list[dict[str, Any]]:
+    """Parse a run's result_json into display-friendly step records.
+
+    Surfaces the LLM "thought process" (response/analysis), toolchain
+    enrichment output, and TheHive/case actions so the UI can render them
+    instead of a raw JSON blob.
+    """
+    if not run:
+        return []
+    try:
+        result = json.loads(run["result_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(result, dict):
+        return []
+
+    ordered_ids = [e.get("step_id") for e in result.get("execution_log", [])]
+    step_results = result.get("steps", {})
+    # Preserve execution order, then append any steps missing from the log.
+    seen: set[str] = set()
+    display: list[dict[str, Any]] = []
+    for step_id in [*ordered_ids, *step_results.keys()]:
+        if not step_id or step_id in seen or step_id not in step_results:
+            continue
+        seen.add(step_id)
+        data = step_results[step_id]
+        if not isinstance(data, dict):
+            display.append({"id": step_id, "kind": "other", "raw": data})
+            continue
+        kind = data.get("type") or ("toolchain" if "results" in data else "other")
+        record: dict[str, Any] = {
+            "id": step_id,
+            "kind": kind,
+            "status": data.get("status", ""),
+            "error": data.get("error"),
+        }
+        if kind == "llm":
+            # The model's reasoning/output — the "thought process".
+            record["thought"] = (
+                data.get("response")
+                or data.get("analysis")
+                or data.get("instruction")
+                or ""
+            )
+            record["model"] = data.get("model", "")
+            record["prompt"] = data.get("prompt", "")
+        elif kind == "toolchain" or "results" in data:
+            record["kind"] = "toolchain"
+            record["tool_results"] = data.get("results", [])
+        elif kind == "thehive":
+            record["action"] = data.get("action", "")
+            record["case_ref"] = data.get("case_id")
+        else:
+            record["raw"] = data
+        display.append(record)
+    return display
 
 
 # ── Routes: Reports ──
@@ -843,9 +921,11 @@ def get_local_ip() -> str:
 
 from web.routes.chat import chat_bp
 from scripts.webhooks import webhooks_bp
+from web.routes.features import features_bp
 
 app.register_blueprint(chat_bp)
 app.register_blueprint(webhooks_bp)
+app.register_blueprint(features_bp)
 
 
 if __name__ == "__main__":

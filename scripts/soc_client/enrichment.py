@@ -205,6 +205,22 @@ class EnrichmentClient:
             if key:
                 self._clients["hybrid-analysis"] = HybridAnalysisClient(key)
 
+        if platforms.get("misp", {}).get("enabled"):
+            key = os.environ.get(platforms["misp"].get("credential_env", ""), "")
+            base_url = platforms["misp"].get("base_url", "")
+            if key and base_url:
+                self._clients["misp"] = MISPClient(base_url, key)
+
+    def _misp_lookup(self, value: str) -> dict[str, Any] | None:
+        """Search MISP for a raw IOC value across all attribute types."""
+        client = self._clients.get("misp")
+        if not client:
+            return None
+        try:
+            return client.attribute_search({"value": value, "limit": 25})
+        except Exception as e:
+            return {"error": str(e)}
+
     def enrich_ip(self, ip: str) -> dict[str, Any]:
         results: dict[str, Any] = {}
         if "virustotal" in self._clients:
@@ -222,6 +238,9 @@ class EnrichmentClient:
                 results["shodan"] = self._clients["shodan"].host_lookup(ip)
             except Exception as e:
                 results["shodan"] = {"error": str(e)}
+        misp = self._misp_lookup(ip)
+        if misp is not None:
+            results["misp"] = misp
         audit("enrichment_ip", ip=ip, platforms=list(results.keys()))
         return results
 
@@ -232,6 +251,9 @@ class EnrichmentClient:
                 results["virustotal"] = self._clients["virustotal"].lookup_domain(domain)
             except Exception as e:
                 results["virustotal"] = {"error": str(e)}
+        misp = self._misp_lookup(domain)
+        if misp is not None:
+            results["misp"] = misp
         audit("enrichment_domain", domain=domain, platforms=list(results.keys()))
         return results
 
@@ -247,6 +269,9 @@ class EnrichmentClient:
                 results["hybrid-analysis"] = self._clients["hybrid-analysis"].hash_search(hash_value)
             except Exception as e:
                 results["hybrid-analysis"] = {"error": str(e)}
+        misp = self._misp_lookup(hash_value)
+        if misp is not None:
+            results["misp"] = misp
         audit("enrichment_hash", hash_value=hash_value, platforms=list(results.keys()))
         return results
 
@@ -257,6 +282,9 @@ class EnrichmentClient:
                 results["virustotal"] = self._clients["virustotal"].lookup_url(url)
             except Exception as e:
                 results["virustotal"] = {"error": str(e)}
+        misp = self._misp_lookup(url)
+        if misp is not None:
+            results["misp"] = misp
         audit("enrichment_url", url=url, platforms=list(results.keys()))
         return results
 

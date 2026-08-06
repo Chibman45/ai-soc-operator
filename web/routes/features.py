@@ -88,61 +88,46 @@ def _require_permission(perm_name):
 @features_bp.post("/api/ingest/alert")
 @_login_required
 def ingest_alert():
-    payload = request.get_json(force=True)
+    payload = request.get_json(force=True) or {}
 
     source = payload.get("source", "manual")
-    title = payload.get("title", "")
-    severity = payload.get("severity", "medium")
-    raw_payload = json.dumps(payload.get("payload", {}))
     source_alert_id = payload.get("source_alert_id")
-    observables = payload.get("observables", [])
+    supplied_observables = payload.get("observables", [])
 
-    if not title:
-        return jsonify({"ok": False, "error": "title is required"}), 400
+    # The alert body may be nested under "payload" or be the top-level object.
+    alert_body = payload.get("payload") if isinstance(payload.get("payload"), dict) else dict(payload)
+    # Carry caller-supplied title/severity into the body so generic
+    # normalization picks them up.
+    if payload.get("title") and "title" not in alert_body:
+        alert_body["title"] = payload["title"]
+    if payload.get("severity") and "severity" not in alert_body:
+        alert_body["severity"] = payload["severity"]
 
     conn = _get_db()
-    from web.services.schema_features import init_feature_db
-    init_feature_db(conn)
+    try:
+        from web.services.schema_features import init_feature_db
+        from web.services.alert_ingest import ingest_alert_record
 
-    # Create alert
-    cursor = conn.execute(
-        "INSERT INTO alerts (source, source_alert_id, title, severity, raw_payload, status) VALUES (?, ?, ?, ?, ?, 'queued')",
-        (source, source_alert_id, title, severity, raw_payload),
-    )
-    alert_id = cursor.lastrowid
-
-    # Check for IOC correlation — link to existing case if observables match
-    linked_case_id = None
-    for obs in observables:
-        existing = conn.execute(
-            "SELECT case_id FROM observables WHERE type = ? AND value = ? LIMIT 1",
-            (obs.get("type", ""), obs.get("value", "")),
-        ).fetchone()
-        if existing and existing["case_id"]:
-            linked_case_id = existing["case_id"]
-            break
-
-    if linked_case_id:
-        conn.execute(
-            "UPDATE alerts SET case_id = ?, status = 'linked' WHERE id = ?",
-            (linked_case_id, alert_id),
+        init_feature_db(conn)
+        result = ingest_alert_record(
+            conn,
+            source=source,
+            source_alert_id=source_alert_id,
+            payload=alert_body,
+            supplied_observables=supplied_observables,
         )
+    except Exception as e:
+        conn.close()
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
 
-    # Store observables
-    for obs in observables:
-        conn.execute(
-            "INSERT INTO observables (case_id, type, value, source) VALUES (?, ?, ?, ?)",
-            (linked_case_id, obs.get("type", ""), obs.get("value", ""), source),
-        )
-
-    conn.commit()
     conn.close()
-
     return jsonify({
         "ok": True,
-        "alert_id": alert_id,
-        "case_id": linked_case_id,
-        "status": "linked" if linked_case_id else "queued",
+        "alert_id": result["alert_id"],
+        "case_id": result["case_id"],
+        "job_id": result["job_id"],
+        "status": result["status"],
+        "playbook": result["playbook"],
     })
 
 
@@ -282,14 +267,21 @@ def credentials_status():
     from web.services.schema_features import init_feature_db
     init_feature_db(conn)
 
-    creds = conn.execute("SELECT id, name, provider, active, last_tested_at, last_test_result, last_test_message FROM credentials").fetchall()
+    # The credentials table stores one row per (platform, key_name). `provider`,
+    # `active`, and the last_test_* columns are added by init_feature_db above.
+    creds = conn.execute(
+        "SELECT id, platform, key_name, provider, active, last_tested_at, last_test_result, last_test_message FROM credentials"
+    ).fetchall()
     conn.close()
 
     return jsonify({
         "ok": True,
         "items": [
             {
-                "id": c["id"], "name": c["name"], "provider": c["provider"],
+                "id": c["id"],
+                "name": c["key_name"],
+                "platform": c["platform"],
+                "provider": c["provider"] or c["platform"],
                 "active": bool(c["active"]),
                 "last_tested_at": c["last_tested_at"],
                 "last_test_result": c["last_test_result"],
@@ -316,7 +308,7 @@ def test_credential(cred_id: int):
     message = ""
 
     # Simple connectivity test based on provider
-    provider = (cred["provider"] or cred["name"] or "").lower()
+    provider = (cred["provider"] or cred["platform"] or "").lower()
     test_urls = {
         "virustotal": "https://www.virustotal.com",
         "abuseipdb": "https://api.abuseipdb.com",
