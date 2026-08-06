@@ -81,9 +81,10 @@ def chat_post(case_id: int):
     # Save assistant message
     answer = response.get("answer", "")
     citations = json.dumps(response.get("citations", []))
+    reasoning = json.dumps(response.get("reasoning", []))
     conn.execute(
-        "INSERT INTO chat_messages (thread_id, sender_type, content, citations_json) VALUES (?, 'assistant', ?, ?)",
-        (thread["id"], answer, citations),
+        "INSERT INTO chat_messages (thread_id, sender_type, content, citations_json, reasoning_json) VALUES (?, 'assistant', ?, ?, ?)",
+        (thread["id"], answer, citations, reasoning),
     )
 
     # Save suggested actions
@@ -111,6 +112,7 @@ def chat_post(case_id: int):
         "ok": True,
         "thread_id": thread["id"],
         "answer": answer,
+        "reasoning": response.get("reasoning", []),
         "citations": response.get("citations", []),
         "suggested_actions": suggested,
         "approval_required": any(a.get("requires_approval") for a in suggested),
@@ -148,7 +150,9 @@ def chat_history(case_id: int):
         "thread": {"id": thread["id"], "case_id": thread["case_id"], "title": thread["title"]},
         "messages": [
             {"id": m["id"], "sender_type": m["sender_type"], "content": m["content"],
-             "citations": json.loads(m["citations_json"] or "[]"), "created_at": m["created_at"]}
+             "citations": json.loads(m["citations_json"] or "[]"),
+             "reasoning": json.loads((m["reasoning_json"] if "reasoning_json" in m.keys() else "[]") or "[]"),
+             "created_at": m["created_at"]}
             for m in messages
         ],
         "actions": [
@@ -164,7 +168,7 @@ def chat_history(case_id: int):
 @chat_bp.post("/<int:case_id>/action/<int:action_id>/approve")
 @_login_required
 def chat_action_approve(case_id: int, action_id: int):
-    from web.services.chat import execute_tool
+    from web.services.chat import execute_tool, execute_enrichment
 
     conn = _get_db()
     _init_chat(conn)
@@ -184,11 +188,13 @@ def chat_action_approve(case_id: int, action_id: int):
 
     # Execute tool if applicable
     result = None
+    final_status = "approved"
     if action["action_type"] == "tool_execution" and action["tool_name"]:
         tool_args = json.loads(action["tool_args_json"] or "{}")
         args = tool_args.get("args", [])
         timeout = tool_args.get("timeout_seconds", 30)
         result = execute_tool(action["tool_name"], args, timeout=timeout)
+        final_status = result["status"]
 
         conn.execute(
             "INSERT INTO tool_executions (action_id, tool_name, command_preview, argv_json, status, exit_code, stdout, stderr, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
@@ -201,9 +207,20 @@ def chat_action_approve(case_id: int, action_id: int):
             (result["status"], json.dumps(result), action_id),
         )
         conn.commit()
+    elif action["action_type"] == "enrichment":
+        tool_args = json.loads(action["tool_args_json"] or "{}")
+        ioc_type = (tool_args.get("ioc_type") or tool_args.get("type") or "").lower()
+        value = tool_args.get("value") or tool_args.get("ioc") or ""
+        result = execute_enrichment(ioc_type, value)
+        final_status = result["status"]
+        conn.execute(
+            "UPDATE chat_actions SET status = ?, result_json = ?, executed_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (result["status"], json.dumps(result), action_id),
+        )
+        conn.commit()
 
     conn.close()
-    return jsonify({"ok": True, "status": action["status"], "result": result})
+    return jsonify({"ok": True, "status": final_status, "result": result})
 
 
 @chat_bp.post("/<int:case_id>/action/<int:action_id>/reject")
@@ -248,3 +265,180 @@ def chat_execute_direct(case_id: int):
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "result": result})
+
+
+@chat_bp.post("/<int:case_id>/action")
+@_login_required
+def chat_action_create(case_id: int):
+    """Create a proposed action from the chat UI (previously missing route).
+
+    The chat panel's suggested-action buttons POST here to persist the action
+    before approving it. Returns the created action row so the client can call
+    the approve endpoint with a real action id.
+    """
+    payload = request.get_json(force=True) or {}
+    conn = _get_db()
+    _init_chat(conn)
+
+    thread = conn.execute(
+        "SELECT * FROM chat_threads WHERE case_id = ? AND closed = 0 ORDER BY updated_at DESC LIMIT 1",
+        (case_id,),
+    ).fetchone()
+    if not thread:
+        cursor = conn.execute(
+            "INSERT INTO chat_threads (case_id, title, created_by) VALUES (?, 'SOC Copilot', ?)",
+            (case_id, session["user_id"]),
+        )
+        conn.commit()
+        thread = conn.execute("SELECT * FROM chat_threads WHERE id = ?", (cursor.lastrowid,)).fetchone()
+
+    cursor = conn.execute(
+        "INSERT INTO chat_actions (thread_id, case_id, action_type, label, description, tool_name, tool_args_json, requires_approval, status, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)",
+        (
+            thread["id"], case_id,
+            payload.get("action_type", "tool_execution"),
+            payload.get("label", ""),
+            payload.get("description", ""),
+            payload.get("tool_name"),
+            json.dumps(payload.get("tool_args", {})),
+            1 if payload.get("requires_approval", True) else 0,
+            session["user_id"],
+        ),
+    )
+    conn.commit()
+    action_id = cursor.lastrowid
+    conn.close()
+    return jsonify({"ok": True, "action": {"id": action_id, "status": "proposed"}})
+
+
+# ═══════════════════════════════════════════
+# Global (dashboard-wide) copilot
+# ═══════════════════════════════════════════
+# Uses case_id = 0 as a sentinel for the SOC-wide thread, so it reuses the
+# same chat_threads/chat_messages/chat_actions machinery as case chat.
+
+GLOBAL_CASE_ID = 0
+
+
+@chat_bp.post("/global")
+@_login_required
+def chat_global_post():
+    from web.services.chat import build_global_context, chat_completion
+
+    payload = request.get_json(force=True)
+    user_message = (payload.get("message") or "").strip()
+    if not user_message:
+        return jsonify({"ok": False, "error": "message is required"}), 400
+
+    conn = _get_db()
+    _init_chat(conn)
+
+    thread = conn.execute(
+        "SELECT * FROM chat_threads WHERE case_id = ? AND closed = 0 ORDER BY updated_at DESC LIMIT 1",
+        (GLOBAL_CASE_ID,),
+    ).fetchone()
+    if not thread:
+        cursor = conn.execute(
+            "INSERT INTO chat_threads (case_id, title, created_by) VALUES (?, 'Dashboard Copilot', ?)",
+            (GLOBAL_CASE_ID, session["user_id"]),
+        )
+        conn.commit()
+        thread = conn.execute("SELECT * FROM chat_threads WHERE id = ?", (cursor.lastrowid,)).fetchone()
+
+    conn.execute(
+        "INSERT INTO chat_messages (thread_id, sender_type, sender_id, content) VALUES (?, 'user', ?, ?)",
+        (thread["id"], session["user_id"], user_message),
+    )
+    conn.commit()
+
+    context = build_global_context(conn, user_message)
+    history_rows = conn.execute(
+        "SELECT * FROM chat_messages WHERE thread_id = ? ORDER BY created_at ASC",
+        (thread["id"],),
+    ).fetchall()
+    history = [{"sender_type": r["sender_type"], "content": r["content"]} for r in history_rows]
+
+    response = chat_completion(context, history, user_message, global_mode=True)
+
+    answer = response.get("answer", "")
+    citations = json.dumps(response.get("citations", []))
+    reasoning = json.dumps(response.get("reasoning", []))
+    conn.execute(
+        "INSERT INTO chat_messages (thread_id, sender_type, content, citations_json, reasoning_json) VALUES (?, 'assistant', ?, ?, ?)",
+        (thread["id"], answer, citations, reasoning),
+    )
+
+    suggested = response.get("suggested_actions", [])
+    for action in suggested:
+        conn.execute(
+            "INSERT INTO chat_actions (thread_id, case_id, action_type, label, description, tool_name, tool_args_json, requires_approval, status, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)",
+            (
+                thread["id"], GLOBAL_CASE_ID,
+                action.get("action_type", "tool_execution"),
+                action.get("label", ""),
+                action.get("description", ""),
+                action.get("tool_name"),
+                json.dumps(action.get("tool_args", {})),
+                1 if action.get("requires_approval", True) else 0,
+                session["user_id"],
+            ),
+        )
+
+    conn.execute("UPDATE chat_threads SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (thread["id"],))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "ok": True,
+        "thread_id": thread["id"],
+        "answer": answer,
+        "reasoning": response.get("reasoning", []),
+        "citations": response.get("citations", []),
+        "suggested_actions": suggested,
+        "approval_required": any(a.get("requires_approval") for a in suggested),
+    })
+
+
+@chat_bp.get("/global/history")
+@_login_required
+def chat_global_history():
+    conn = _get_db()
+    _init_chat(conn)
+
+    thread = conn.execute(
+        "SELECT * FROM chat_threads WHERE case_id = ? ORDER BY updated_at DESC LIMIT 1",
+        (GLOBAL_CASE_ID,),
+    ).fetchone()
+
+    if not thread:
+        conn.close()
+        return jsonify({"ok": True, "thread": None, "messages": [], "actions": []})
+
+    messages = conn.execute(
+        "SELECT * FROM chat_messages WHERE thread_id = ? ORDER BY created_at ASC",
+        (thread["id"],),
+    ).fetchall()
+    actions = conn.execute(
+        "SELECT * FROM chat_actions WHERE thread_id = ? ORDER BY created_at ASC",
+        (thread["id"],),
+    ).fetchall()
+
+    conn.close()
+    return jsonify({
+        "ok": True,
+        "thread": {"id": thread["id"], "case_id": thread["case_id"], "title": thread["title"]},
+        "messages": [
+            {"id": m["id"], "sender_type": m["sender_type"], "content": m["content"],
+             "citations": json.loads(m["citations_json"] or "[]"),
+             "reasoning": json.loads((m["reasoning_json"] if "reasoning_json" in m.keys() else "[]") or "[]"),
+             "created_at": m["created_at"]}
+            for m in messages
+        ],
+        "actions": [
+            {"id": a["id"], "action_type": a["action_type"], "label": a["label"],
+             "description": a["description"], "tool_name": a["tool_name"],
+             "requires_approval": bool(a["requires_approval"]), "status": a["status"],
+             "result_json": a["result_json"], "created_at": a["created_at"]}
+            for a in actions
+        ],
+    })

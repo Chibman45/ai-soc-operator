@@ -109,7 +109,7 @@ def build_clients(config: dict[str, Any]) -> dict[str, Any]:
     # Enrichment (aggregates all threat intel platforms)
     if any(
         platforms.get(p, {}).get("enabled")
-        for p in ["virustotal", "abuseipdb", "shodan", "urlscan", "hybrid_analysis", "misp"]
+        for p in ["virustotal", "abuseipdb", "shodan", "urlscan", "hybrid_analysis", "phishtank", "cortex", "misp"]
     ):
         clients["enrichment"] = EnrichmentClient(config)
 
@@ -207,6 +207,7 @@ def execute_playbook(
     alert: dict[str, Any],
     clients: dict[str, Any],
     session: Session,
+    approval_handler: Any | None = None,
 ) -> dict[str, Any]:
     """Execute a playbook against an alert."""
     playbook = load_playbook(playbook_path)
@@ -241,7 +242,7 @@ def execute_playbook(
     )
 
     # Run the playbook
-    runner = PlaybookRunner(playbook, context, clients)
+    runner = PlaybookRunner(playbook, context, clients, approval_handler=approval_handler)
     result = runner.run()
 
     # Include triage result in output for severity mapping

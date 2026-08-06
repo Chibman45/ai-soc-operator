@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     sender_id INTEGER,
     content TEXT NOT NULL,
     citations_json TEXT DEFAULT '[]',
+    reasoning_json TEXT DEFAULT '[]',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (thread_id) REFERENCES chat_threads(id)
 );
@@ -80,6 +81,14 @@ CREATE TABLE IF NOT EXISTS tool_executions (
 
 def init_chat_db(conn) -> None:
     conn.executescript(CHAT_SCHEMA)
+    # Migration: add reasoning_json to chat_messages if missing (older DBs).
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()}
+        if "reasoning_json" not in cols:
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN reasoning_json TEXT DEFAULT '[]'")
+            conn.commit()
+    except Exception:
+        pass
 
 
 # ── Tool Allowlist ──
@@ -193,6 +202,45 @@ def execute_tool(
         return {"exit_code": -1, "stdout": "", "stderr": str(e)[:500], "status": "error", "command_preview": command_preview}
 
 
+def execute_enrichment(ioc_type: str, value: str) -> dict[str, Any]:
+    """Execute enrichment lookup via EnrichmentClient (VT/AbuseIPDB/Shodan/urlscan/HybridAnalysis/MISP).
+
+    Returns: {status, platforms, results} where results is {platform: data} for each.
+    """
+    try:
+        from web.app import load_config_for_web
+        from scripts.orchestrator import build_clients
+
+        config = load_config_for_web()
+        clients = build_clients(config)
+        enrichment_client = clients.get("enrichment")
+        if not enrichment_client:
+            return {
+                "status": "no_enrichment_configured",
+                "platforms": [],
+                "results": {},
+                "error": "No enrichment platforms configured (VirusTotal/AbuseIPDB/Shodan/urlscan/HybridAnalysis/MISP).",
+            }
+
+        results = enrichment_client.enrich(ioc_type, value)
+        platforms = list(results.keys())
+        has_data = any(
+            isinstance(v, dict) and "error" not in v for v in results.values()
+        )
+        return {
+            "status": "done" if has_data else "no_data",
+            "platforms": platforms,
+            "results": results,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "platforms": [],
+            "results": {},
+            "error": str(e)[:500],
+        }
+
+
 # ── Context Builder ──
 
 def build_chat_context(conn, case_id: int, user_message: str) -> dict[str, Any]:
@@ -286,6 +334,75 @@ def build_chat_context(conn, case_id: int, user_message: str) -> dict[str, Any]:
     }
 
 
+# ── Global (dashboard) context builder ──
+
+def build_global_context(conn, user_message: str = "") -> dict[str, Any]:
+    """Build context spanning ALL alerts and cases for the dashboard copilot.
+
+    Unlike build_chat_context (single case), this gives the AI a SOC-wide view:
+    recent cases, the live alert queue, org-wide activity, and IOC hot-spots.
+    """
+    cases = conn.execute(
+        "SELECT id, title, severity, status, summary, created_at FROM cases ORDER BY created_at DESC LIMIT 25"
+    ).fetchall()
+
+    # Alert queue (feature table may not exist on very old DBs)
+    alerts = []
+    try:
+        alerts = conn.execute(
+            "SELECT id, source, title, severity, status, case_id, created_at FROM alerts ORDER BY created_at DESC LIMIT 25"
+        ).fetchall()
+    except Exception:
+        pass
+
+    activity = conn.execute(
+        "SELECT step, status, detail, timestamp FROM activity_log ORDER BY timestamp DESC LIMIT 30"
+    ).fetchall()
+
+    # IOCs seen across more than one case — correlation hot-spots
+    hot_iocs = []
+    try:
+        hot_iocs = conn.execute(
+            "SELECT value, type, COUNT(DISTINCT case_id) AS cases FROM observables "
+            "WHERE case_id IS NOT NULL GROUP BY value, type HAVING cases > 1 ORDER BY cases DESC LIMIT 10"
+        ).fetchall()
+    except Exception:
+        pass
+
+    def _sev_count(rows, sev):
+        return sum(1 for r in rows if (r["severity"] or "").lower() == sev)
+
+    return {
+        "scope": "global",
+        "summary": {
+            "open_cases": sum(1 for c in cases if (c["status"] or "") == "open"),
+            "total_cases": len(cases),
+            "queued_alerts": sum(1 for a in alerts if (a["status"] or "") in ("new", "queued")),
+            "critical_cases": _sev_count(cases, "critical"),
+            "high_cases": _sev_count(cases, "high"),
+        },
+        "cases": [
+            {"id": c["id"], "title": c["title"], "severity": c["severity"],
+             "status": c["status"], "summary": (c["summary"] or "")[:300], "created_at": c["created_at"]}
+            for c in cases
+        ],
+        "alerts": [
+            {"id": a["id"], "source": a["source"], "title": a["title"], "severity": a["severity"],
+             "status": a["status"], "case_id": a["case_id"], "created_at": a["created_at"]}
+            for a in alerts
+        ],
+        "activity": [
+            {"step": r["step"], "status": r["status"], "detail": r["detail"], "timestamp": r["timestamp"]}
+            for r in activity
+        ],
+        "correlated_iocs": [
+            {"value": r["value"], "type": r["type"], "case_count": r["cases"]}
+            for r in hot_iocs
+        ],
+        "allowed_tools": list(ALLOWED_TOOLS.keys()),
+    }
+
+
 # ── LLM Chat ──
 
 SOC_SYSTEM_PROMPT = """You are an AI SOC analyst assistant. You help analysts investigate security incidents.
@@ -300,12 +417,16 @@ You can:
 Rules:
 - Always ground your analysis in the case context and activity log
 - When suggesting a tool command, include the tool_name and args as a suggested action
+- To look up an IOC's reputation across threat-intel platforms (VirusTotal, AbuseIPDB, Shodan, urlscan, Hybrid Analysis, MISP), propose an "enrichment" action with tool_args {"ioc_type": "ip|domain|hash|url", "value": "<the ioc>"}
 - For risky tools (nmap, tshark, tcpdump), mark requires_approval: true
 - Be concise and factual — no speculation without evidence
-- Structure your response as JSON with: answer, citations, suggested_actions
+- Show your reasoning: put your step-by-step thinking in the "reasoning" field so the analyst can follow how you reached the answer
+- Anything with a side effect (running a tool, closing a case, contacting a platform that changes state) MUST be a suggested_action with requires_approval: true — never claim you already did it
+- Structure your response as JSON with: reasoning, answer, citations, suggested_actions
 
 Response format:
 {
+  "reasoning": ["Step 1: what I looked at", "Step 2: what it implies", "Step 3: what I conclude"],
   "answer": "Your analysis text",
   "citations": [{"type": "case", "ref": "case_id", "label": "..."}],
   "suggested_actions": [
@@ -316,17 +437,40 @@ Response format:
       "tool_name": "dig",
       "tool_args": {"args": ["example.com", "ANY"], "timeout_seconds": 15},
       "requires_approval": false
+    },
+    {
+      "action_type": "enrichment",
+      "label": "Enrich IP 203.0.113.5",
+      "description": "Reputation lookup via VirusTotal / AbuseIPDB / Shodan / MISP",
+      "tool_args": {"ioc_type": "ip", "value": "203.0.113.5"},
+      "requires_approval": true
     }
   ]
 }"""
 
+GLOBAL_SYSTEM_PROMPT = SOC_SYSTEM_PROMPT + """
 
-def chat_completion(context: dict[str, Any], history: list[dict], user_message: str) -> dict[str, Any]:
-    """Call GPT-5.6 for chat response."""
+You are operating in DASHBOARD mode with a SOC-wide view: you can see every case,
+the alert queue, org-wide activity, and IOCs that correlate across cases. When the
+analyst asks about "an alert" or "a case", identify which one(s) they mean from the
+context and cite them by id. If the question is ambiguous across many cases, ask a
+brief clarifying question rather than guessing."""
+
+
+def chat_completion(context: dict[str, Any], history: list[dict], user_message: str, global_mode: bool = False) -> dict[str, Any]:
+    """Call GPT-5.6 for chat response.
+
+    Args:
+        context: Case-specific or global SOC context
+        history: Conversation history
+        user_message: Current user question
+        global_mode: If True, use GLOBAL_SYSTEM_PROMPT (dashboard copilot)
+    """
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     if not openai_key:
         return {
-            "answer": "I need an OpenAI API key configured to analyze this case. Please set OPENAI_API_KEY.",
+            "reasoning": ["No OpenAI API key configured"],
+            "answer": "I need an OpenAI API key configured to analyze cases. Please set OPENAI_API_KEY.",
             "citations": [],
             "suggested_actions": [],
         }
@@ -335,13 +479,15 @@ def chat_completion(context: dict[str, Any], history: list[dict], user_message: 
         import urllib.request
         import ssl
 
-        messages = [{"role": "system", "content": SOC_SYSTEM_PROMPT}]
+        system_prompt = GLOBAL_SYSTEM_PROMPT if global_mode else SOC_SYSTEM_PROMPT
+        messages = [{"role": "system", "content": system_prompt}]
 
         # Add context
         context_str = json.dumps(context, indent=2)
+        label = "SOC-wide context" if global_mode else "Case context"
         messages.append({
             "role": "user",
-            "content": f"Case context:\n{context_str}\n\n"
+            "content": f"{label}:\n{context_str}\n\n"
         })
 
         # Add history
@@ -383,9 +529,14 @@ def chat_completion(context: dict[str, Any], history: list[dict], user_message: 
             content = re.sub(r"\n?```\s*$", "", content)
 
         try:
-            return json.loads(content)
+            parsed = json.loads(content)
+            # Ensure reasoning exists (fallback to empty list if not in response)
+            if "reasoning" not in parsed:
+                parsed["reasoning"] = []
+            return parsed
         except json.JSONDecodeError:
             return {
+                "reasoning": [],
                 "answer": content,
                 "citations": [],
                 "suggested_actions": [],
@@ -393,6 +544,7 @@ def chat_completion(context: dict[str, Any], history: list[dict], user_message: 
 
     except Exception as e:
         return {
+            "reasoning": [f"LLM call failed: {str(e)[:200]}"],
             "answer": f"Error calling LLM: {str(e)[:200]}",
             "citations": [],
             "suggested_actions": [],

@@ -158,19 +158,27 @@ PLATFORM_DEFAULTS = {
     "shodan": "https://api.shodan.io",
     "urlscan": "https://urlscan.io",
     "hybrid_analysis": "https://www.hybrid-analysis.com",
+    "phishtank": "https://checkurl.phishtank.com",
     "misp": "https://misp.example.com",
 }
+
+# Platforms that operate without an API key. They may still accept an optional
+# key (higher rate limits), but are enabled purely on their config flag.
+KEYLESS_PLATFORMS = {"phishtank"}
 
 PLATFORM_CREDENTIAL_KEYS = [
     ("OPENAI_API_KEY", None),
     ("THEHIVE_API_KEY", "thehive"),
     ("CORTEX_API_KEY", "cortex"),
     ("WAZUH_API_TOKEN", "wazuh_manager"),
+    ("WAZUH_INDEXER_USER", "wazuh_indexer"),
+    ("WAZUH_INDEXER_PASSWORD", "wazuh_indexer"),
     ("VIRUSTOTAL_API_KEY", "virustotal"),
     ("ABUSEIPDB_API_KEY", "abuseipdb"),
     ("SHODAN_API_KEY", "shodan"),
     ("URLSCAN_API_KEY", "urlscan"),
     ("HYBRID_ANALYSIS_API_KEY", "hybrid_analysis"),
+    ("PHISHTANK_API_KEY", "phishtank"),
     ("MISP_API_KEY", "misp"),
 ]
 
@@ -203,10 +211,16 @@ def save_platform_settings(conn: sqlite3.Connection, form: Any) -> None:
             "shodan": "SHODAN_URL",
             "urlscan": "URLSCAN_URL",
             "hybrid_analysis": "HYBRID_ANALYSIS_URL",
+            "phishtank": "PHISHTANK_URL",
         }.get(platform)
         if form_key:
             base_url = form.get(form_key, "").strip() or default_url
-            enabled = 1 if base_url else 0
+            # Keyless platforms are toggled by an explicit checkbox; everything
+            # else is considered enabled once it has a base URL.
+            if platform in KEYLESS_PLATFORMS:
+                enabled = 1 if form.get(f"{platform}_enabled") else 0
+            else:
+                enabled = 1 if base_url else 0
             conn.execute(
                 "INSERT INTO platform_config (platform, base_url, enabled, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)"
                 " ON CONFLICT(platform) DO UPDATE SET base_url = excluded.base_url, enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP",
@@ -227,6 +241,21 @@ def build_platforms_toml() -> str:
     for row in rows:
         platform = row["platform"]
         enabled = int(row["enabled"] or 0)
+        # Wazuh Indexer authenticates with basic auth (user+password), not a
+        # single API key — emit a dedicated block with username/password envs.
+        if platform == "wazuh_indexer":
+            user = creds.get("WAZUH_INDEXER_USER")
+            pw = creds.get("WAZUH_INDEXER_PASSWORD")
+            idx_enabled = bool(enabled and user and pw)
+            lines.extend([
+                "[platforms.wazuh_indexer]",
+                f"enabled = {str(idx_enabled).lower()}",
+                f'base_url = "{row["base_url"] or PLATFORM_DEFAULTS.get(platform, "")}"',
+                'username_env = "WAZUH_INDEXER_USER"',
+                'password_env = "WAZUH_INDEXER_PASSWORD"',
+                "",
+            ])
+            continue
         key_name = {
             "thehive": "THEHIVE_API_KEY",
             "cortex": "CORTEX_API_KEY",
@@ -236,13 +265,20 @@ def build_platforms_toml() -> str:
             "shodan": "SHODAN_API_KEY",
             "urlscan": "URLSCAN_API_KEY",
             "hybrid_analysis": "HYBRID_ANALYSIS_API_KEY",
+            "phishtank": "PHISHTANK_API_KEY",
             "misp": "MISP_API_KEY",
         }.get(platform)
         if not key_name:
             continue
+        # Keyless platforms (e.g. PhishTank) are enabled purely on their config
+        # flag; key-gated platforms require a stored credential to switch on.
+        if platform in KEYLESS_PLATFORMS:
+            is_enabled = bool(enabled)
+        else:
+            is_enabled = bool(enabled and creds.get(key_name))
         lines.extend([
             f"[platforms.{platform}]",
-            f"enabled = {str(bool(enabled and creds.get(key_name))).lower()}",
+            f"enabled = {str(is_enabled).lower()}",
             f'base_url = "{row["base_url"] or PLATFORM_DEFAULTS.get(platform, "")}"',
             f'credential_env = "{key_name}"',
             "",
@@ -496,7 +532,13 @@ def _execute_run_job(
         )
         try:
             progress_cb(0.35)
-            result = execute_playbook(playbook_path, alert, clients, session_obj)
+            from web.services.approvals import make_approval_handler
+
+            approval_handler = make_approval_handler(run_id)
+            result = execute_playbook(
+                playbook_path, alert, clients, session_obj,
+                approval_handler=approval_handler,
+            )
             progress_cb(0.9)
         finally:
             session_obj.finish()
@@ -902,6 +944,108 @@ def api_secrets_test():
         return jsonify({"status": "reachable", "platform": platform})
     except Exception as e:
         return jsonify({"status": "unreachable", "error": str(e)[:200]})
+
+
+# ── Platform connection testing ──
+
+PLATFORM_LABELS = {
+    "openai": "OpenAI",
+    "thehive": "TheHive",
+    "cortex": "Cortex",
+    "wazuh_manager": "Wazuh Manager",
+    "wazuh_indexer": "Wazuh Indexer",
+    "virustotal": "VirusTotal",
+    "abuseipdb": "AbuseIPDB",
+    "shodan": "Shodan",
+    "urlscan": "urlscan.io",
+    "hybrid_analysis": "Hybrid Analysis",
+    "misp": "MISP",
+}
+
+
+def _platform_probe(platform: str, base_url: str, api_key: str):
+    """Return (url, headers, method) for a lightweight authenticated probe, or None."""
+    b = (base_url or "").rstrip("/")
+    if platform == "openai":
+        return ("https://api.openai.com/v1/models", {"Authorization": f"Bearer {api_key}"}, "GET")
+    if platform == "virustotal":
+        return ("https://www.virustotal.com/api/v3/metadata", {"x-apikey": api_key}, "GET")
+    if platform == "abuseipdb":
+        return ("https://api.abuseipdb.com/api/v2/check?ipAddress=8.8.8.8&maxAgeInDays=30",
+                {"Key": api_key, "Accept": "application/json"}, "GET")
+    if platform == "shodan":
+        return (f"https://api.shodan.io/api-info?key={api_key}", {}, "GET")
+    if platform == "urlscan":
+        return ("https://urlscan.io/user/quota/", {"API-Key": api_key}, "GET")
+    if platform == "hybrid_analysis":
+        return ("https://www.hybrid-analysis.com/api/v2/key/current",
+                {"api-key": api_key, "User-Agent": "Falcon Sandbox", "Accept": "application/json"}, "GET")
+    if platform == "misp":
+        return (f"{b}/servers/getPyMISPVersion.json",
+                {"Authorization": api_key, "Accept": "application/json"}, "GET")
+    if platform == "thehive":
+        return (f"{b}/api/v1/user/current", {"Authorization": f"Bearer {api_key}"}, "GET")
+    if platform == "cortex":
+        return (f"{b}/api/user/current", {"Authorization": f"Bearer {api_key}"}, "GET")
+    if platform == "wazuh_manager":
+        return (f"{b}/manager/info", {"Authorization": f"Bearer {api_key}"}, "GET")
+    if platform == "wazuh_indexer":
+        return (f"{b}/", {}, "GET")
+    return None
+
+
+def _test_platform_connection(platform: str, base_url: str, api_key: str) -> dict[str, Any]:
+    result: dict[str, Any] = {"platform": platform, "label": PLATFORM_LABELS.get(platform, platform), "status": "unknown", "message": ""}
+    probe = _platform_probe(platform, base_url, api_key)
+    if probe is None:
+        result.update(status="skipped", message="No connectivity test available")
+        return result
+    url, headers, method = probe
+    if platform != "wazuh_indexer" and not api_key:
+        result.update(status="no_key", message="API key not configured")
+        return result
+    if base_url and "example.com" in base_url:
+        result.update(status="not_configured", message="Base URL still set to placeholder")
+        return result
+
+    import urllib.request
+    import urllib.error
+    import ssl
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, method=method, headers=headers)
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        resp = opener.open(req, timeout=8)
+        result.update(status="ok", http_status=resp.getcode(), message="Connected")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            result.update(status="auth_failed", http_status=e.code, message="Reachable, but authentication failed")
+        elif e.code in (400, 404, 405, 429):
+            result.update(status="reachable", http_status=e.code, message=f"Server responded ({e.code})")
+        else:
+            result.update(status="error", http_status=e.code, message=f"HTTP {e.code}")
+    except Exception as e:
+        result.update(status="unreachable", message=str(e)[:200])
+    return result
+
+
+@app.route("/api/secrets/test-all", methods=["POST"])
+@login_required
+def api_secrets_test_all():
+    conn = get_db()
+    creds = {row["key_name"]: row["key_value"] for row in conn.execute("SELECT key_name, key_value FROM credentials").fetchall()}
+    platform_cfg = {row["platform"]: row["base_url"] for row in conn.execute("SELECT platform, base_url FROM platform_config").fetchall()}
+    conn.close()
+
+    key_for_platform = {plat: kn for kn, plat in PLATFORM_CREDENTIAL_KEYS if plat}
+    results = [_test_platform_connection("openai", "", creds.get("OPENAI_API_KEY", ""))]
+    for platform in PLATFORM_DEFAULTS:
+        key_name = key_for_platform.get(platform)
+        api_key = creds.get(key_name, "") if key_name else ""
+        results.append(_test_platform_connection(platform, platform_cfg.get(platform, ""), api_key))
+
+    ok = sum(1 for r in results if r["status"] == "ok")
+    return jsonify({"results": results, "summary": {"total": len(results), "ok": ok}})
 
 
 # ── Main ──

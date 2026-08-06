@@ -205,6 +205,21 @@ class EnrichmentClient:
             if key:
                 self._clients["hybrid-analysis"] = HybridAnalysisClient(key)
 
+        if platforms.get("phishtank", {}).get("enabled"):
+            key = os.environ.get(
+                platforms["phishtank"].get("credential_env", ""), ""
+            )
+            self._clients["phishtank"] = PhishTankClient(key or None)
+
+        if platforms.get("cortex", {}).get("enabled"):
+            key = os.environ.get(
+                platforms["cortex"].get("credential_env", ""), ""
+            )
+            base_url = platforms["cortex"].get("base_url", "")
+            if key and base_url:
+                from .cortex import CortexClient
+                self._clients["cortex"] = CortexClient(base_url, key)
+
         if platforms.get("misp", {}).get("enabled"):
             key = os.environ.get(platforms["misp"].get("credential_env", ""), "")
             base_url = platforms["misp"].get("base_url", "")
@@ -220,6 +235,82 @@ class EnrichmentClient:
             return client.attribute_search({"value": value, "limit": 25})
         except Exception as e:
             return {"error": str(e)}
+
+    def _phishtank_lookup(self, url: str) -> dict[str, Any] | None:
+        """Check a URL against PhishTank's phishing database."""
+        client = self._clients.get("phishtank")
+        if not client:
+            return None
+        try:
+            return client.check_url(url)
+        except Exception as e:
+            return {"error": str(e)[:200]}
+
+    def _cortex_enrich(self, data_type: str, value: str) -> dict[str, Any] | None:
+        """Run Cortex analyzers for an observable and collect their reports.
+
+        Bounded by CORTEX_MAX_ANALYZERS (default 3) analyzers and a
+        CORTEX_POLL_TIMEOUT (default 25s) total wait budget so a slow analyzer
+        can't stall enrichment. Analyzers still running when the budget expires
+        are returned with their job id and status 'running'.
+        """
+        client = self._clients.get("cortex")
+        if not client:
+            return None
+        import time as _time
+
+        try:
+            max_analyzers = int(os.environ.get("CORTEX_MAX_ANALYZERS", "3") or "3")
+        except ValueError:
+            max_analyzers = 3
+        try:
+            poll_budget = float(os.environ.get("CORTEX_POLL_TIMEOUT", "25") or "25")
+        except ValueError:
+            poll_budget = 25.0
+
+        try:
+            analyzers = client.list_analyzers(data_type=data_type)
+        except Exception as e:
+            return {"error": f"list_analyzers failed: {str(e)[:150]}"}
+        if not analyzers:
+            return {
+                "analyzers": [],
+                "note": f"No Cortex analyzers available for dataType '{data_type}'",
+            }
+
+        reports: dict[str, Any] = {}
+        pending: dict[str, str] = {}
+        for a in analyzers[:max_analyzers]:
+            analyzer_id = a.get("id") or a.get("_id") or a.get("name")
+            name = a.get("name", analyzer_id)
+            if not analyzer_id:
+                continue
+            try:
+                job = client.run_analyzer(analyzer_id, data_type, value)
+                jid = job.get("id") or job.get("_id")
+                if jid:
+                    pending[name] = jid
+            except Exception as e:
+                reports[name] = {"error": str(e)[:150]}
+
+        deadline = _time.time() + poll_budget
+        while pending and _time.time() < deadline:
+            for name, jid in list(pending.items()):
+                try:
+                    job = client.get_job(jid)
+                except Exception as e:
+                    reports[name] = {"error": str(e)[:150]}
+                    pending.pop(name, None)
+                    continue
+                status = (job.get("status") or "").lower()
+                if status in ("success", "failure"):
+                    reports[name] = {"status": status, "report": job.get("report", {})}
+                    pending.pop(name, None)
+            if pending:
+                _time.sleep(2)
+        for name, jid in pending.items():
+            reports[name] = {"status": "running", "job_id": jid}
+        return {"analyzers_run": list(reports.keys()), "reports": reports}
 
     def enrich_ip(self, ip: str) -> dict[str, Any]:
         results: dict[str, Any] = {}
@@ -238,6 +329,9 @@ class EnrichmentClient:
                 results["shodan"] = self._clients["shodan"].host_lookup(ip)
             except Exception as e:
                 results["shodan"] = {"error": str(e)}
+        cortex = self._cortex_enrich("ip", ip)
+        if cortex is not None:
+            results["cortex"] = cortex
         misp = self._misp_lookup(ip)
         if misp is not None:
             results["misp"] = misp
@@ -251,6 +345,9 @@ class EnrichmentClient:
                 results["virustotal"] = self._clients["virustotal"].lookup_domain(domain)
             except Exception as e:
                 results["virustotal"] = {"error": str(e)}
+        cortex = self._cortex_enrich("domain", domain)
+        if cortex is not None:
+            results["cortex"] = cortex
         misp = self._misp_lookup(domain)
         if misp is not None:
             results["misp"] = misp
@@ -269,6 +366,9 @@ class EnrichmentClient:
                 results["hybrid-analysis"] = self._clients["hybrid-analysis"].hash_search(hash_value)
             except Exception as e:
                 results["hybrid-analysis"] = {"error": str(e)}
+        cortex = self._cortex_enrich("hash", hash_value)
+        if cortex is not None:
+            results["cortex"] = cortex
         misp = self._misp_lookup(hash_value)
         if misp is not None:
             results["misp"] = misp
@@ -282,6 +382,12 @@ class EnrichmentClient:
                 results["virustotal"] = self._clients["virustotal"].lookup_url(url)
             except Exception as e:
                 results["virustotal"] = {"error": str(e)}
+        phishtank = self._phishtank_lookup(url)
+        if phishtank is not None:
+            results["phishtank"] = phishtank
+        cortex = self._cortex_enrich("url", url)
+        if cortex is not None:
+            results["cortex"] = cortex
         misp = self._misp_lookup(url)
         if misp is not None:
             results["misp"] = misp

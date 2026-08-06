@@ -1,0 +1,313 @@
+<!-- Global SOC Copilot — floating dashboard-wide chat.
+     Included from base.html for all authenticated pages. Talks to /api/chat/global. -->
+<div id="copilot-root">
+    <!-- Launcher button -->
+    <button id="copilot-launcher" onclick="Copilot.toggle()"
+        class="fixed bottom-6 right-6 z-40 flex items-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 rounded-full shadow-lg shadow-blue-900/40 transition">
+        <span class="text-lg">💬</span>
+        <span class="text-sm font-medium">Copilot</span>
+        <span id="copilot-badge"
+            class="hidden absolute -top-1 -right-1 min-w-[20px] h-5 px-1 flex items-center justify-center rounded-full bg-red-500 text-white text-xs font-bold pulse">0</span>
+    </button>
+
+    <!-- Chat panel -->
+    <div id="copilot-panel"
+        class="fixed bottom-6 right-6 z-50 hidden w-[420px] max-w-[calc(100vw-2rem)] bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl flex flex-col"
+        style="height: min(680px, calc(100vh - 3rem));">
+        <!-- Header -->
+        <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+            <div class="flex items-center gap-2">
+                <span class="text-lg">🛡️</span>
+                <div>
+                    <div class="font-medium text-sm">SOC Copilot</div>
+                    <div class="text-xs text-gray-500" id="copilot-status">SOC-wide view</div>
+                </div>
+            </div>
+            <button onclick="Copilot.toggle()" class="text-gray-500 hover:text-gray-300 text-xl leading-none">&times;</button>
+        </div>
+
+        <!-- Messages -->
+        <div class="flex-1 overflow-y-auto p-4 space-y-4" id="copilot-messages">
+            <div class="text-center text-gray-600 text-sm py-6" id="copilot-placeholder">
+                Ask about any alert, case, or IOC across the SOC.<br>
+                <span class="text-gray-700">e.g. "What are the open critical cases?" · "Investigate the latest brute-force alert"</span>
+            </div>
+        </div>
+
+        <!-- Pending approvals -->
+        <div id="copilot-actions" class="px-4 py-2 border-t border-gray-800 hidden">
+            <div class="text-xs text-gray-500 mb-2">Proposed actions — your approval required</div>
+            <div class="space-y-2" id="copilot-actions-list"></div>
+        </div>
+
+        <!-- Input -->
+        <div class="px-3 py-3 border-t border-gray-800">
+            <div class="flex gap-2">
+                <input type="text" id="copilot-input" placeholder="Ask the SOC copilot…" autocomplete="off"
+                    class="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 text-sm focus:outline-none focus:border-blue-500"
+                    onkeypress="if(event.key==='Enter')Copilot.send()">
+                <button onclick="Copilot.send()" id="copilot-send"
+                    class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition">Send</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const Copilot = {
+    open: false,
+    rendered: new Set(),   // server message ids currently shown in the panel
+    pendingCount: 0,
+    pollTimer: null,
+
+    init() {
+        // Poll in the background so playbook approval requests surface even when
+        // the panel is closed — the AI "asks for approval" via this chat.
+        this.refresh();
+        this.pollTimer = setInterval(() => this.refresh(), 5000);
+    },
+
+    toggle() {
+        this.open = !this.open;
+        document.getElementById('copilot-panel').classList.toggle('hidden', !this.open);
+        document.getElementById('copilot-launcher').classList.toggle('hidden', this.open);
+        if (this.open) {
+            this.refresh();
+            document.getElementById('copilot-input').focus();
+        }
+    },
+
+    // Fetch the SOC-wide thread. When the panel is open, append any messages not
+    // yet rendered and refresh the pending-approval cards. Always update the badge.
+    async refresh() {
+        try {
+            const resp = await fetch('/api/chat/global/history');
+            const data = await resp.json();
+            if (!data.ok) return;
+
+            if (this.open && data.messages) {
+                for (const m of data.messages) {
+                    if (this.rendered.has(m.id)) continue;
+                    this.rendered.add(m.id);
+                    this.append(m.sender_type, m.content, m.reasoning, m.citations);
+                }
+            }
+            const pending = (data.actions || []).filter(a => a.status === 'proposed');
+            this.pendingCount = pending.length;
+            this.updateBadge();
+            if (this.open) this.showActions(pending);
+        } catch (e) { /* first run / transient: ignore */ }
+    },
+
+    updateBadge() {
+        const badge = document.getElementById('copilot-badge');
+        if (this.pendingCount > 0 && !this.open) {
+            badge.textContent = this.pendingCount;
+            badge.classList.remove('hidden');
+        } else {
+            badge.classList.add('hidden');
+        }
+    },
+
+    // After a send round-trip, baseline every current server message id as
+    // rendered so the local echoes aren't duplicated by the next poll.
+    async markRenderedBaseline() {
+        try {
+            const resp = await fetch('/api/chat/global/history');
+            const data = await resp.json();
+            if (data.ok && data.messages) data.messages.forEach(m => this.rendered.add(m.id));
+        } catch (e) { /* ignore */ }
+    },
+
+    async send() {
+        const input = document.getElementById('copilot-input');
+        const msg = input.value.trim();
+        if (!msg) return;
+        input.value = '';
+        this.append('user', msg);
+
+        this.setStatus('Thinking…');
+        document.getElementById('copilot-send').disabled = true;
+        const typing = this.appendTyping();
+
+        try {
+            const resp = await fetch('/api/chat/global', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({message: msg})
+            });
+            const data = await resp.json();
+            typing.remove();
+            if (data.ok) {
+                this.append('assistant', data.answer, data.reasoning, data.citations);
+                if (data.suggested_actions && data.suggested_actions.length) {
+                    this.showActions(data.suggested_actions);
+                }
+                await this.markRenderedBaseline();
+            } else {
+                this.append('system', 'Error: ' + (data.error || 'unknown'));
+            }
+        } catch (e) {
+            typing.remove();
+            this.append('system', 'Connection error: ' + e.message);
+        }
+        this.setStatus('SOC-wide view');
+        document.getElementById('copilot-send').disabled = false;
+    },
+
+    setStatus(t) { document.getElementById('copilot-status').textContent = t; },
+
+    _clearPlaceholder() {
+        const p = document.getElementById('copilot-placeholder');
+        if (p) p.remove();
+    },
+
+    appendTyping() {
+        this._clearPlaceholder();
+        const container = document.getElementById('copilot-messages');
+        const div = document.createElement('div');
+        div.className = 'text-xs text-gray-500 pulse';
+        div.textContent = '🤖 Copilot is analyzing…';
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+        return div;
+    },
+
+    append(type, content, reasoning, citations) {
+        this._clearPlaceholder();
+        const container = document.getElementById('copilot-messages');
+        const div = document.createElement('div');
+        div.className = 'fade-in';
+
+        const bubble = {
+            user: 'bg-blue-600 text-white ml-8',
+            assistant: 'bg-gray-800 text-gray-100 mr-4',
+            system: 'bg-yellow-900/40 text-yellow-300 text-xs',
+        }[type] || 'bg-gray-800';
+        const label = {user: 'You', assistant: '🤖 Copilot', system: 'System'}[type] || type;
+
+        // Collapsible reasoning ("thought process")
+        let reasoningHtml = '';
+        if (reasoning && reasoning.length) {
+            const steps = reasoning.map(s => '<li class="mb-1">' + this.esc(s) + '</li>').join('');
+            reasoningHtml = `
+                <details class="mb-1 group">
+                    <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+                        🧠 Thought process (${reasoning.length} steps)
+                    </summary>
+                    <ol class="list-decimal list-inside text-xs text-gray-400 mt-1 pl-2 border-l border-gray-700">
+                        ${steps}
+                    </ol>
+                </details>`;
+        }
+
+        const citeHtml = (citations && citations.length)
+            ? '<div class="text-xs text-gray-600 mt-1">📎 ' + citations.map(c => this.esc(c.label || String(c.ref || ''))).join(', ') + '</div>'
+            : '';
+
+        div.innerHTML = `
+            <div class="text-xs text-gray-500 mb-1">${label}</div>
+            ${reasoningHtml}
+            <div class="px-3 py-2 rounded-xl text-sm whitespace-pre-wrap ${bubble}">${this.esc(content)}</div>
+            ${citeHtml}`;
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+    },
+
+    showActions(actions) {
+        const wrap = document.getElementById('copilot-actions');
+        const list = document.getElementById('copilot-actions-list');
+        list.innerHTML = '';
+        wrap.classList.remove('hidden');
+        actions.forEach(a => {
+            const row = document.createElement('div');
+            row.className = 'flex items-center justify-between gap-2 rounded-lg border border-gray-800 px-3 py-2';
+            const needsApproval = a.requires_approval !== false;
+            row.innerHTML = `
+                <div class="min-w-0">
+                    <div class="text-sm text-gray-200 truncate">${needsApproval ? '🔐 ' : '▶ '}${this.esc(a.label || a.tool_name || 'action')}</div>
+                    <div class="text-xs text-gray-500 truncate">${this.esc(a.description || '')}</div>
+                </div>
+                <div class="flex gap-1 shrink-0"></div>`;
+            const btns = row.querySelector('div.flex');
+            if (needsApproval) {
+                const approve = document.createElement('button');
+                approve.className = 'px-2 py-1 rounded bg-green-800 text-green-200 text-xs hover:bg-green-700';
+                approve.textContent = 'Approve';
+                approve.onclick = () => this.decide(a, true, row);
+                const reject = document.createElement('button');
+                reject.className = 'px-2 py-1 rounded bg-red-900 text-red-300 text-xs hover:bg-red-800';
+                reject.textContent = 'Reject';
+                reject.onclick = () => this.decide(a, false, row);
+                btns.appendChild(approve); btns.appendChild(reject);
+            } else {
+                const run = document.createElement('button');
+                run.className = 'px-2 py-1 rounded bg-blue-700 text-blue-100 text-xs hover:bg-blue-600';
+                run.textContent = 'Run';
+                run.onclick = () => this.decide(a, true, row);
+                btns.appendChild(run);
+            }
+            list.appendChild(row);
+        });
+    },
+
+    async decide(action, approved, row) {
+        row.querySelectorAll('button').forEach(b => b.disabled = true);
+        try {
+            // Persist the proposed action (id may already exist if loaded from history)
+            let actionId = action.id;
+            if (!actionId) {
+                const createResp = await fetch('/api/chat/0/action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        action_type: action.action_type, label: action.label,
+                        description: action.description, tool_name: action.tool_name,
+                        tool_args: action.tool_args, requires_approval: action.requires_approval
+                    })
+                });
+                const created = await createResp.json();
+                actionId = created.action && created.action.id;
+            }
+            if (!actionId) throw new Error('could not create action');
+
+            const verb = approved ? 'approve' : 'reject';
+            const resp = await fetch(`/api/chat/0/action/${actionId}/${verb}`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({})
+            });
+            const result = await resp.json();
+            row.remove();
+            if (!document.getElementById('copilot-actions-list').children.length) {
+                document.getElementById('copilot-actions').classList.add('hidden');
+            }
+            if (approved && result.result) {
+                const r = result.result;
+                if (r.platforms !== undefined || r.results !== undefined) {
+                    // enrichment result
+                    const plats = (r.platforms || []).join(', ') || 'none';
+                    const body = JSON.stringify(r.results || {}, null, 2).slice(0, 1800);
+                    this.append('system', `✅ ${action.label}\nplatforms: ${plats} · ${r.status}\n\n${body}`);
+                } else {
+                    // local tool execution result
+                    this.append('system', `✅ ${action.label}\n$ ${r.command_preview}\nexit ${r.exit_code}\n\n${(r.stdout || r.stderr || '(no output)').slice(0, 1500)}`);
+                }
+            } else if (approved) {
+                this.append('system', `✅ Approved: ${action.label}`);
+            } else {
+                this.append('system', `🚫 Rejected: ${action.label}`);
+            }
+            this.refresh();  // update pending count / badge after the decision
+        } catch (e) {
+            this.append('system', '❌ ' + e.message);
+        }
+    },
+
+    esc(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+};
+
+document.addEventListener('DOMContentLoaded', () => Copilot.init());
+</script>

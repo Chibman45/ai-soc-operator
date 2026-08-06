@@ -68,6 +68,10 @@
         </main>
     </div>
 
+    {% if session.get('user_id') %}
+        {% include "copilot_widget.html" %}
+    {% endif %}
+
     {% block scripts %}{% endblock %}
 </body>
 </html>

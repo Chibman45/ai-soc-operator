@@ -199,12 +199,17 @@ class PlaybookRunner:
         playbook: dict[str, Any],
         context: dict[str, Any],
         clients: dict[str, Any] | None = None,
+        approval_handler: Any | None = None,
     ):
         self.playbook = playbook
         self.context = context
         self.clients = clients or {}
         self.results: dict[str, Any] = {}
         self.execution_log: list[dict[str, Any]] = []
+        # Optional callable(step, actions, context) -> decision dict, injected by
+        # the web runtime to block on human approval via the copilot chat. When
+        # None (CLI/tests), approval steps stay non-blocking (legacy behavior).
+        self.approval_handler = approval_handler
 
     def run(self) -> dict[str, Any]:
         steps = self.playbook.get("steps", [])
@@ -258,6 +263,24 @@ class PlaybookRunner:
 
                 self._log(step_id, step_type, "finished")
                 audit("playbook_step_finished", step=step_id, type=step_type)
+
+                # Human-in-the-loop: a rejected or timed-out approval gate halts
+                # the run so no unapproved action is performed downstream.
+                if (
+                    step_type == "approval"
+                    and isinstance(result, dict)
+                    and result.get("status") in ("rejected", "timeout")
+                ):
+                    self._log(
+                        step_id, step_type, "halted",
+                        f"approval {result.get('status')} — stopping playbook",
+                    )
+                    audit(
+                        "playbook_halted",
+                        step=step_id,
+                        reason=f"approval_{result.get('status')}",
+                    )
+                    break
 
             except Exception as e:
                 error_result = {"error": str(e)}
@@ -325,7 +348,7 @@ class PlaybookRunner:
                 continue
 
             # Actually execute enrichment if client is available
-            if enrichment_client and tool in ("virustotal", "abuseipdb", "shodan", "urlscan", "hybrid-analysis"):
+            if enrichment_client and tool in ("virustotal", "abuseipdb", "shodan", "urlscan", "hybrid-analysis", "cortex", "phishtank"):
                 try:
                     ioc_type = operation if operation in ("ip", "domain", "hash", "url") else "ip"
                     api_result = enrichment_client.enrich(ioc_type, target)
@@ -417,11 +440,56 @@ class PlaybookRunner:
         actions = step.get("actions", [])
         condition = when.get("condition", "")
         needs_approval = not condition or evaluate_condition(condition, self.context)
+
+        if not needs_approval:
+            return {
+                "type": "approval",
+                "actions": actions,
+                "needs_approval": False,
+                "status": "auto_approved",
+            }
+
+        # Human approval required. When a handler is wired (web runtime), block
+        # until a human approves/rejects in the copilot chat. Without a handler
+        # (CLI/tests), preserve legacy non-blocking "pending" behavior.
+        if self.approval_handler is None:
+            return {
+                "type": "approval",
+                "actions": actions,
+                "needs_approval": True,
+                "status": "pending_human_approval",
+            }
+
+        try:
+            decision = self.approval_handler(step, actions, self.context) or {}
+        except Exception as exc:  # noqa: BLE001 — handler failure must not crash the run
+            audit(
+                "playbook_approval_handler_error",
+                step=step.get("id"),
+                error=str(exc)[:200],
+            )
+            return {
+                "type": "approval",
+                "actions": actions,
+                "needs_approval": True,
+                "status": "pending_human_approval",
+                "error": str(exc)[:200],
+            }
+
+        status = {
+            "approved": "approved",
+            "rejected": "rejected",
+            "timeout": "timeout",
+        }.get(decision.get("decision", "timeout"), "timeout")
         return {
             "type": "approval",
             "actions": actions,
-            "needs_approval": needs_approval,
-            "status": "pending_human_approval" if needs_approval else "auto_approved",
+            "needs_approval": True,
+            "status": status,
+            "decided_by": decision.get("decided_by"),
+            "decided_at": decision.get("decided_at"),
+            "reason": decision.get("reason"),
+            "action_id": decision.get("action_id"),
         }
 
     def _run_report(self, step: dict[str, Any]) -> dict[str, Any]:
