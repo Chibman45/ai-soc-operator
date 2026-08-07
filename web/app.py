@@ -1074,6 +1074,12 @@ app.register_blueprint(features_bp)
 
 if __name__ == "__main__":
     init_db()
+
+    # Opt-in Wazuh alert poller -- only starts when WAZUH_POLL_ENABLED is set.
+    if os.environ.get("WAZUH_POLL_ENABLED", "").lower() in {"1", "true", "yes", "on"}:
+        from web.services.wazuh_poller import get_poller
+        get_poller().start()
+
     ip = get_local_ip()
     port = 5000
     print(f"\n{'='*50}")

@@ -341,6 +341,41 @@ def test_credential(cred_id: int):
 
 
 # ═══════════════════════════════════════════
+# Wazuh Alert Poller Control
+# ═══════════════════════════════════════════
+
+@features_bp.post("/api/wazuh/poller/start")
+@_login_required
+def poller_start():
+    from web.services.wazuh_poller import get_poller
+    started = get_poller().start()
+    return jsonify({"ok": True, "started": started})
+
+
+@features_bp.post("/api/wazuh/poller/stop")
+@_login_required
+def poller_stop():
+    from web.services.wazuh_poller import get_poller
+    stopped = get_poller().stop()
+    return jsonify({"ok": True, "stopped": stopped})
+
+
+@features_bp.get("/api/wazuh/poller/status")
+@_login_required
+def poller_status():
+    from web.services.wazuh_poller import get_poller
+    return jsonify({"ok": True, **get_poller().status()})
+
+
+@features_bp.post("/api/wazuh/poller/poll-once")
+@_login_required
+def poller_poll_once():
+    from web.services.wazuh_poller import get_poller
+    result = get_poller().poll_once()
+    return jsonify({"ok": result.get("ok", False), **result})
+
+
+# ═══════════════════════════════════════════
 # Feature 5: Case Assignment + SLA
 # ═══════════════════════════════════════════
 
