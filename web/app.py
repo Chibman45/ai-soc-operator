@@ -211,17 +211,27 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 PLATFORM_DEFAULTS = {
-    "thehive": "https://thehive.example.com",
-    "cortex": "https://cortex.example.com",
-    "wazuh_manager": "https://wazuh-manager.example.com:55000",
-    "wazuh_indexer": "https://wazuh-indexer.example.com:9200",
+    # Self-hosted services have no safe universal address. Keeping them empty
+    # prevents a placeholder domain from being saved as an enabled connection.
+    "thehive": "",
+    "cortex": "",
+    "wazuh_manager": "",
+    "wazuh_indexer": "",
     "virustotal": "https://www.virustotal.com",
     "abuseipdb": "https://api.abuseipdb.com",
     "shodan": "https://api.shodan.io",
     "urlscan": "https://urlscan.io",
     "hybrid_analysis": "https://www.hybrid-analysis.com",
     "phishtank": "https://checkurl.phishtank.com",
-    "misp": "https://misp.example.com",
+    "misp": "",
+}
+
+PLATFORM_URL_PLACEHOLDERS = {
+    "thehive": "https://thehive.your-domain.example",
+    "cortex": "https://cortex.your-domain.example",
+    "wazuh_manager": "https://wazuh-manager.your-domain.example:55000",
+    "wazuh_indexer": "https://wazuh-indexer.your-domain.example:9200",
+    "misp": "https://misp.your-domain.example",
 }
 
 # Platforms that operate without an API key. They may still accept an optional
@@ -499,7 +509,13 @@ def credentials():
         for row in conn.execute("SELECT platform, base_url, enabled FROM platform_config WHERE org_id = ?", (org_id,)).fetchall()
     }
     conn.close()
-    return render_template("credentials.html", existing=existing, platform_existing=platform_existing)
+    return render_template(
+        "credentials.html",
+        existing=existing,
+        platform_existing=platform_existing,
+        platform_defaults=PLATFORM_DEFAULTS,
+        platform_placeholders=PLATFORM_URL_PLACEHOLDERS,
+    )
 
 
 # ── Routes: Dashboard ──

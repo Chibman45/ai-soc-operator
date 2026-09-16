@@ -104,6 +104,40 @@ class AuthorizationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
 
 
+class CredentialFormTests(unittest.TestCase):
+    def test_public_urls_are_populated_and_private_urls_are_placeholders(self):
+        from web.app import app, init_db
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "soc_operator.db"
+            with patch("web.app.DB_PATH", db_path), patch("web.security.DB_PATH", db_path):
+                init_db()
+                conn = sqlite3.connect(db_path)
+                conn.execute("INSERT INTO users (username, password_hash) VALUES ('admin', 'x')")
+                conn.commit()
+                conn.close()
+                init_db()
+                conn = sqlite3.connect(db_path)
+                user_id, org_id = conn.execute(
+                    "SELECT u.id, om.org_id FROM users u JOIN organization_memberships om ON om.user_id = u.id"
+                ).fetchone()
+                conn.close()
+                app.config.update(TESTING=True)
+                client = app.test_client()
+                with client.session_transaction() as sess:
+                    sess["user_id"] = user_id
+                    sess["org_id"] = org_id
+                    sess["csrf_token"] = "test-token"
+                response = client.get("/credentials")
+
+        body = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('name="VIRUSTOTAL_URL" value="https://www.virustotal.com"', body)
+        self.assertIn('name="URLSCAN_URL" value="https://urlscan.io"', body)
+        self.assertIn('name="WAZUH_URL" value=""', body)
+        self.assertIn('placeholder="https://wazuh-manager.your-domain.example:55000"', body)
+
+
 class JobDurabilityTests(unittest.TestCase):
     def test_idempotency_key_returns_existing_job(self):
         with tempfile.TemporaryDirectory() as tmp:
