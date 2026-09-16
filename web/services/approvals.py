@@ -27,19 +27,19 @@ DEFAULT_TIMEOUT_SECONDS = 1800  # 30 minutes — long enough for a human to resp
 _APPROVED_STATES = {"approved", "done", "executed"}
 
 
-def _get_global_thread(conn, created_by: int | None = None) -> int:
+def _get_global_thread(conn, org_id: int, created_by: int | None = None) -> int:
     """Return the id of the open dashboard-copilot thread, creating it if needed."""
     thread = conn.execute(
-        "SELECT id FROM chat_threads WHERE case_id = ? AND closed = 0 "
+        "SELECT id FROM chat_threads WHERE case_id = ? AND org_id = ? AND closed = 0 "
         "ORDER BY updated_at DESC LIMIT 1",
-        (GLOBAL_CASE_ID,),
+        (GLOBAL_CASE_ID, org_id),
     ).fetchone()
     if thread:
         return int(thread["id"])
     cursor = conn.execute(
-        "INSERT INTO chat_threads (case_id, title, created_by) "
-        "VALUES (?, 'Dashboard Copilot', ?)",
-        (GLOBAL_CASE_ID, created_by),
+        "INSERT INTO chat_threads (case_id, title, created_by, org_id) "
+        "VALUES (?, 'Dashboard Copilot', ?, ?)",
+        (GLOBAL_CASE_ID, created_by, org_id),
     )
     conn.commit()
     return int(cursor.lastrowid)
@@ -82,7 +82,11 @@ def make_approval_handler(
         conn = get_db()
         try:
             init_chat_db(conn)
-            thread_id = _get_global_thread(conn)
+            run = conn.execute("SELECT org_id, requested_by FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if not run or run["org_id"] is None:
+                raise RuntimeError("Run has no organization context for approval")
+            org_id = int(run["org_id"])
+            thread_id = _get_global_thread(conn, org_id, run["requested_by"])
 
             step_id = step.get("id", "approval")
             prompt = (
@@ -119,8 +123,8 @@ def make_approval_handler(
             cursor = conn.execute(
                 "INSERT INTO chat_actions "
                 "(thread_id, case_id, action_type, label, description, tool_name, "
-                " tool_args_json, requires_approval, status, requested_by) "
-                "VALUES (?, ?, 'playbook_approval', ?, ?, NULL, ?, 1, 'proposed', NULL)",
+                " tool_args_json, requires_approval, status, requested_by, org_id) "
+                "VALUES (?, ?, 'playbook_approval', ?, ?, NULL, ?, 1, 'proposed', ?, ?)",
                 (
                     thread_id,
                     GLOBAL_CASE_ID,
@@ -129,6 +133,8 @@ def make_approval_handler(
                     json.dumps(
                         {"run_id": run_id, "step_id": step_id, "actions": actions}
                     ),
+                    run["requested_by"],
+                    org_id,
                 ),
             )
             action_id = int(cursor.lastrowid)

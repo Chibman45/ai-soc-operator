@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS chat_threads (
     created_by INTEGER,
     closed INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    org_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS chat_messages (
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS chat_actions (
     approved_at TIMESTAMP,
     executed_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    org_id INTEGER,
     FOREIGN KEY (thread_id) REFERENCES chat_threads(id)
 );
 
@@ -86,7 +88,15 @@ def init_chat_db(conn) -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()}
         if "reasoning_json" not in cols:
             conn.execute("ALTER TABLE chat_messages ADD COLUMN reasoning_json TEXT DEFAULT '[]'")
-            conn.commit()
+        for table in ("chat_threads", "chat_actions"):
+            table_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "org_id" not in table_cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN org_id INTEGER")
+        default_org = conn.execute("SELECT id FROM organizations ORDER BY id LIMIT 1").fetchone()
+        if default_org:
+            conn.execute("UPDATE chat_threads SET org_id = ? WHERE org_id IS NULL", (default_org["id"],))
+            conn.execute("UPDATE chat_actions SET org_id = ? WHERE org_id IS NULL", (default_org["id"],))
+        conn.commit()
     except Exception:
         pass
 
@@ -99,12 +109,12 @@ ALLOWED_TOOLS = {
     "dig": {"tier": 0, "approval": False},
     "nslookup": {"tier": 0, "approval": False},
     "host": {"tier": 0, "approval": False},
-    "ip": {"tier": 0, "approval": False},
-    "curl": {"tier": 0, "approval": False},
+    "ip": {"tier": 2, "approval": True},
+    "curl": {"tier": 2, "approval": True},
     "grep": {"tier": 0, "approval": False},
     "rg": {"tier": 0, "approval": False},
-    "awk": {"tier": 0, "approval": False},
-    "sed": {"tier": 0, "approval": False},
+    "awk": {"tier": 1, "approval": True},
+    "sed": {"tier": 1, "approval": True},
     "jq": {"tier": 0, "approval": False},
     "ps": {"tier": 0, "approval": False},
     "ss": {"tier": 0, "approval": False},
@@ -116,7 +126,7 @@ ALLOWED_TOOLS = {
     "file": {"tier": 0, "approval": False},
     "sha256sum": {"tier": 0, "approval": False},
     "md5sum": {"tier": 0, "approval": False},
-    "sqlite3": {"tier": 0, "approval": False},
+    "sqlite3": {"tier": 1, "approval": True},
     # Tier 1 — local analysis
     "nmap": {"tier": 1, "approval": True},
     "whatweb": {"tier": 1, "approval": True},
@@ -142,6 +152,7 @@ BLOCKED_ARGUMENTS = [
     "python3 -c",
     "nc -l",
     "ncat -l",
+    "system(",
 ]
 
 
@@ -158,6 +169,8 @@ def validate_command(tool_name: str, args: list[str]) -> tuple[bool, str]:
 
     if any(arg.startswith("-") and "script" in arg.lower() for arg in args):
         return False, "Script-like arguments are not allowed"
+    if tool_name == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in args):
+        return False, "In-place file changes are not allowed"
 
     return True, "ok"
 
@@ -210,9 +223,20 @@ def execute_enrichment(ioc_type: str, value: str) -> dict[str, Any]:
     try:
         from web.app import load_config_for_web
         from scripts.orchestrator import build_clients
+        from web.security import current_org_id, get_security_db
+        from web.services.credential_vault import open_secret
 
-        config = load_config_for_web()
-        clients = build_clients(config)
+        conn = get_security_db()
+        try:
+            org_id = current_org_id(conn)
+            credentials = {
+                row["key_name"]: open_secret(row["key_value"])
+                for row in conn.execute("SELECT key_name, key_value FROM credentials WHERE org_id = ?", (org_id,)).fetchall()
+            }
+        finally:
+            conn.close()
+        config = load_config_for_web(org_id)
+        clients = build_clients(config, credentials=credentials)
         enrichment_client = clients.get("enrichment")
         if not enrichment_client:
             return {
@@ -248,6 +272,7 @@ def build_chat_context(conn, case_id: int, user_message: str) -> dict[str, Any]:
     case = conn.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
     if not case:
         return {"error": "Case not found"}
+    org_id = case["org_id"] if "org_id" in case.keys() else None
 
     # Get recent activity
     activity = conn.execute(
@@ -258,10 +283,13 @@ def build_chat_context(conn, case_id: int, user_message: str) -> dict[str, Any]:
     # Get observables from the observables table (real data)
     observables = []
     try:
-        obs_rows = conn.execute(
-            "SELECT * FROM observables WHERE case_id = ? ORDER BY created_at DESC",
-            (case_id,),
-        ).fetchall()
+        if org_id is None:
+            obs_rows = conn.execute("SELECT * FROM observables WHERE case_id = ? ORDER BY created_at DESC", (case_id,)).fetchall()
+        else:
+            obs_rows = conn.execute(
+                "SELECT * FROM observables WHERE case_id = ? AND org_id = ? ORDER BY created_at DESC",
+                (case_id, org_id),
+            ).fetchall()
         observables = [{"type": r["type"], "value": r["value"], "source": r["source"]} for r in obs_rows]
     except Exception:
         pass  # Table may not exist yet
@@ -271,10 +299,16 @@ def build_chat_context(conn, case_id: int, user_message: str) -> dict[str, Any]:
     if observables:
         for obs in observables[:5]:
             try:
-                related = conn.execute(
-                    "SELECT DISTINCT c.id, c.title, c.severity FROM observables o JOIN cases c ON o.case_id = c.id WHERE o.value = ? AND o.case_id != ? LIMIT 3",
-                    (obs["value"], case_id),
-                ).fetchall()
+                if org_id is None:
+                    related = conn.execute(
+                        "SELECT DISTINCT c.id, c.title, c.severity FROM observables o JOIN cases c ON o.case_id = c.id WHERE o.value = ? AND o.case_id != ? LIMIT 3",
+                        (obs["value"], case_id),
+                    ).fetchall()
+                else:
+                    related = conn.execute(
+                        "SELECT DISTINCT c.id, c.title, c.severity FROM observables o JOIN cases c ON o.case_id = c.id WHERE o.org_id = ? AND c.org_id = ? AND o.value = ? AND o.case_id != ? LIMIT 3",
+                        (org_id, org_id, obs["value"], case_id),
+                    ).fetchall()
                 for r in related:
                     if r["id"] not in [rc["id"] for rc in related_cases]:
                         related_cases.append({"id": r["id"], "title": r["title"], "severity": r["severity"]})
@@ -336,27 +370,30 @@ def build_chat_context(conn, case_id: int, user_message: str) -> dict[str, Any]:
 
 # ── Global (dashboard) context builder ──
 
-def build_global_context(conn, user_message: str = "") -> dict[str, Any]:
+def build_global_context(conn, user_message: str = "", org_id: int | None = None) -> dict[str, Any]:
     """Build context spanning ALL alerts and cases for the dashboard copilot.
 
     Unlike build_chat_context (single case), this gives the AI a SOC-wide view:
     recent cases, the live alert queue, org-wide activity, and IOC hot-spots.
     """
     cases = conn.execute(
-        "SELECT id, title, severity, status, summary, created_at FROM cases ORDER BY created_at DESC LIMIT 25"
+        "SELECT id, title, severity, status, summary, created_at FROM cases WHERE org_id = ? ORDER BY created_at DESC LIMIT 25",
+        (org_id,),
     ).fetchall()
 
     # Alert queue (feature table may not exist on very old DBs)
     alerts = []
     try:
         alerts = conn.execute(
-            "SELECT id, source, title, severity, status, case_id, created_at FROM alerts ORDER BY created_at DESC LIMIT 25"
+            "SELECT id, source, title, severity, status, case_id, created_at FROM alerts WHERE org_id = ? ORDER BY created_at DESC LIMIT 25",
+            (org_id,),
         ).fetchall()
     except Exception:
         pass
 
     activity = conn.execute(
-        "SELECT step, status, detail, timestamp FROM activity_log ORDER BY timestamp DESC LIMIT 30"
+        "SELECT step, status, detail, timestamp FROM activity_log WHERE org_id = ? ORDER BY timestamp DESC LIMIT 30",
+        (org_id,),
     ).fetchall()
 
     # IOCs seen across more than one case — correlation hot-spots
@@ -364,7 +401,8 @@ def build_global_context(conn, user_message: str = "") -> dict[str, Any]:
     try:
         hot_iocs = conn.execute(
             "SELECT value, type, COUNT(DISTINCT case_id) AS cases FROM observables "
-            "WHERE case_id IS NOT NULL GROUP BY value, type HAVING cases > 1 ORDER BY cases DESC LIMIT 10"
+            "WHERE org_id = ? AND case_id IS NOT NULL GROUP BY value, type HAVING cases > 1 ORDER BY cases DESC LIMIT 10",
+            (org_id,),
         ).fetchall()
     except Exception:
         pass

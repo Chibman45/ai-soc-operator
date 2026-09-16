@@ -14,6 +14,9 @@ class WebRouteRegistrationTests(unittest.TestCase):
         self.assertIn("/api/webhooks/test", routes)
         self.assertIn("/api/webhooks/wazuh", routes)
         self.assertIn("/api/learning/suggestions", routes)
+        self.assertIn("/api/cases/<int:case_id>/export/stix", routes)
+        self.assertIn("/api/cases/<int:case_id>/responders", routes)
+        self.assertIn("/api/service-clients", routes)
 
 
 if __name__ == "__main__":

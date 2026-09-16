@@ -52,14 +52,22 @@ def load_config() -> dict[str, Any]:
         return tomllib.load(f)
 
 
-def build_clients(config: dict[str, Any]) -> dict[str, Any]:
-    """Build platform clients from configuration."""
+def build_clients(
+    config: dict[str, Any],
+    credentials: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build platform clients from config plus request-scoped decrypted credentials."""
     import os
     clients: dict[str, Any] = {}
     platforms = config.get("platforms", {})
+    credentials = credentials or {}
+
+    def secret(name: str) -> str:
+        # CLI deployments keep env compatibility; the web path passes a tenant-scoped map.
+        return credentials.get(name, "") or os.environ.get(name, "")
 
     # OpenAI GPT-5.6 for LLM steps
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    openai_key = secret("OPENAI_API_KEY")
     if openai_key:
         from .soc_client.openai import OpenAIClient
         clients["openai"] = OpenAIClient(openai_key)
@@ -67,21 +75,21 @@ def build_clients(config: dict[str, Any]) -> dict[str, Any]:
     # TheHive
     thehive_cfg = platforms.get("thehive", {})
     if thehive_cfg.get("enabled"):
-        key = os.environ.get(thehive_cfg.get("credential_env", ""), "")
+        key = secret(thehive_cfg.get("credential_env", ""))
         if key:
             clients["thehive"] = TheHiveClient(thehive_cfg["base_url"], key)
 
     # Cortex
     cortex_cfg = platforms.get("cortex", {})
     if cortex_cfg.get("enabled"):
-        key = os.environ.get(cortex_cfg.get("credential_env", ""), "")
+        key = secret(cortex_cfg.get("credential_env", ""))
         if key:
             clients["cortex"] = CortexClient(cortex_cfg["base_url"], key)
 
     # Wazuh Manager
     wazuh_cfg = platforms.get("wazuh_manager", {})
     if wazuh_cfg.get("enabled"):
-        key = os.environ.get(wazuh_cfg.get("credential_env", ""), "")
+        key = secret(wazuh_cfg.get("credential_env", ""))
         if key:
             clients["wazuh_manager"] = WazuhManagerClient(
                 wazuh_cfg["base_url"], key
@@ -90,8 +98,8 @@ def build_clients(config: dict[str, Any]) -> dict[str, Any]:
     # Wazuh Indexer
     wazuh_idx = platforms.get("wazuh_indexer", {})
     if wazuh_idx.get("enabled"):
-        username = os.environ.get(wazuh_idx.get("username_env", ""), "")
-        password = os.environ.get(wazuh_idx.get("password_env", ""), "")
+        username = secret(wazuh_idx.get("username_env", ""))
+        password = secret(wazuh_idx.get("password_env", ""))
         if username and password:
             clients["wazuh_indexer"] = WazuhIndexerClient(
                 wazuh_idx["base_url"], username, password
@@ -100,7 +108,7 @@ def build_clients(config: dict[str, Any]) -> dict[str, Any]:
     # MISP (threat intel platform) — exposed both standalone and via enrichment
     misp_cfg = platforms.get("misp", {})
     if misp_cfg.get("enabled"):
-        key = os.environ.get(misp_cfg.get("credential_env", ""), "")
+        key = secret(misp_cfg.get("credential_env", ""))
         base_url = misp_cfg.get("base_url", "")
         if key and base_url:
             from .soc_client.enrichment import MISPClient
@@ -111,7 +119,7 @@ def build_clients(config: dict[str, Any]) -> dict[str, Any]:
         platforms.get(p, {}).get("enabled")
         for p in ["virustotal", "abuseipdb", "shodan", "urlscan", "hybrid_analysis", "phishtank", "cortex", "misp"]
     ):
-        clients["enrichment"] = EnrichmentClient(config)
+        clients["enrichment"] = EnrichmentClient(config, credentials=credentials)
 
     return clients
 

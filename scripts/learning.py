@@ -67,12 +67,38 @@ class LearningStore:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS skill_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    suggestion_id INTEGER NOT NULL,
+                    org_id INTEGER,
+                    corpus_version TEXT NOT NULL,
+                    passed INTEGER NOT NULL,
+                    score REAL NOT NULL,
+                    details_json TEXT DEFAULT '{}',
+                    evaluated_by INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (suggestion_id) REFERENCES skill_suggestions(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_learning_category_subject
                     ON learning_events(category, subject);
                 CREATE INDEX IF NOT EXISTS idx_skill_suggestions_category
                     ON skill_suggestions(category);
                 """
             )
+            for table, columns in {
+                "learning_events": {"org_id": "INTEGER"},
+                "skill_suggestions": {
+                    "org_id": "INTEGER",
+                    "reviewed_by": "INTEGER",
+                    "reviewed_at": "TIMESTAMP",
+                    "published_at": "TIMESTAMP",
+                },
+            }.items():
+                existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                for name, definition in columns.items():
+                    if name not in existing:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
             conn.commit()
         finally:
             conn.close()
@@ -86,6 +112,7 @@ class LearningStore:
         summary: str,
         severity: str = "info",
         evidence: dict[str, Any] | None = None,
+        org_id: int | None = None,
     ) -> int:
         """Record one learning event and refresh matching skill suggestions."""
         conn = self._connect()
@@ -93,8 +120,8 @@ class LearningStore:
             cursor = conn.execute(
                 """
                 INSERT INTO learning_events
-                    (source, category, subject, severity, summary, evidence_json)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (source, category, subject, severity, summary, evidence_json, org_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source,
@@ -102,7 +129,8 @@ class LearningStore:
                     subject,
                     severity,
                     summary,
-                    json.dumps(evidence or {}, sort_keys=True),
+                    json.dumps(_redact_sensitive(evidence or {}), sort_keys=True),
+                    org_id,
                 ),
             )
             event_id = int(cursor.lastrowid)
@@ -117,7 +145,7 @@ class LearningStore:
             subject=subject,
             severity=severity,
         )
-        self.refresh_skill_suggestions(category=category, subject=subject)
+        self.refresh_skill_suggestions(category=category, subject=subject, org_id=org_id)
         return event_id
 
     def learn_from_alert(
@@ -126,6 +154,7 @@ class LearningStore:
         *,
         source: str = "alert",
         playbook: str | None = None,
+        org_id: int | None = None,
     ) -> None:
         """Learn from a Wazuh or generic alert before execution."""
         rule = (alert.get("rule") or {}).get("name") or alert.get("title") or "unknown-alert"
@@ -143,6 +172,7 @@ class LearningStore:
             severity=str(alert.get("severity") or "info"),
             summary=f"Observed alert pattern: {rule}",
             evidence=evidence,
+            org_id=org_id,
         )
 
     def learn_from_playbook_result(
@@ -150,6 +180,7 @@ class LearningStore:
         playbook_name: str,
         result: dict[str, Any],
         alert: dict[str, Any] | None = None,
+        org_id: int | None = None,
     ) -> None:
         """Learn from completed playbook execution and failed/pending steps."""
         steps = result.get("steps", {})
@@ -164,6 +195,7 @@ class LearningStore:
                     severity="high",
                     summary=f"Step {step_id} failed in {playbook_name}: {step_result['error']}",
                     evidence={"step_result": step_result, "alert_rule": _alert_rule(alert)},
+                    org_id=org_id,
                 )
             elif str(step_result.get("status", "")).startswith("pending"):
                 self.record_event(
@@ -173,9 +205,10 @@ class LearningStore:
                     severity="medium",
                     summary=f"Step {step_id} in {playbook_name} requires follow-up execution support.",
                     evidence={"step_result": step_result, "alert_rule": _alert_rule(alert)},
+                    org_id=org_id,
                 )
 
-    def learn_from_case(self, case: dict[str, Any]) -> None:
+    def learn_from_case(self, case: dict[str, Any], org_id: int | None = None) -> None:
         """Learn from a local case record."""
         title = str(case.get("title") or "untitled-case")
         self.record_event(
@@ -189,6 +222,7 @@ class LearningStore:
                 "status": case.get("status"),
                 "summary": str(case.get("summary") or "")[:500],
             },
+            org_id=org_id,
         )
 
     def refresh_skill_suggestions(
@@ -197,6 +231,7 @@ class LearningStore:
         category: str | None = None,
         subject: str | None = None,
         minimum_events: int = 1,
+        org_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Create or update reviewable skill drafts from repeated signals."""
         conn = self._connect()
@@ -209,6 +244,9 @@ class LearningStore:
             if subject:
                 where.append("subject = ?")
                 params.append(subject)
+            if org_id is not None:
+                where.append("org_id = ?")
+                params.append(org_id)
             clause = "WHERE " + " AND ".join(where) if where else ""
             rows = conn.execute(
                 f"""
@@ -228,20 +266,16 @@ class LearningStore:
 
         suggestions = []
         for row in rows:
-            suggestions.append(self._upsert_skill_suggestion(dict(row)))
+            suggestions.append(self._upsert_skill_suggestion({**dict(row), "org_id": org_id}))
         return suggestions
 
-    def list_skill_suggestions(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_skill_suggestions(self, limit: int = 20, org_id: int | None = None) -> list[dict[str, Any]]:
         conn = self._connect()
         try:
-            rows = conn.execute(
-                """
-                SELECT * FROM skill_suggestions
-                ORDER BY event_count DESC, updated_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            if org_id is None:
+                rows = conn.execute("SELECT * FROM skill_suggestions ORDER BY event_count DESC, updated_at DESC LIMIT ?", (limit,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM skill_suggestions WHERE org_id = ? ORDER BY event_count DESC, updated_at DESC LIMIT ?", (org_id, limit)).fetchall()
             return [dict(row) for row in rows]
         finally:
             conn.close()
@@ -250,7 +284,8 @@ class LearningStore:
         category = signal["category"]
         subject = signal["subject"]
         event_count = int(signal["count"])
-        slug = safe_name(f"{category}-{subject}").lower()
+        org_id = signal.get("org_id")
+        slug = safe_name(f"{org_id or 'global'}-{category}-{subject}").lower()
         title = _title_for(category, subject)
         reason = (
             f"{event_count} learning event(s) for {subject}. "
@@ -263,15 +298,15 @@ class LearningStore:
             conn.execute(
                 """
                 INSERT INTO skill_suggestions
-                    (slug, title, category, reason, draft_path, event_count)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (slug, title, category, reason, draft_path, event_count, org_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(slug) DO UPDATE SET
                     reason = excluded.reason,
                     draft_path = excluded.draft_path,
                     event_count = excluded.event_count,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (slug, title, category, reason, str(draft_path), event_count),
+                (slug, title, category, reason, str(draft_path), event_count, org_id),
             )
             conn.commit()
         finally:
@@ -286,6 +321,74 @@ class LearningStore:
             "draft_path": str(draft_path),
             "event_count": event_count,
         }
+
+    def record_evaluation(
+        self,
+        suggestion_id: int,
+        *,
+        org_id: int,
+        corpus_version: str,
+        score: float,
+        passed: bool,
+        evaluated_by: int,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        conn = self._connect()
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM skill_suggestions WHERE id = ? AND org_id = ?",
+                (suggestion_id, org_id),
+            ).fetchone()
+            if not exists:
+                raise ValueError("Skill suggestion not found")
+            cursor = conn.execute(
+                "INSERT INTO skill_evaluations (suggestion_id, org_id, corpus_version, passed, score, details_json, evaluated_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (suggestion_id, org_id, corpus_version, 1 if passed else 0, score, json.dumps(_redact_sensitive(details or {}), sort_keys=True), evaluated_by),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+        finally:
+            conn.close()
+
+    def transition_suggestion(self, suggestion_id: int, *, org_id: int, status: str, reviewed_by: int) -> dict[str, Any]:
+        transitions = {
+            "draft": {"under_review", "rejected"},
+            "under_review": {"approved", "rejected"},
+            "approved": {"shadow", "rejected"},
+            "shadow": {"canary", "rolled_back"},
+            "canary": {"published", "rolled_back"},
+            "published": {"rolled_back"},
+            "rejected": set(),
+            "rolled_back": set(),
+        }
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT status FROM skill_suggestions WHERE id = ? AND org_id = ?",
+                (suggestion_id, org_id),
+            ).fetchone()
+            if not row:
+                raise ValueError("Skill suggestion not found")
+            current = str(row["status"])
+            if status not in transitions.get(current, set()):
+                raise ValueError(f"Invalid learning transition: {current} -> {status}")
+            if status in {"approved", "shadow", "canary", "published"}:
+                evaluation = conn.execute(
+                    "SELECT passed FROM skill_evaluations WHERE suggestion_id = ? AND org_id = ? ORDER BY id DESC LIMIT 1",
+                    (suggestion_id, org_id),
+                ).fetchone()
+                if not evaluation or not evaluation["passed"]:
+                    raise PermissionError("A passing evaluation is required before promotion")
+            published_at = "CURRENT_TIMESTAMP" if status == "published" else "published_at"
+            conn.execute(
+                f"UPDATE skill_suggestions SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP, published_at = {published_at}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, reviewed_by, suggestion_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("skill_suggestion_transitioned", suggestion_id=suggestion_id, org_id=org_id, status=status, reviewed_by=reviewed_by)
+        return {"id": suggestion_id, "status": status}
 
     def _write_skill_draft(
         self,
@@ -310,6 +413,19 @@ def _alert_rule(alert: dict[str, Any] | None) -> str | None:
     if not alert:
         return None
     return (alert.get("rule") or {}).get("name") or alert.get("title")
+
+
+def _redact_sensitive(value: Any, key: str = "") -> Any:
+    sensitive = {"password", "passwd", "secret", "token", "api_key", "apikey", "authorization", "credential"}
+    if any(marker in key.lower() for marker in sensitive):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(k): _redact_sensitive(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_sensitive(item, key) for item in value]
+    if isinstance(value, str) and len(value) > 10000:
+        return value[:10000] + "[TRUNCATED]"
+    return value
 
 
 def _title_for(category: str, subject: str) -> str:
@@ -359,13 +475,14 @@ def learn_playbook_result(
     playbook_name: str,
     result: dict[str, Any],
     alert: dict[str, Any] | None = None,
+    org_id: int | None = None,
 ) -> None:
-    LearningStore().learn_from_playbook_result(playbook_name, result, alert)
+    LearningStore().learn_from_playbook_result(playbook_name, result, alert, org_id=org_id)
 
 
-def learn_alert(alert: dict[str, Any], source: str, playbook: str | None = None) -> None:
-    LearningStore().learn_from_alert(alert, source=source, playbook=playbook)
+def learn_alert(alert: dict[str, Any], source: str, playbook: str | None = None, org_id: int | None = None) -> None:
+    LearningStore().learn_from_alert(alert, source=source, playbook=playbook, org_id=org_id)
 
 
-def learn_case(case: dict[str, Any]) -> None:
-    LearningStore().learn_from_case(case)
+def learn_case(case: dict[str, Any], org_id: int | None = None) -> None:
+    LearningStore().learn_from_case(case, org_id=org_id)

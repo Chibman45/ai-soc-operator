@@ -2,6 +2,8 @@
 
 ## Current Remediation Note
 
+Production-hardening Phases 0-7 are tracked in `docs/PRODUCTION_ROADMAP.md`. This historical analysis is retained for traceability; its status table is not the current release checklist.
+
 The following items have been addressed in the current implementation pass:
 
 - Platform HTTP requests now build headers correctly in `scripts/soc_client/base.py`.

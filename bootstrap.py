@@ -523,10 +523,10 @@ def setup_web_credentials() -> None:
 
         username = input("  Username [admin]: ").strip() or "admin"
         while True:
-            password = getpass.getpass("  Password (min 8 chars): ")
+            password = getpass.getpass("  Password (min 12 chars): ")
             confirm = getpass.getpass("  Confirm password: ")
-            if len(password) < 8:
-                warn("Password must be at least 8 characters")
+            if len(password) < 12:
+                warn("Password must be at least 12 characters")
                 continue
             if password != confirm:
                 warn("Passwords do not match")
@@ -540,7 +540,7 @@ def setup_web_credentials() -> None:
         )
         conn.commit()
         status(f"Created web portal admin account: {username}")
-        print("Web portal ready — run: python3 web/app.py")
+        print("Web portal ready — run: python3 -m web.app")
     finally:
         conn.close()
 

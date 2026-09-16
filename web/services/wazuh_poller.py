@@ -205,34 +205,52 @@ class WazuhAlertPoller:
     def _ingest(self, conn, doc_id: str | None, source_doc: dict[str, Any]) -> None:
         from web.services.alert_ingest import ingest_alert_record
 
+        org_id = self._configured_org_id(conn)
         ingest_alert_record(
             conn,
             source="wazuh",
             source_alert_id=doc_id,
             payload=source_doc,
+            org_id=org_id,
         )
 
     def _build_indexer_client(self) -> Any:
         """Load saved credentials, rebuild config, and return the indexer client."""
         from web.app import get_db, load_config_for_web
         from scripts.orchestrator import build_clients
+        from web.services.credential_vault import open_secret
 
         conn = get_db()
         try:
-            for row in conn.execute("SELECT key_name, key_value FROM credentials").fetchall():
-                if row["key_value"]:
-                    os.environ[row["key_name"]] = row["key_value"]
+            org_id = self._configured_org_id(conn)
+            credentials = {
+                row["key_name"]: open_secret(row["key_value"])
+                for row in conn.execute(
+                    "SELECT key_name, key_value FROM credentials WHERE org_id = ?",
+                    (org_id,),
+                ).fetchall()
+            }
         finally:
             conn.close()
 
-        config = load_config_for_web()
-        clients = build_clients(config)
+        config = load_config_for_web(org_id)
+        clients = build_clients(config, credentials=credentials)
         return clients.get("wazuh_indexer")
 
+    def _configured_org_id(self, conn) -> int:
+        configured = os.environ.get("AI_SOC_POLLER_ORG_ID", "").strip()
+        if configured:
+            return int(configured)
+        row = conn.execute("SELECT id FROM organizations ORDER BY id LIMIT 1").fetchone()
+        if not row:
+            raise RuntimeError("No organization exists for the Wazuh poller")
+        return int(row["id"])
+
     def _already_ingested(self, conn, doc_id: str) -> bool:
+        org_id = self._configured_org_id(conn)
         row = conn.execute(
-            "SELECT 1 FROM alerts WHERE source = 'wazuh' AND source_alert_id = ? LIMIT 1",
-            (doc_id,),
+            "SELECT 1 FROM alerts WHERE org_id = ? AND source = 'wazuh' AND source_alert_id = ? LIMIT 1",
+            (org_id, doc_id),
         ).fetchone()
         return row is not None
 
@@ -256,8 +274,10 @@ class WazuhAlertPoller:
         try:
             try:
                 self._ensure_state_table(conn)
+                state_name = f"wazuh_indexer_watermark:{self._configured_org_id(conn)}"
                 row = conn.execute(
-                    "SELECT value FROM poller_state WHERE name = 'wazuh_indexer_watermark'"
+                    "SELECT value FROM poller_state WHERE name = ?",
+                    (state_name,),
                 ).fetchone()
             except Exception:
                 return None
@@ -267,13 +287,14 @@ class WazuhAlertPoller:
                 conn.close()
 
     def _write_watermark(self, conn, value: str) -> None:
+        state_name = f"wazuh_indexer_watermark:{self._configured_org_id(conn)}"
         conn.execute(
             """
             INSERT INTO poller_state (name, value, updated_at)
-            VALUES ('wazuh_indexer_watermark', ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
             """,
-            (value,),
+            (state_name, value),
         )
         conn.commit()
 

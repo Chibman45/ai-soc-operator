@@ -4,6 +4,19 @@ A playbook-driven SOC automation platform. Organizations supply their SOC playbo
 
 All platform credentials and connections are managed through a built-in web portal. No secrets ever touch config files.
 
+## Release Status
+
+Application hardening Phases 0-7 are implemented and covered by 218 tests. This
+includes organization-scoped RBAC, authenticated SIEM ingestion, the live alert
+queue, SLA metrics, encrypted credentials, durable local jobs, approval-gated
+responder dry-runs, and controlled self-learning drafts.
+
+This milestone is not yet the final production deployment. Notifications and
+intel delivery (Phase 8), PostgreSQL/external workers/containers/TLS/operations
+(Phase 9), and CI/CD release assurance (Phase 10) remain intentionally deferred.
+See [the production roadmap](docs/PRODUCTION_ROADMAP.md) and
+[security policy](SECURITY.md) before deploying beyond a controlled environment.
+
 ## Quick Start
 
 ```bash
@@ -81,7 +94,9 @@ Supported platforms:
 | MISP | Internal threat intelligence attribute/event search |
 | OpenAI | GPT model for LLM steps in playbooks (classification, summarization) |
 
-Platform config is regenerated from the database automatically before every playbook run. The orchestrator always reads a fresh `config/platforms.toml`.
+The web application builds a tenant-scoped runtime configuration in memory
+before every playbook run. The bootstrap CLI remains the only supported way to
+initialize `config/platforms.toml`; do not edit it manually.
 
 ## Running the Platform
 
@@ -92,7 +107,7 @@ ai-soc-operator
 ```
 
 The web portal provides:
-- **Dashboard** — active cases, recent runs, platform status
+- **Dashboard** — live alert queue, SLA metrics, active cases, recent runs, platform status
 - **Cases** — case list with status, severity, and timeline
 - **Playbooks** — upload, review, and approve playbook documents (PDF/DOCX/MD → YAML)
 - **Reports** — SOC, incident, and executive reports per case
@@ -158,7 +173,8 @@ Three playbooks are included: identity compromise, phishing response, and malwar
 - **Audit trail**: every action logged to `audit/actions.jsonl`
 - **Session management**: evidence, artifacts, and reports tied to session IDs
 - **No destructive commands**: `rm -rf`, `shred`, `mkfs`, etc. are blocked
-- **Credential isolation**: API keys stored in SQLite only, never in config files or logs
+- **Credential isolation**: API keys are encrypted at rest in SQLite and are never written to generated config files or logs
+- **Controlled learning**: learning evidence is redacted and produces reviewable drafts only; publishing requires evaluation and staged human promotion
 
 ## Project Structure
 
@@ -201,7 +217,7 @@ ai-soc-operator/
 ├── skills/
 │   ├── soc-orchestrator/SKILL.md
 │   └── soc-analyst/SKILL.md
-├── tests/                    # 205 tests covering all components
+├── tests/                    # 218 tests covering all components
 ├── demo/
 │   └── brute-force-alert.json  # Sample alert for testing
 ├── docs/

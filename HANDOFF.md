@@ -1,10 +1,33 @@
 # Handoff — AI SOC Operator
 
-_Last updated: 2026-08-06_
+_Last updated: 2026-09-16_
 
 This document is a self-contained brief for the next agent/developer picking up
 this work. It covers **what the overall goal is**, **what has been implemented**,
 **what remains**, and the **exact integration points** for the unfinished work.
+
+## Current release status
+
+Phases 0-7 of the production-hardening plan are implemented on
+`codex/phase-0-7-production-hardening`. The release now includes centralized
+multi-role authorization, active organization isolation, CSRF and session
+hardening, encrypted stored credentials, authenticated alert ingestion, a live
+alert queue, SLA metrics, durable local job controls, approval-gated responder
+dry-runs, and reviewable self-learning promotion states.
+
+The full local test suite passes with **218 tests**. This is an application-level
+hardening milestone, not a claim of full production readiness. The remaining
+deployment and release gates are tracked in
+[`docs/PRODUCTION_ROADMAP.md`](docs/PRODUCTION_ROADMAP.md):
+
+- Phase 8: notification delivery, SLA scheduling, and threat-intel delivery.
+- Phase 9: PostgreSQL/RLS, external workers, containers, TLS, rate limiting,
+  observability, backups, and disaster recovery.
+- Phase 10: CI/CD security gates, SBOM/provenance, staging, load, and rollback.
+
+The self-learning subsystem only creates redacted, reviewable drafts. It cannot
+autonomously install code, change permissions, publish playbooks, or bypass the
+evaluation, approval, shadow, canary, and rollback workflow.
 
 ---
 
@@ -27,7 +50,7 @@ The work was decomposed into 5 gaps, to be implemented sequentially:
 | 11 | Playbook approval steps block and wait for human approval **via chat** | ✅ Done |
 | 13 | Bridge copilot chat actions to the **real enrichment clients** | ✅ Done |
 | 14 | Wire **Cortex + PhishTank** into the enrichment dispatch | ✅ Done |
-| 12 | **Wazuh alert poller** (optional background scheduler) | 🟡 ~70% — module built, NOT wired to routes/startup |
+| 12 | **Wazuh alert poller** (optional background scheduler) | Done; authenticated controls, scoped credentials, and per-org watermarks |
 | 15 | **Browser click-through test** of copilot + full pipeline | ⬜ Not started |
 
 ---
@@ -118,7 +141,12 @@ The work was decomposed into 5 gaps, to be implemented sequentially:
 
 ---
 
-## 4. WHAT REMAINS
+## 4. Historical pre-hardening notes
+
+The subsections below describe the August 2026 state and are retained only as
+implementation history. The poller wiring described as missing in 4a is now
+implemented. Use the current release status above and the production roadmap
+for remaining work.
 
 ### 4a. Finish #12 — wire the poller (est. small)
 
@@ -187,7 +215,7 @@ The poller class is done but **imported by nothing**. To activate it:
 
 Run the app and manually exercise, ideally with the Browser tools:
 ```bash
-.venv/Scripts/python.exe web/app.py
+.venv/Scripts/python.exe -m web.app
 ```
 (or set up `.claude/launch.json` and use the preview tools). Then:
 - Log in / complete `/setup` if no user exists.

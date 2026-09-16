@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from functools import wraps
+from datetime import datetime, timezone
 from pathlib import Path
 from flask import Blueprint, jsonify, request, session
+from web.security import (
+    current_org_id,
+    login_required as _login_required,
+    permission_required as _require_permission,
+    role_required as _require_role,
+    session_or_api_scope,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -22,63 +28,24 @@ def _get_db():
     return conn
 
 
-def _login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user_id" not in session:
-            return jsonify({"error": "unauthorized"}), 401
-        return f(*args, **kwargs)
-    return decorated
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
-def _require_role(role_name):
-    """Decorator: user must have the specified role."""
-    def decorator(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
-            if "user_id" not in session:
-                return jsonify({"error": "unauthorized"}), 401
-            conn = _get_db()
-            user_role = conn.execute(
-                "SELECT r.name FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = ?",
-                (session["user_id"],),
-            ).fetchone()
-            conn.close()
-            if not user_role or user_role["name"] != role_name:
-                # Admin always has access
-                if user_role and user_role["name"] == "admin":
-                    pass
-                else:
-                    return jsonify({"error": "forbidden", "required_role": role_name}), 403
-            return f(*args, **kwargs)
-        return decorated
-    return decorator
-
-
-def _require_permission(perm_name):
-    """Decorator: user must have the specified permission."""
-    def decorator(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
-            if "user_id" not in session:
-                return jsonify({"error": "unauthorized"}), 401
-            conn = _get_db()
-            row = conn.execute(
-                "SELECT r.permissions FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = ?",
-                (session["user_id"],),
-            ).fetchone()
-            conn.close()
-            if not row:
-                return jsonify({"error": "forbidden", "required_permission": perm_name}), 403
-            try:
-                perms = json.loads(row["permissions"])
-            except (json.JSONDecodeError, TypeError):
-                perms = []
-            if perm_name not in perms:
-                return jsonify({"error": "forbidden", "required_permission": perm_name}), 403
-            return f(*args, **kwargs)
-        return decorated
-    return decorator
+def _hours_between(start: str | None, end: str | None) -> float | None:
+    try:
+        start_at = _parse_utc(start)
+        end_at = _parse_utc(end)
+        if not start_at or not end_at:
+            return None
+        return round(max(0.0, (end_at - start_at).total_seconds() / 3600), 2)
+    except (TypeError, ValueError):
+        return None
 
 
 # ═══════════════════════════════════════════
@@ -86,9 +53,11 @@ def _require_permission(perm_name):
 # ═══════════════════════════════════════════
 
 @features_bp.post("/api/ingest/alert")
-@_login_required
+@session_or_api_scope("alert.ingest")
 def ingest_alert():
-    payload = request.get_json(force=True) or {}
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "JSON object required"}), 400
 
     source = payload.get("source", "manual")
     source_alert_id = payload.get("source_alert_id")
@@ -104,6 +73,7 @@ def ingest_alert():
         alert_body["severity"] = payload["severity"]
 
     conn = _get_db()
+    org_id = getattr(request, "api_org_id", None) or current_org_id(conn)
     try:
         from web.services.schema_features import init_feature_db
         from web.services.alert_ingest import ingest_alert_record
@@ -115,7 +85,11 @@ def ingest_alert():
             source_alert_id=source_alert_id,
             payload=alert_body,
             supplied_observables=supplied_observables,
+            org_id=org_id,
         )
+    except ValueError as e:
+        conn.close()
+        return jsonify({"ok": False, "error": str(e)[:300]}), 400
     except Exception as e:
         conn.close()
         return jsonify({"ok": False, "error": str(e)[:300]}), 500
@@ -136,29 +110,33 @@ def ingest_alert():
 # ═══════════════════════════════════════════
 
 @features_bp.get("/api/alerts/queue")
-@_login_required
+@_require_permission("chat.read")
 def alert_queue():
     mode = request.args.get("mode", "new")
-    limit = int(request.args.get("limit", "50"))
+    try:
+        limit = min(max(int(request.args.get("limit", "50")), 1), 200)
+    except ValueError:
+        return jsonify({"error": "limit must be an integer"}), 400
 
     conn = _get_db()
     from web.services.schema_features import init_feature_db
     init_feature_db(conn)
+    org_id = current_org_id(conn)
 
     if mode == "new":
         alerts = conn.execute(
-            "SELECT * FROM alerts WHERE status IN ('new', 'queued') ORDER BY created_at DESC LIMIT ?",
-            (limit,),
+            "SELECT a.*, j.status AS job_status FROM alerts a LEFT JOIN jobs j ON j.id = a.job_id AND j.org_id = a.org_id WHERE a.org_id = ? AND a.status IN ('new', 'queued') ORDER BY a.created_at DESC LIMIT ?",
+            (org_id, limit),
         ).fetchall()
     elif mode == "all":
         alerts = conn.execute(
-            "SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?",
-            (limit,),
+            "SELECT a.*, j.status AS job_status FROM alerts a LEFT JOIN jobs j ON j.id = a.job_id AND j.org_id = a.org_id WHERE a.org_id = ? ORDER BY a.created_at DESC LIMIT ?",
+            (org_id, limit),
         ).fetchall()
     else:
         alerts = conn.execute(
-            "SELECT * FROM alerts WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-            (mode, limit),
+            "SELECT a.*, j.status AS job_status FROM alerts a LEFT JOIN jobs j ON j.id = a.job_id AND j.org_id = a.org_id WHERE a.org_id = ? AND a.status = ? ORDER BY a.created_at DESC LIMIT ?",
+            (org_id, mode, limit),
         ).fetchall()
 
     conn.close()
@@ -169,7 +147,10 @@ def alert_queue():
             {
                 "id": a["id"], "source": a["source"], "title": a["title"],
                 "severity": a["severity"], "status": a["status"],
-                "case_id": a["case_id"], "created_at": a["created_at"],
+                "case_id": a["case_id"], "job_id": a["job_id"],
+                "job_status": a["job_status"],
+                "selected_playbook": a["selected_playbook"],
+                "created_at": a["created_at"],
             }
             for a in alerts
         ],
@@ -181,7 +162,7 @@ def alert_queue():
 # ═══════════════════════════════════════════
 
 @features_bp.get("/api/roles")
-@_login_required
+@_require_permission("role.manage")
 def list_roles():
     conn = _get_db()
     roles = conn.execute("SELECT * FROM roles").fetchall()
@@ -196,7 +177,7 @@ def list_roles():
 
 
 @features_bp.post("/api/users/<int:user_id>/roles")
-@_require_role("admin")
+@_require_permission("role.manage")
 def assign_role(user_id: int):
     payload = request.get_json(force=True)
     role_id = payload.get("role_id")
@@ -204,17 +185,23 @@ def assign_role(user_id: int):
         return jsonify({"ok": False, "error": "role_id is required"}), 400
 
     conn = _get_db()
+    org_id = current_org_id(conn)
+    member = conn.execute("SELECT 1 FROM organization_memberships WHERE org_id = ? AND user_id = ? AND status = 'active'", (org_id, user_id)).fetchone()
+    role = conn.execute("SELECT 1 FROM roles WHERE id = ?", (role_id,)).fetchone()
+    if not member or not role:
+        conn.close()
+        return jsonify({"error": "user or role not found"}), 404
     existing = conn.execute(
-        "SELECT id FROM user_roles WHERE user_id = ? AND role_id = ?",
-        (user_id, role_id),
+        "SELECT id FROM user_roles WHERE user_id = ? AND role_id = ? AND org_id = ?",
+        (user_id, role_id, org_id),
     ).fetchone()
     if existing:
         conn.close()
         return jsonify({"ok": False, "error": "role already assigned"}), 409
 
     conn.execute(
-        "INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)",
-        (user_id, role_id),
+        "INSERT INTO user_roles (user_id, role_id, org_id) VALUES (?, ?, ?)",
+        (user_id, role_id, org_id),
     )
     conn.commit()
     conn.close()
@@ -222,13 +209,34 @@ def assign_role(user_id: int):
 
 
 @features_bp.delete("/api/users/<int:user_id>/roles/<int:role_id>")
-@_require_role("admin")
+@_require_permission("role.manage")
 def remove_role(user_id: int, role_id: int):
     conn = _get_db()
-    conn.execute(
-        "DELETE FROM user_roles WHERE user_id = ? AND role_id = ?",
-        (user_id, role_id),
-    )
+    org_id = current_org_id(conn)
+    role = conn.execute("SELECT name FROM roles WHERE id = ?", (role_id,)).fetchone()
+    if role and role["name"] == "admin":
+        admin_count = conn.execute(
+            """
+            SELECT COUNT(DISTINCT ur.user_id)
+            FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+            WHERE ur.org_id = ? AND r.name = 'admin'
+            """,
+            (org_id,),
+        ).fetchone()[0]
+        target_has_role = conn.execute(
+            "SELECT 1 FROM user_roles WHERE user_id = ? AND role_id = ? AND org_id = ?",
+            (user_id, role_id, org_id),
+        ).fetchone()
+        if target_has_role and admin_count <= 1:
+            conn.close()
+            return jsonify({"error": "organization must retain at least one admin"}), 409
+    removed = conn.execute(
+        "DELETE FROM user_roles WHERE user_id = ? AND role_id = ? AND org_id = ?",
+        (user_id, role_id, org_id),
+    ).rowcount
+    if not removed:
+        conn.close()
+        return jsonify({"error": "role assignment not found"}), 404
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -239,10 +247,11 @@ def remove_role(user_id: int, role_id: int):
 def get_me():
     conn = _get_db()
     user = conn.execute("SELECT id, username FROM users WHERE id = ?", (session["user_id"],)).fetchone()
-    role = conn.execute(
-        "SELECT r.name, r.permissions FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = ?",
-        (session["user_id"],),
-    ).fetchone()
+    org_id = current_org_id(conn)
+    roles = conn.execute(
+        "SELECT r.name, r.permissions FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = ? AND ur.org_id = ?",
+        (session["user_id"], org_id),
+    ).fetchall()
     conn.close()
 
     if not user:
@@ -251,8 +260,9 @@ def get_me():
     return jsonify({
         "id": user["id"],
         "username": user["username"],
-        "role": role["name"] if role else None,
-        "permissions": json.loads(role["permissions"]) if role else [],
+        "org_id": org_id,
+        "roles": [role["name"] for role in roles],
+        "permissions": sorted({p for role in roles for p in json.loads(role["permissions"] or "[]")}),
     })
 
 
@@ -261,7 +271,7 @@ def get_me():
 # ═══════════════════════════════════════════
 
 @features_bp.get("/api/credentials/status")
-@_login_required
+@_require_permission("credential.manage")
 def credentials_status():
     conn = _get_db()
     from web.services.schema_features import init_feature_db
@@ -270,7 +280,8 @@ def credentials_status():
     # The credentials table stores one row per (platform, key_name). `provider`,
     # `active`, and the last_test_* columns are added by init_feature_db above.
     creds = conn.execute(
-        "SELECT id, platform, key_name, provider, active, last_tested_at, last_test_result, last_test_message FROM credentials"
+        "SELECT id, platform, key_name, provider, active, last_tested_at, last_test_result, last_test_message FROM credentials WHERE org_id = ?",
+        (current_org_id(conn),),
     ).fetchall()
     conn.close()
 
@@ -296,7 +307,11 @@ def credentials_status():
 @_require_permission("credential.manage")
 def test_credential(cred_id: int):
     conn = _get_db()
-    cred = conn.execute("SELECT * FROM credentials WHERE id = ?", (cred_id,)).fetchone()
+    org_id = current_org_id(conn)
+    cred = conn.execute(
+        "SELECT * FROM credentials WHERE id = ? AND org_id = ?",
+        (cred_id, org_id),
+    ).fetchone()
     if not cred:
         conn.close()
         return jsonify({"error": "not found"}), 404
@@ -331,8 +346,8 @@ def test_credential(cred_id: int):
         message = "No connectivity test available for this provider"
 
     conn.execute(
-        "UPDATE credentials SET last_tested_at = CURRENT_TIMESTAMP, last_test_result = ?, last_test_message = ? WHERE id = ?",
-        (status, message, cred_id),
+        "UPDATE credentials SET last_tested_at = CURRENT_TIMESTAMP, last_test_result = ?, last_test_message = ? WHERE id = ? AND org_id = ?",
+        (status, message, cred_id, org_id),
     )
     conn.commit()
     conn.close()
@@ -345,7 +360,7 @@ def test_credential(cred_id: int):
 # ═══════════════════════════════════════════
 
 @features_bp.post("/api/wazuh/poller/start")
-@_login_required
+@_require_permission("credential.manage")
 def poller_start():
     from web.services.wazuh_poller import get_poller
     started = get_poller().start()
@@ -353,7 +368,7 @@ def poller_start():
 
 
 @features_bp.post("/api/wazuh/poller/stop")
-@_login_required
+@_require_permission("credential.manage")
 def poller_stop():
     from web.services.wazuh_poller import get_poller
     stopped = get_poller().stop()
@@ -361,14 +376,14 @@ def poller_stop():
 
 
 @features_bp.get("/api/wazuh/poller/status")
-@_login_required
+@_require_permission("chat.read")
 def poller_status():
     from web.services.wazuh_poller import get_poller
     return jsonify({"ok": True, **get_poller().status()})
 
 
 @features_bp.post("/api/wazuh/poller/poll-once")
-@_login_required
+@_require_permission("credential.manage")
 def poller_poll_once():
     from web.services.wazuh_poller import get_poller
     result = get_poller().poll_once()
@@ -386,10 +401,19 @@ def assign_case(case_id: int):
     assignee_id = payload.get("assignee_id")
 
     conn = _get_db()
-    conn.execute(
-        "UPDATE cases SET assignee_id = ? WHERE id = ?",
-        (assignee_id, case_id),
-    )
+    org_id = current_org_id(conn)
+    if assignee_id is not None:
+        member = conn.execute("SELECT 1 FROM organization_memberships WHERE org_id = ? AND user_id = ? AND status = 'active'", (org_id, assignee_id)).fetchone()
+        if not member:
+            conn.close()
+            return jsonify({"error": "assignee is not an active organization member"}), 400
+    updated = conn.execute(
+        "UPDATE cases SET assignee_id = ?, first_response_at = COALESCE(first_response_at, CURRENT_TIMESTAMP) WHERE id = ? AND org_id = ?",
+        (assignee_id, case_id, org_id),
+    ).rowcount
+    if not updated:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
     conn.commit()
     conn.close()
 
@@ -397,37 +421,32 @@ def assign_case(case_id: int):
 
 
 @features_bp.get("/api/cases/<int:case_id>/sla")
-@_login_required
+@_require_permission("sla.view")
 def case_sla(case_id: int):
     conn = _get_db()
-    case = conn.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
+    case = conn.execute("SELECT * FROM cases WHERE id = ? AND org_id = ?", (case_id, current_org_id(conn))).fetchone()
     if not case:
         conn.close()
         return jsonify({"error": "not found"}), 404
 
     opened = case["opened_at"] or case["created_at"]
+    first_response = case["first_response_at"]
     closed = case["closed_at"]
-    now = datetime.utcnow().isoformat()
-
-    # Calculate time to close or current age
-    mttr = None
-    if closed and opened:
-        try:
-            from datetime import datetime as dt
-            open_dt = dt.fromisoformat(opened.replace("Z", "+00:00").replace("+00:00", ""))
-            close_dt = dt.fromisoformat(closed.replace("Z", "+00:00").replace("+00:00", ""))
-            mttr_hours = (close_dt - open_dt).total_seconds() / 3600
-            mttr = round(mttr_hours, 1)
-        except Exception:
-            pass
+    now = datetime.now(timezone.utc).isoformat()
+    mtta = _hours_between(opened, first_response)
+    mttr = _hours_between(opened, closed)
+    age = _hours_between(opened, closed or now)
 
     conn.close()
     return jsonify({
         "ok": True,
         "case_id": case_id,
         "opened_at": opened,
+        "first_response_at": first_response,
         "closed_at": closed,
+        "mtta_hours": mtta,
         "mttr_hours": mttr,
+        "age_hours": age,
         "status": case["status"],
     })
 
@@ -436,10 +455,14 @@ def case_sla(case_id: int):
 @_require_permission("case.close")
 def close_case(case_id: int):
     conn = _get_db()
-    conn.execute(
-        "UPDATE cases SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (case_id,),
-    )
+    org_id = current_org_id(conn)
+    updated = conn.execute(
+        "UPDATE cases SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ? AND org_id = ? AND status != 'closed'",
+        (case_id, org_id),
+    ).rowcount
+    if not updated:
+        conn.close()
+        return jsonify({"error": "not found or already closed"}), 404
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -450,16 +473,27 @@ def close_case(case_id: int):
 # ═══════════════════════════════════════════
 
 @features_bp.get("/api/iocs/<value>/correlations")
-@_login_required
+@_require_permission("chat.read")
 def ioc_correlations(value: str):
     conn = _get_db()
     from web.services.schema_features import init_feature_db
     init_feature_db(conn)
 
+    org_id = current_org_id(conn)
     obs = conn.execute(
-        "SELECT o.*, c.title as case_title, c.severity as case_severity FROM observables o JOIN cases c ON o.case_id = c.id WHERE o.value = ?",
-        (value,),
+        "SELECT o.*, c.title as case_title, c.severity as case_severity FROM observables o JOIN cases c ON o.case_id = c.id WHERE o.org_id = ? AND c.org_id = ? AND o.value = ?",
+        (org_id, org_id, value),
     ).fetchall()
+    summary = conn.execute(
+        """
+        SELECT MIN(first_seen) AS first_seen, MAX(last_seen) AS last_seen,
+               COUNT(DISTINCT case_id) AS case_count,
+               COUNT(DISTINCT alert_id) AS alert_count,
+               COUNT(DISTINCT type) AS type_count
+        FROM observables WHERE org_id = ? AND value = ?
+        """,
+        (org_id, value),
+    ).fetchone()
 
     cases = []
     seen = set()
@@ -479,11 +513,16 @@ def ioc_correlations(value: str):
         "value": value,
         "correlated_cases": cases,
         "total": len(cases),
+        "first_seen": summary["first_seen"],
+        "last_seen": summary["last_seen"],
+        "case_count": summary["case_count"],
+        "alert_count": summary["alert_count"],
+        "campaign_hint": len(cases) > 1,
     })
 
 
 @features_bp.post("/api/cases/<int:case_id>/observables")
-@_login_required
+@_require_permission("case.update")
 def add_observable(case_id: int):
     payload = request.get_json(force=True)
     obs_type = payload.get("type", "")
@@ -497,9 +536,14 @@ def add_observable(case_id: int):
     from web.services.schema_features import init_feature_db
     init_feature_db(conn)
 
+    org_id = current_org_id(conn)
+    case = conn.execute("SELECT 1 FROM cases WHERE id = ? AND org_id = ?", (case_id, org_id)).fetchone()
+    if not case:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
     conn.execute(
-        "INSERT INTO observables (case_id, type, value, source) VALUES (?, ?, ?, ?)",
-        (case_id, obs_type, obs_value, source),
+        "INSERT INTO observables (org_id, case_id, type, value, source) VALUES (?, ?, ?, ?, ?)",
+        (org_id, case_id, obs_type, obs_value, source),
     )
     conn.commit()
     conn.close()

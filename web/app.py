@@ -30,16 +30,63 @@ from flask import (
     session,
     url_for,
 )
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from scripts.job_queue import JobQueue
 from scripts.learning import LearningStore, learn_alert, learn_case, learn_playbook_result
 from scripts.common import audit
+from web.security import csrf_token, current_org_id, enforce_csrf, login_required as secure_login_required, permission_required
+from web.services.credential_vault import open_secret, seal_secret
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "soc_operator.db"
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
+
+
+def _session_secret() -> str:
+    configured = os.environ.get("AI_SOC_SESSION_SECRET", "").strip()
+    if configured:
+        return configured
+    if os.environ.get("AI_SOC_ENV", "development").lower() == "production":
+        raise RuntimeError("AI_SOC_SESSION_SECRET is required in production")
+    path = ROOT / "data" / ".session_secret"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(secrets.token_hex(32), encoding="ascii")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    return path.read_text(encoding="ascii").strip()
+
+
+app.secret_key = _session_secret()
+app.config.update(
+    MAX_CONTENT_LENGTH=int(os.environ.get("AI_SOC_MAX_REQUEST_BYTES", str(5 * 1024 * 1024))),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    SESSION_COOKIE_SECURE=os.environ.get("AI_SOC_ENV", "development").lower() == "production",
+    PERMANENT_SESSION_LIFETIME=int(os.environ.get("AI_SOC_SESSION_TTL_SECONDS", "28800")),
+)
+app.before_request(enforce_csrf)
+app.jinja_env.globals["csrf_token"] = csrf_token
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'",
+    )
+    if app.config["SESSION_COOKIE_SECURE"]:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 job_queue = JobQueue(DB_PATH)
 
 
@@ -68,6 +115,8 @@ def get_db() -> sqlite3.Connection:
         sys.exit(1)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -131,7 +180,14 @@ def init_db() -> None:
     try:
         from web.services.schema_features import init_feature_db
         init_feature_db(conn)
+        from web.services.credential_vault import migrate_plaintext_credentials
+        migrated = migrate_plaintext_credentials(conn)
+        if migrated:
+            audit("credentials_encrypted_at_rest", count=migrated)
     except Exception as e:
+        if os.environ.get("AI_SOC_ENV", "development").lower() == "production":
+            conn.close()
+            raise
         print(f"[WARN] Feature schema init failed: {e}", file=sys.stderr)
     conn.close()
 
@@ -139,13 +195,19 @@ def init_db() -> None:
 # ── Auth ──
 
 def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest() + f":{salt}"
+    return generate_password_hash(password, method="scrypt")
 
 
 def verify_password(password: str, stored: str) -> bool:
-    salt = stored.split(":")[-1]
-    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest() == stored.split(":")[0]
+    if stored.startswith(("scrypt:", "pbkdf2:")):
+        return check_password_hash(stored, password)
+    # Legacy salted SHA-256 remains readable only long enough to migrate at login.
+    try:
+        digest, salt = stored.split(":", 1)
+    except ValueError:
+        return False
+    candidate = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+    return secrets.compare_digest(candidate, digest)
 
 
 PLATFORM_DEFAULTS = {
@@ -190,14 +252,16 @@ def _platform_rows() -> list[dict[str, Any]]:
     ]
 
 
-def save_platform_settings(conn: sqlite3.Connection, form: Any) -> None:
+def save_platform_settings(conn: sqlite3.Connection, form: Any, org_id: int) -> None:
     for key_name, platform in PLATFORM_CREDENTIAL_KEYS:
         value = form.get(key_name, "").strip()
+        if value.endswith("****"):
+            continue
         if value:
-            conn.execute("DELETE FROM credentials WHERE key_name = ?", (key_name,))
+            conn.execute("DELETE FROM credentials WHERE key_name = ? AND org_id = ?", (key_name, org_id))
             conn.execute(
-                "INSERT INTO credentials (platform, key_name, key_value) VALUES (?, ?, ?)",
-                ((platform or key_name.split("_")[0].lower()), key_name, value),
+                "INSERT INTO credentials (platform, key_name, key_value, org_id) VALUES (?, ?, ?, ?)",
+                ((platform or key_name.split("_")[0].lower()), key_name, seal_secret(value), org_id),
             )
     for platform, default_url in PLATFORM_DEFAULTS.items():
         form_key = {
@@ -222,16 +286,17 @@ def save_platform_settings(conn: sqlite3.Connection, form: Any) -> None:
             else:
                 enabled = 1 if base_url else 0
             conn.execute(
-                "INSERT INTO platform_config (platform, base_url, enabled, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)"
-                " ON CONFLICT(platform) DO UPDATE SET base_url = excluded.base_url, enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP",
-                (platform, base_url, enabled),
+                "INSERT INTO platform_config (platform, base_url, enabled, org_id, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)"
+                " ON CONFLICT(org_id, platform) DO UPDATE SET base_url = excluded.base_url, enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP",
+                (platform, base_url, enabled, org_id),
             )
 
 
-def build_platforms_toml() -> str:
+def build_platforms_toml(org_id: int | None = None) -> str:
     conn = get_db()
-    creds = {row["key_name"]: row["key_value"] for row in conn.execute("SELECT key_name, key_value FROM credentials").fetchall()}
-    rows = conn.execute("SELECT platform, base_url, enabled FROM platform_config ORDER BY platform").fetchall()
+    org_id = org_id or current_org_id(conn)
+    creds = {row["key_name"]: open_secret(row["key_value"]) for row in conn.execute("SELECT key_name, key_value FROM credentials WHERE org_id = ?", (org_id,)).fetchall()}
+    rows = conn.execute("SELECT platform, base_url, enabled FROM platform_config WHERE org_id = ? ORDER BY platform", (org_id,)).fetchall()
     conn.close()
     lines = [
         "# AI SOC Operator — Platform Configuration",
@@ -286,11 +351,11 @@ def build_platforms_toml() -> str:
     return "\n".join(lines)
 
 
-def write_platforms_toml() -> None:
+def write_platforms_toml(org_id: int | None = None) -> None:
     output = ROOT / "config" / "platforms.toml"
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(build_platforms_toml(), encoding="utf-8")
+        output.write_text(build_platforms_toml(org_id), encoding="utf-8")
     except PermissionError:
         raise PermissionError(
             f"Cannot write to {output}. "
@@ -299,12 +364,7 @@ def write_platforms_toml() -> None:
 
 
 def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user_id" not in session:
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return decorated
+    return secure_login_required(f)
 
 
 # ── Routes: Auth ──
@@ -312,17 +372,58 @@ def login_required(f):
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        username = request.form.get("username", "")
+        username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         conn = get_db()
+        recent_failures = conn.execute(
+            """
+            SELECT COUNT(*) FROM login_attempts
+            WHERE username = ? AND ip_address = ? AND succeeded = 0
+              AND attempted_at >= datetime('now', '-15 minutes')
+            """,
+            (username, request.remote_addr or ""),
+        ).fetchone()[0]
+        if recent_failures >= 10:
+            conn.close()
+            audit("login_rate_limited", username=username, ip_address=request.remote_addr)
+            return render_template("login.html"), 429
         user = conn.execute(
             "SELECT * FROM users WHERE username = ?", (username,)
         ).fetchone()
-        conn.close()
-        if user and verify_password(password, user["password_hash"]):
+        membership = None
+        if user:
+            membership = conn.execute(
+                """
+                SELECT org_id FROM organization_memberships
+                WHERE user_id = ? AND status = 'active'
+                ORDER BY CASE WHEN org_id = ? THEN 0 ELSE 1 END, id LIMIT 1
+                """,
+                (user["id"], user["default_org_id"]),
+            ).fetchone()
+        valid = bool(user and membership and not user["disabled_at"] and verify_password(password, user["password_hash"]))
+        conn.execute(
+            "INSERT INTO login_attempts (username, ip_address, succeeded) VALUES (?, ?, ?)",
+            (username, request.remote_addr or "", 1 if valid else 0),
+        )
+        if valid:
+            if not user["password_hash"].startswith(("scrypt:", "pbkdf2:")):
+                conn.execute(
+                    "UPDATE users SET password_hash = ?, password_changed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (hash_password(password), user["id"]),
+                )
+            conn.commit()
+            session.clear()
+            session.permanent = True
             session["user_id"] = user["id"]
             session["username"] = user["username"]
+            session["org_id"] = membership["org_id"]
+            csrf_token()
+            audit("login_success", user_id=user["id"], org_id=membership["org_id"], ip_address=request.remote_addr)
+            conn.close()
             return redirect(url_for("dashboard"))
+        conn.commit()
+        conn.close()
+        audit("login_failed", username=username, ip_address=request.remote_addr)
         flash("Invalid credentials", "error")
     return render_template("login.html")
 
@@ -336,25 +437,41 @@ def setup():
         return redirect(url_for("login"))
 
     if request.method == "POST":
-        username = request.form.get("username", "")
+        username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        if not username or not password:
-            flash("Username and password required", "error")
+        if not username or len(password) < 12:
+            flash("Username and a password of at least 12 characters are required", "error")
         else:
             conn = get_db()
-            conn.execute(
+            org = conn.execute("SELECT id FROM organizations ORDER BY id LIMIT 1").fetchone()
+            if not org:
+                org_id = int(conn.execute(
+                    "INSERT INTO organizations (name, slug) VALUES ('Default Organization', 'default')"
+                ).lastrowid)
+            else:
+                org_id = int(org["id"])
+            cursor = conn.execute(
                 "INSERT INTO users (username, password_hash) VALUES (?, ?)",
                 (username, hash_password(password)),
             )
-            conn.commit()
+            user_id = int(cursor.lastrowid)
+            conn.execute("UPDATE users SET default_org_id = ?, password_changed_at = CURRENT_TIMESTAMP WHERE id = ?", (org_id, user_id))
+            conn.execute("INSERT OR IGNORE INTO organization_memberships (org_id, user_id) VALUES (?, ?)", (org_id, user_id))
+            from web.services.schema_features import ensure_admin_role
+            ensure_admin_role(conn, user_id, org_id)
             conn.close()
-            session["user_id"] = 1
+            session.clear()
+            session.permanent = True
+            session["user_id"] = user_id
             session["username"] = username
+            session["org_id"] = org_id
+            csrf_token()
+            audit("initial_admin_created", user_id=user_id, org_id=org_id)
             return redirect(url_for("credentials"))
     return render_template("setup.html")
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 def logout():
     session.clear()
     return redirect(url_for("login"))
@@ -363,22 +480,23 @@ def logout():
 # ── Routes: Credentials ──
 
 @app.route("/credentials", methods=["GET", "POST"])
-@login_required
+@permission_required("credential.manage")
 def credentials():
     conn = get_db()
+    org_id = current_org_id(conn)
     if request.method == "POST":
-        save_platform_settings(conn, request.form)
+        save_platform_settings(conn, request.form, int(org_id))
         conn.commit()
         flash("Credentials and platform connections saved", "success")
         return redirect(url_for("dashboard"))
 
     existing = {
         row["key_name"]: row["key_value"][:8] + "****"
-        for row in conn.execute("SELECT key_name, key_value FROM credentials").fetchall()
+        for row in conn.execute("SELECT key_name, key_value FROM credentials WHERE org_id = ?", (org_id,)).fetchall()
     }
     platform_existing = {
         row["platform"]: {"base_url": row["base_url"], "enabled": bool(row["enabled"])}
-        for row in conn.execute("SELECT platform, base_url, enabled FROM platform_config").fetchall()
+        for row in conn.execute("SELECT platform, base_url, enabled FROM platform_config WHERE org_id = ?", (org_id,)).fetchall()
     }
     conn.close()
     return render_template("credentials.html", existing=existing, platform_existing=platform_existing)
@@ -390,31 +508,53 @@ def credentials():
 @login_required
 def dashboard():
     conn = get_db()
+    org_id = current_org_id(conn)
     runs = conn.execute(
-        "SELECT * FROM runs ORDER BY started_at DESC LIMIT 20"
+        "SELECT * FROM runs WHERE org_id = ? ORDER BY started_at DESC LIMIT 20", (org_id,)
     ).fetchall()
     cases = conn.execute(
-        "SELECT * FROM cases ORDER BY created_at DESC LIMIT 10"
+        "SELECT * FROM cases WHERE org_id = ? ORDER BY created_at DESC LIMIT 10", (org_id,)
     ).fetchall()
     recent_log = conn.execute(
-        "SELECT * FROM activity_log ORDER BY timestamp DESC LIMIT 50"
+        "SELECT * FROM activity_log WHERE org_id = ? ORDER BY timestamp DESC LIMIT 50", (org_id,)
     ).fetchall()
+    alerts = conn.execute(
+        """
+        SELECT a.*, j.status AS job_status
+        FROM alerts a LEFT JOIN jobs j ON j.id = a.job_id AND j.org_id = a.org_id
+        WHERE a.org_id = ?
+        ORDER BY a.created_at DESC LIMIT 20
+        """,
+        (org_id,),
+    ).fetchall()
+    # SQLite computes the operational metrics from persisted UTC timestamps so
+    # dashboard values survive process restarts and can be audited later.
+    sla = conn.execute(
+        """
+        SELECT
+          ROUND(AVG(CASE WHEN first_response_at IS NOT NULL
+            THEN (julianday(first_response_at) - julianday(COALESCE(opened_at, created_at))) * 24 END), 2) AS mtta_hours,
+          ROUND(AVG(CASE WHEN closed_at IS NOT NULL
+            THEN (julianday(closed_at) - julianday(COALESCE(opened_at, created_at))) * 24 END), 2) AS mttr_hours
+        FROM cases WHERE org_id = ?
+        """,
+        (org_id,),
+    ).fetchone()
     conn.close()
     return render_template(
-        "dashboard.html", runs=runs, cases=cases, activity=recent_log
+        "dashboard.html", runs=runs, cases=cases, activity=recent_log,
+        alerts=alerts, sla=sla,
     )
 
 
 # ── Routes: Agent Run ──
 
 @app.route("/run", methods=["POST"])
-@login_required
+@permission_required("tool.execute")
 def run_agent():
-    try:
-        write_platforms_toml()
-    except PermissionError as e:
-        return jsonify({"error": str(e), "fix": "sudo chown -R $USER config/"}), 500
     playbook = request.form.get("playbook", "identity-compromise.yaml")
+    if Path(playbook).name != playbook:
+        return jsonify({"error": "Invalid playbook name"}), 400
     alert_file = request.form.get("alert_file", "")
     playbook_path = ROOT / "playbooks" / playbook
     if not playbook_path.is_file():
@@ -426,26 +566,37 @@ def run_agent():
         return jsonify({"error": f"Unable to load alert: {str(e)[:200]}"}), 400
 
     conn = get_db()
+    org_id = current_org_id(conn)
+    idempotency_key = request.headers.get("Idempotency-Key") or secrets.token_urlsafe(24)
+    existing_run = conn.execute(
+        "SELECT id FROM runs WHERE org_id = ? AND idempotency_key = ?",
+        (org_id, idempotency_key),
+    ).fetchone()
+    if existing_run:
+        conn.close()
+        return jsonify({"run_id": existing_run["id"], "status": "already_queued"}), 200
     cursor = conn.execute(
-        "INSERT INTO runs (playbook, alert_file, status) VALUES (?, ?, 'running')",
-        (playbook, alert_file or "demo/brute-force-alert.json"),
+        "INSERT INTO runs (org_id, requested_by, idempotency_key, playbook, alert_file, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+        (org_id, session["user_id"], idempotency_key, playbook, alert_file or "demo/brute-force-alert.json"),
     )
     run_id = cursor.lastrowid
     conn.execute(
-        "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'queue', 'running', ?)",
-        (run_id, f"Queued playbook: {playbook}"),
+        "INSERT INTO activity_log (org_id, actor_id, run_id, step, status, detail) VALUES (?, ?, ?, 'queue', 'running', ?)",
+        (org_id, session["user_id"], run_id, f"Queued playbook: {playbook}"),
     )
     conn.commit()
     conn.close()
 
-    config = load_config_for_web()
+    config = load_config_for_web(int(org_id))
     job_id = job_queue.create_job(
         run_id=run_id,
         playbook_path=str(playbook_path),
         alert=alert,
         config=config,
+        org_id=int(org_id),
+        idempotency_key=idempotency_key,
     )
-    learn_alert(alert, source="manual_run", playbook=playbook)
+    learn_alert(alert, source="manual_run", playbook=playbook, org_id=int(org_id))
     job_queue.execute_job(
         job_id,
         lambda alert_data, progress_cb: _execute_run_job(
@@ -454,22 +605,20 @@ def run_agent():
             alert_data,
             config,
             progress_cb,
+            int(org_id),
         ),
     )
 
     return jsonify({"run_id": run_id, "job_id": job_id, "status": "queued"})
 
 
-def load_config_for_web() -> dict[str, Any]:
+def load_config_for_web(org_id: int | None = None) -> dict[str, Any]:
     try:
         import tomllib
     except ModuleNotFoundError:
         import tomli as tomllib  # type: ignore
-    config_path = ROOT / "config" / "platforms.toml"
-    if not config_path.is_file():
-        return {}
-    with config_path.open("rb") as f:
-        return tomllib.load(f)
+    # Parsing the generated text in memory avoids a cross-tenant shared config file.
+    return tomllib.loads(build_platforms_toml(org_id))
 
 
 def _load_alert_payload(alert_file: str) -> dict[str, Any]:
@@ -479,6 +628,11 @@ def _load_alert_payload(alert_file: str) -> dict[str, Any]:
     path = Path(raw)
     if not path.is_absolute():
         path = ROOT / path
+    resolved = path.resolve()
+    allowed_roots = [(ROOT / name).resolve() for name in ("demo", "data", "evidence")]
+    if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+        raise ValueError("alert file must be under demo/, data/, or evidence/")
+    path = resolved
     if not path.is_file():
         raise FileNotFoundError(str(path))
     alert = json.loads(path.read_text(encoding="utf-8"))
@@ -493,6 +647,7 @@ def _execute_run_job(
     alert: dict[str, Any],
     config: dict[str, Any],
     progress_cb,
+    org_id: int,
 ) -> dict[str, Any]:
     """Execute a web-submitted run through the persistent job queue."""
     from scripts.common import Session
@@ -501,27 +656,24 @@ def _execute_run_job(
     progress_cb(0.05)
     conn = get_db()
     try:
-        creds = conn.execute("SELECT key_name, key_value FROM credentials").fetchall()
-        for cred in creds:
-            os.environ[cred["key_name"]] = cred["key_value"]
-
-        # Regenerate platforms.toml from the DB and re-read it, so client
-        # construction always reflects the credentials/URLs saved in the
-        # portal — never a stale or empty config passed in by the caller.
-        try:
-            write_platforms_toml()
-            config = load_config_for_web() or config
-        except Exception as cfg_err:
-            audit("web_run_config_reload_failed", run_id=run_id, error=str(cfg_err)[:200])
+        credentials = {
+            row["key_name"]: open_secret(row["key_value"])
+            for row in conn.execute(
+                "SELECT key_name, key_value FROM credentials WHERE org_id = ?",
+                (org_id,),
+            ).fetchall()
+        }
+        config = load_config_for_web(org_id) or config
 
         conn.execute(
-            "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'start', 'running', ?)",
-            (run_id, f"Starting playbook: {playbook_path.name}"),
+            "INSERT INTO activity_log (org_id, run_id, step, status, detail) VALUES (?, ?, 'start', 'running', ?)",
+            (org_id, run_id, f"Starting playbook: {playbook_path.name}"),
         )
+        conn.execute("UPDATE runs SET status = 'running', first_response_at = COALESCE(first_response_at, CURRENT_TIMESTAMP) WHERE id = ? AND org_id = ?", (run_id, org_id))
         conn.commit()
         progress_cb(0.15)
 
-        clients = build_clients(config)
+        clients = build_clients(config, credentials=credentials)
         progress_cb(0.25)
 
         alert_title = alert.get("rule", {}).get("name", alert.get("title", "Unknown alert"))
@@ -552,17 +704,17 @@ def _execute_run_job(
         case_summary = result_json[:500]
         severity = result.get("triage_result", {}).get("tier", "medium")
         cursor = conn.execute(
-            "INSERT INTO cases (run_id, title, severity, status, summary, report_path) VALUES (?, ?, ?, 'open', ?, ?)",
-            (run_id, case_title, severity, case_summary, result.get("report_path")),
+            "INSERT INTO cases (org_id, run_id, title, severity, status, summary, report_path, opened_at) VALUES (?, ?, ?, ?, 'open', ?, ?, CURRENT_TIMESTAMP)",
+            (org_id, run_id, case_title, severity, case_summary, result.get("report_path")),
         )
         case_id = cursor.lastrowid
         conn.execute(
-            "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'complete', 'done', 'Playbook execution completed')",
-            (run_id,),
+            "INSERT INTO activity_log (org_id, run_id, step, status, detail) VALUES (?, ?, 'complete', 'done', 'Playbook execution completed')",
+            (org_id, run_id),
         )
         conn.commit()
 
-        learn_playbook_result(playbook_path.name, result, alert)
+        learn_playbook_result(playbook_path.name, result, alert, org_id=org_id)
         learn_case(
             {
                 "id": case_id,
@@ -570,7 +722,8 @@ def _execute_run_job(
                 "severity": severity,
                 "status": "open",
                 "summary": case_summary,
-            }
+            },
+            org_id=org_id,
         )
         progress_cb(1.0)
         return result
@@ -580,8 +733,8 @@ def _execute_run_job(
             (str(e)[:2000], run_id),
         )
         conn.execute(
-            "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'error', 'failed', ?)",
-            (run_id, str(e)[:500]),
+            "INSERT INTO activity_log (org_id, run_id, step, status, detail) VALUES (?, ?, 'error', 'failed', ?)",
+            (org_id, run_id, str(e)[:500]),
         )
         conn.commit()
         raise
@@ -595,8 +748,18 @@ def _execute_run_job(
 @login_required
 def cases():
     conn = get_db()
+    org_id = current_org_id(conn)
+    assignment = request.args.get("assignment", "all")
+    where = "org_id = ?"
+    params: list[Any] = [org_id]
+    if assignment == "mine":
+        where += " AND assignee_id = ?"
+        params.append(session["user_id"])
+    elif assignment == "unassigned":
+        where += " AND assignee_id IS NULL"
     cases = conn.execute(
-        "SELECT * FROM cases ORDER BY created_at DESC"
+        f"SELECT * FROM cases WHERE {where} ORDER BY created_at DESC",
+        params,
     ).fetchall()
     conn.close()
     return render_template("cases.html", cases=cases)
@@ -606,7 +769,8 @@ def cases():
 @login_required
 def case_detail(case_id: int):
     conn = get_db()
-    case = conn.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
+    org_id = current_org_id(conn)
+    case = conn.execute("SELECT * FROM cases WHERE id = ? AND org_id = ?", (case_id, org_id)).fetchone()
     run = None
     activity = []
     steps = []
@@ -690,8 +854,10 @@ def _extract_run_steps(run) -> list[dict[str, Any]]:
 @login_required
 def reports():
     conn = get_db()
+    org_id = current_org_id(conn)
     cases_with_reports = conn.execute(
-        "SELECT * FROM cases WHERE report_path IS NOT NULL ORDER BY created_at DESC"
+        "SELECT * FROM cases WHERE org_id = ? AND report_path IS NOT NULL ORDER BY created_at DESC",
+        (org_id,),
     ).fetchall()
     conn.close()
     return render_template("reports.html", cases=cases_with_reports)
@@ -703,14 +869,15 @@ def reports():
 @login_required
 def api_run_status(run_id: int):
     conn = get_db()
-    run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    org_id = current_org_id(conn)
+    run = conn.execute("SELECT * FROM runs WHERE id = ? AND org_id = ?", (run_id, org_id)).fetchone()
     log = conn.execute(
-        "SELECT * FROM activity_log WHERE run_id = ? ORDER BY timestamp",
-        (run_id,),
+        "SELECT * FROM activity_log WHERE run_id = ? AND org_id = ? ORDER BY timestamp",
+        (run_id, org_id),
     ).fetchall()
     job = conn.execute(
-        "SELECT id, status, progress, error_message, finished_at FROM jobs WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
-        (run_id,),
+        "SELECT id, status, progress, error_message, finished_at FROM jobs WHERE run_id = ? AND org_id = ? ORDER BY created_at DESC LIMIT 1",
+        (run_id, org_id),
     ).fetchone()
     conn.close()
     if not run:
@@ -723,17 +890,18 @@ def api_run_status(run_id: int):
 
 
 @app.route("/api/learning/suggestions")
-@login_required
+@permission_required("learning.review")
 def api_learning_suggestions():
-    return jsonify(LearningStore().list_skill_suggestions())
+    return jsonify(LearningStore().list_skill_suggestions(org_id=current_org_id()))
 
 
 @app.route("/api/activity")
 @login_required
 def api_activity():
     conn = get_db()
+    org_id = current_org_id(conn)
     log = conn.execute(
-        "SELECT * FROM activity_log ORDER BY timestamp DESC LIMIT 50"
+        "SELECT * FROM activity_log WHERE org_id = ? ORDER BY timestamp DESC LIMIT 50", (org_id,)
     ).fetchall()
     conn.close()
     return jsonify([dict(row) for row in log])
@@ -753,7 +921,7 @@ def playbooks():
 # ── Routes: Playbook Upload ──
 
 @app.route("/playbooks/upload", methods=["POST"])
-@login_required
+@permission_required("playbook.manage")
 def upload_playbook():
     if "playbook" not in request.files:
         flash("No file selected", "error")
@@ -835,8 +1003,8 @@ def upload_playbook():
         # Record in DB
         conn = get_db()
         conn.execute(
-            "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, ?, 'done', ?)",
-            (None, "upload_playbook", f"Uploaded playbook: {file.filename}"),
+            "INSERT INTO activity_log (org_id, actor_id, run_id, step, status, detail) VALUES (?, ?, ?, ?, 'done', ?)",
+            (current_org_id(conn), session["user_id"], None, "upload_playbook", f"Uploaded playbook: {file.filename}"),
         )
         conn.commit()
         conn.close()
@@ -852,20 +1020,27 @@ def upload_playbook():
 # ── Routes: Run Approve/Reject ──
 
 @app.route("/api/runs/<int:run_id>/approve", methods=["POST"])
-@login_required
+@permission_required("responder.approve")
 def api_run_approve(run_id: int):
     conn = get_db()
-    run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    org_id = current_org_id(conn)
+    run = conn.execute("SELECT * FROM runs WHERE id = ? AND org_id = ?", (run_id, org_id)).fetchone()
     if not run:
         conn.close()
         return jsonify({"error": "not found"}), 404
+    if run["requested_by"] == session["user_id"]:
+        conn.close()
+        return jsonify({"error": "requester cannot approve their own run"}), 403
+    updated = conn.execute(
+        "UPDATE runs SET status = 'approved' WHERE id = ? AND org_id = ? AND status IN ('pending', 'awaiting_approval')",
+        (run_id, org_id),
+    ).rowcount
+    if not updated:
+        conn.close()
+        return jsonify({"error": "run is not awaiting approval"}), 409
     conn.execute(
-        "UPDATE runs SET status = 'approved' WHERE id = ?",
-        (run_id,),
-    )
-    conn.execute(
-        "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'approval', 'done', 'Run approved by operator')",
-        (run_id,),
+        "INSERT INTO activity_log (org_id, actor_id, run_id, step, status, detail) VALUES (?, ?, ?, 'approval', 'done', 'Run approved by operator')",
+        (org_id, session["user_id"], run_id),
     )
     conn.commit()
     conn.close()
@@ -873,17 +1048,28 @@ def api_run_approve(run_id: int):
 
 
 @app.route("/api/runs/<int:run_id>/reject", methods=["POST"])
-@login_required
+@permission_required("responder.approve")
 def api_run_reject(run_id: int):
     reason = request.json.get("reason", "") if request.is_json else ""
     conn = get_db()
+    org_id = current_org_id(conn)
+    run = conn.execute("SELECT id, requested_by FROM runs WHERE id = ? AND org_id = ?", (run_id, org_id)).fetchone()
+    if not run:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if run["requested_by"] == session["user_id"]:
+        conn.close()
+        return jsonify({"error": "requester cannot reject their own run"}), 403
+    updated = conn.execute(
+        "UPDATE runs SET status = 'rejected' WHERE id = ? AND org_id = ? AND status IN ('pending', 'awaiting_approval')",
+        (run_id, org_id),
+    ).rowcount
+    if not updated:
+        conn.close()
+        return jsonify({"error": "run is not awaiting approval"}), 409
     conn.execute(
-        "UPDATE runs SET status = 'rejected' WHERE id = ?",
-        (run_id,),
-    )
-    conn.execute(
-        "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'approval', 'failed', ?)",
-        (run_id, f"Run rejected: {reason}" if reason else "Run rejected by operator"),
+        "INSERT INTO activity_log (org_id, actor_id, run_id, step, status, detail) VALUES (?, ?, ?, 'approval', 'failed', ?)",
+        (org_id, session["user_id"], run_id, f"Run rejected: {reason}" if reason else "Run rejected by operator"),
     )
     conn.commit()
     conn.close()
@@ -893,10 +1079,10 @@ def api_run_reject(run_id: int):
 # ── Routes: Secrets Status & Test ──
 
 @app.route("/api/secrets/status")
-@login_required
+@permission_required("credential.manage")
 def api_secrets_status():
     conn = get_db()
-    creds = conn.execute("SELECT key_name FROM credentials").fetchall()
+    creds = conn.execute("SELECT key_name FROM credentials WHERE org_id = ?", (current_org_id(conn),)).fetchall()
     conn.close()
     configured = [c["key_name"] for c in creds]
     required = [
@@ -916,7 +1102,7 @@ def api_secrets_status():
 
 
 @app.route("/api/secrets/test", methods=["POST"])
-@login_required
+@permission_required("credential.manage")
 def api_secrets_test():
     platform = request.json.get("platform", "") if request.is_json else ""
     if not platform:
@@ -1030,11 +1216,12 @@ def _test_platform_connection(platform: str, base_url: str, api_key: str) -> dic
 
 
 @app.route("/api/secrets/test-all", methods=["POST"])
-@login_required
+@permission_required("credential.manage")
 def api_secrets_test_all():
     conn = get_db()
-    creds = {row["key_name"]: row["key_value"] for row in conn.execute("SELECT key_name, key_value FROM credentials").fetchall()}
-    platform_cfg = {row["platform"]: row["base_url"] for row in conn.execute("SELECT platform, base_url FROM platform_config").fetchall()}
+    org_id = current_org_id(conn)
+    creds = {row["key_name"]: open_secret(row["key_value"]) for row in conn.execute("SELECT key_name, key_value FROM credentials WHERE org_id = ?", (org_id,)).fetchall()}
+    platform_cfg = {row["platform"]: row["base_url"] for row in conn.execute("SELECT platform, base_url FROM platform_config WHERE org_id = ?", (org_id,)).fetchall()}
     conn.close()
 
     key_for_platform = {plat: kn for kn, plat in PLATFORM_CREDENTIAL_KEYS if plat}
@@ -1066,25 +1253,35 @@ def get_local_ip() -> str:
 from web.routes.chat import chat_bp
 from scripts.webhooks import webhooks_bp
 from web.routes.features import features_bp
+from web.routes.export import export_bp
+from web.routes.operations import operations_bp
 
 app.register_blueprint(chat_bp)
 app.register_blueprint(webhooks_bp)
 app.register_blueprint(features_bp)
+app.register_blueprint(export_bp)
+app.register_blueprint(operations_bp)
+
+# WSGI imports must initialize the schema too; production servers do not execute __main__.
+init_db()
 
 
 if __name__ == "__main__":
-    init_db()
-
     # Opt-in Wazuh alert poller -- only starts when WAZUH_POLL_ENABLED is set.
     if os.environ.get("WAZUH_POLL_ENABLED", "").lower() in {"1", "true", "yes", "on"}:
         from web.services.wazuh_poller import get_poller
         get_poller().start()
 
     ip = get_local_ip()
-    port = 5000
+    port = int(os.environ.get("AI_SOC_PORT", "5000"))
+    if not 1 <= port <= 65535:
+        raise ValueError("AI_SOC_PORT must be between 1 and 65535")
     print(f"\n{'='*50}")
     print(f"  AI SOC Operator")
     print(f"  Local:   http://localhost:{port}")
     print(f"  Network: http://{ip}:{port}")
     print(f"{'='*50}\n")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # Debug mode can expose an interactive traceback, so it is opt-in even in
+    # local development and must never be inferred from the bind address.
+    debug = os.environ.get("AI_SOC_FLASK_DEBUG", "").lower() in {"1", "true", "yes"}
+    app.run(host=os.environ.get("AI_SOC_BIND", "127.0.0.1"), port=port, debug=debug)

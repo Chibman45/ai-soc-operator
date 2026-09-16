@@ -5,6 +5,7 @@
     <div class="flex items-center justify-between">
         <h2 class="text-xl font-bold">Dashboard</h2>
         <form method="POST" action="{{ url_for('run_agent') }}" class="flex gap-2" id="run-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <select name="playbook" class="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm">
                 {% for pb in (playbooks if playbooks is defined else []) %}
                 <option value="{{ pb.name }}">{{ pb.name }}</option>
@@ -20,28 +21,72 @@
     </div>
 
     <!-- Stats -->
-    <div class="grid grid-cols-4 gap-4">
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-6 gap-4">
+        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
             <div class="text-2xl font-bold text-blue-400">{{ runs|length }}</div>
             <div class="text-xs text-gray-500">Total Runs</div>
         </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
             <div class="text-2xl font-bold text-green-400">{{ runs|selectattr('status', 'equalto', 'completed')|list|length }}</div>
             <div class="text-xs text-gray-500">Completed</div>
         </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
             <div class="text-2xl font-bold text-yellow-400">{{ cases|selectattr('status', 'equalto', 'open')|list|length }}</div>
             <div class="text-xs text-gray-500">Open Cases</div>
         </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
             <div class="text-2xl font-bold text-purple-400">{{ activity|length }}</div>
             <div class="text-xs text-gray-500">Log Entries</div>
         </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+            <div class="text-2xl font-bold text-cyan-400">{{ sla.mtta_hours if sla and sla.mtta_hours is not none else '—' }}</div>
+            <div class="text-xs text-gray-500">MTTA Hours</div>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+            <div class="text-2xl font-bold text-rose-400">{{ sla.mttr_hours if sla and sla.mttr_hours is not none else '—' }}</div>
+            <div class="text-xs text-gray-500">MTTR Hours</div>
+        </div>
     </div>
 
-    <div class="grid grid-cols-2 gap-6">
+    <section class="border-y border-gray-800 py-4">
+        <div class="flex items-center justify-between mb-3">
+            <h3 class="font-medium">Alert Queue</h3>
+            <span class="text-xs text-gray-500" id="alert-count">{{ alerts|length }} alerts</span>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead class="text-left text-xs text-gray-500 uppercase">
+                    <tr>
+                        <th class="pb-2 pr-4">Alert</th>
+                        <th class="pb-2 pr-4">Source</th>
+                        <th class="pb-2 pr-4">Severity</th>
+                        <th class="pb-2 pr-4">Playbook</th>
+                        <th class="pb-2 pr-4">Status</th>
+                        <th class="pb-2">Received</th>
+                    </tr>
+                </thead>
+                <tbody id="alert-queue" class="divide-y divide-gray-800">
+                    {% for alert in alerts %}
+                    <tr>
+                        <td class="py-2 pr-4 max-w-xs truncate">{{ alert.title }}</td>
+                        <td class="py-2 pr-4 text-gray-400">{{ alert.source }}</td>
+                        <td class="py-2 pr-4">{{ alert.severity }}</td>
+                        <td class="py-2 pr-4 text-gray-400">{{ alert.selected_playbook or 'Unmatched' }}</td>
+                        <td class="py-2 pr-4">{{ alert.job_status or alert.status }}</td>
+                        <td class="py-2 text-gray-500 whitespace-nowrap">{{ alert.created_at }}</td>
+                    </tr>
+                    {% endfor %}
+                    {% if not alerts %}
+                    <tr id="empty-alert-row"><td colspan="6" class="py-6 text-center text-gray-600">No alerts in the queue.</td></tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
         <!-- Recent Activity -->
-        <div class="bg-gray-900 border border-gray-800 rounded-xl">
+        <div class="bg-gray-900 border border-gray-800 rounded-lg">
             <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
                 <h3 class="font-medium">Activity Feed</h3>
                 <span class="text-xs text-gray-500" id="activity-count">{{ activity|length }} entries</span>
@@ -66,7 +111,7 @@
         </div>
 
         <!-- Recent Cases -->
-        <div class="bg-gray-900 border border-gray-800 rounded-xl">
+        <div class="bg-gray-900 border border-gray-800 rounded-lg">
             <div class="px-4 py-3 border-b border-gray-800">
                 <h3 class="font-medium">Recent Cases</h3>
             </div>
@@ -98,14 +143,47 @@
 
 {% block scripts %}
 <script>
-// Poll for activity updates every 5 seconds
+function renderAlertQueue(alerts) {
+    const body = document.getElementById('alert-queue');
+    body.replaceChildren();
+    document.getElementById('alert-count').textContent = `${alerts.length} alerts`;
+    if (!alerts.length) {
+        const row = body.insertRow();
+        const cell = row.insertCell();
+        cell.colSpan = 6;
+        cell.className = 'py-6 text-center text-gray-600';
+        cell.textContent = 'No alerts in the queue.';
+        return;
+    }
+    for (const alert of alerts) {
+        const row = body.insertRow();
+        const values = [alert.title, alert.source, alert.severity,
+            alert.selected_playbook || 'Unmatched', alert.job_status || alert.status,
+            alert.created_at];
+        for (const value of values) {
+            const cell = row.insertCell();
+            cell.className = 'py-2 pr-4 text-gray-300';
+            // textContent keeps SIEM-controlled alert fields inert in the live queue.
+            cell.textContent = value || '';
+        }
+    }
+}
+
+// Poll the persisted queue; workers update the same records as jobs advance.
 setInterval(async () => {
     try {
-        const resp = await fetch('/api/activity');
-        const data = await resp.json();
+        const [activityResp, alertsResp] = await Promise.all([
+            fetch('/api/activity'),
+            fetch('/api/alerts/queue?mode=all&limit=20')
+        ]);
+        const data = await activityResp.json();
         const feed = document.getElementById('activity-feed');
         if (data.length > 0) {
             document.getElementById('activity-count').textContent = data.length + ' entries';
+        }
+        if (alertsResp.ok) {
+            const queue = await alertsResp.json();
+            renderAlertQueue(queue.alerts || []);
         }
     } catch (e) {}
 }, 5000);

@@ -32,6 +32,18 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class JobControlSignal(RuntimeError):
+    """Internal cooperative stop signal raised at progress checkpoints."""
+
+
+class JobPaused(JobControlSignal):
+    pass
+
+
+class JobCancelled(JobControlSignal):
+    pass
+
+
 @dataclass
 class JobResult:
     """Result of a job execution."""
@@ -50,6 +62,7 @@ class JobQueue:
     def __init__(self, db_path: Path = ROOT / "data" / "soc_operator.db"):
         self.db_path = db_path
         self._workers: dict[str, threading.Thread] = {}
+        self._executors: dict[str, Callable] = {}
         self._init_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -79,12 +92,32 @@ class JobQueue:
                     paused_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    org_id INTEGER,
+                    idempotency_key TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    worker_id TEXT,
+                    lease_expires_at TIMESTAMP,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (run_id) REFERENCES runs(id)
                 );
                 
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_jobs_run_id ON jobs(run_id);
             """)
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+            for name, definition in {
+                "org_id": "INTEGER",
+                "idempotency_key": "TEXT",
+                "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "max_attempts": "INTEGER NOT NULL DEFAULT 3",
+                "worker_id": "TEXT",
+                "lease_expires_at": "TIMESTAMP",
+                "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+            }.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency ON jobs(org_id, idempotency_key) WHERE idempotency_key IS NOT NULL")
             conn.commit()
         finally:
             conn.close()
@@ -95,6 +128,9 @@ class JobQueue:
         playbook_path: str,
         alert: dict[str, Any],
         config: dict[str, Any],
+        org_id: int | None = None,
+        idempotency_key: str | None = None,
+        max_attempts: int = 3,
     ) -> str:
         """Create and queue a new job.
         
@@ -106,17 +142,28 @@ class JobQueue:
 
         conn = self._get_conn()
         try:
+            if idempotency_key:
+                existing = conn.execute(
+                    "SELECT id FROM jobs WHERE org_id = ? AND idempotency_key = ?",
+                    (org_id, idempotency_key),
+                ).fetchone()
+                if existing:
+                    return str(existing["id"])
             conn.execute(
-                """INSERT INTO jobs (id, run_id, status, playbook_path, alert_json, config_json, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO jobs
+                   (id, org_id, run_id, status, playbook_path, alert_json, config_json,
+                    idempotency_key, max_attempts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job_id,
+                    org_id,
                     run_id,
                     JobStatus.PENDING.value,
                     playbook_path,
                     json.dumps(alert),
                     json.dumps(config),
-                    utc_now(),
+                    idempotency_key,
+                    max(1, max_attempts),
                 ),
             )
             conn.commit()
@@ -162,7 +209,15 @@ class JobQueue:
         conn = self._get_conn()
         try:
             conn.execute(
-                "UPDATE jobs SET progress = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                """
+                UPDATE jobs
+                SET progress = ?, updated_at = CURRENT_TIMESTAMP,
+                    lease_expires_at = CASE
+                        WHEN status = 'running' THEN datetime('now', '+5 minutes')
+                        ELSE lease_expires_at
+                    END
+                WHERE id = ?
+                """,
                 (progress, job_id),
             )
             conn.commit()
@@ -230,10 +285,13 @@ class JobQueue:
 
             conn.execute(
                 "UPDATE jobs SET status = ?, paused_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (JobStatus.RUNNING.value, job_id),
+                (JobStatus.PENDING.value, job_id),
             )
             conn.commit()
             audit("job_resumed", job_id=job_id)
+            executor = self._executors.get(job_id)
+            if executor:
+                self.execute_job(job_id, executor)
             return True
         finally:
             conn.close()
@@ -251,7 +309,12 @@ class JobQueue:
             if job["status"] in (JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value):
                 return False  # Already terminal
 
-            self.update_job_status(job_id, JobStatus.CANCELLED, error="Cancelled by user")
+            conn.execute(
+                "UPDATE jobs SET cancel_requested = 1, status = ?, error_message = ?, finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (JobStatus.CANCELLED.value, "Cancelled by user", job_id),
+            )
+            conn.commit()
+            audit("job_cancelled", job_id=job_id)
             return True
         finally:
             conn.close()
@@ -298,9 +361,29 @@ class JobQueue:
             job_id: Job ID to execute
             executor: Callable that takes (alert, progress_callback) and returns result dict
         """
+        self._executors[job_id] = executor
+
         def worker():
             try:
-                self.update_job_status(job_id, JobStatus.RUNNING)
+                worker_id = f"local-{threading.get_ident()}"
+                conn = self._get_conn()
+                try:
+                    claimed = conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = ?, started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                            attempt_count = attempt_count + 1, worker_id = ?,
+                            lease_expires_at = datetime('now', '+5 minutes'), updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND status = ? AND cancel_requested = 0
+                          AND attempt_count < max_attempts
+                        """,
+                        (JobStatus.RUNNING.value, worker_id, job_id, JobStatus.PENDING.value),
+                    ).rowcount
+                    conn.commit()
+                finally:
+                    conn.close()
+                if not claimed:
+                    return
 
                 # Load job data
                 conn = self._get_conn()
@@ -322,19 +405,62 @@ class JobQueue:
                 # Define progress callback
                 def update_progress(progress: float):
                     if 0 <= progress <= 1.0:
+                        control = self.get_job(job_id).status
+                        if control == JobStatus.CANCELLED:
+                            raise JobCancelled("Job cancellation requested")
+                        if control == JobStatus.PAUSED:
+                            raise JobPaused("Job pause requested")
                         self.update_job_progress(job_id, progress)
 
                 # Execute
                 result = executor(alert, update_progress)
                 self.update_job_status(job_id, JobStatus.COMPLETED, result=result)
 
+            except JobPaused:
+                audit("job_worker_paused", job_id=job_id)
+            except JobCancelled:
+                self.update_job_status(job_id, JobStatus.CANCELLED, error="Cancelled by user")
             except Exception as e:
                 self.update_job_status(job_id, JobStatus.FAILED, error=str(e)[:500])
+            finally:
+                self._workers.pop(job_id, None)
 
         # Start worker in non-daemon thread
         thread = threading.Thread(target=worker, daemon=False)
         self._workers[job_id] = thread
         thread.start()
+
+    def recover_stale_jobs(self) -> int:
+        """Retry recoverable leases and fail jobs that exhausted their attempts."""
+        conn = self._get_conn()
+        try:
+            recovered = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'pending', worker_id = NULL, lease_expires_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'running' AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < CURRENT_TIMESTAMP AND attempt_count < max_attempts
+                """
+            ).rowcount
+            exhausted = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed', worker_id = NULL, lease_expires_at = NULL,
+                    error_message = 'Worker lease expired after maximum attempts',
+                    finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'running' AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < CURRENT_TIMESTAMP AND attempt_count >= max_attempts
+                """
+            ).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        if recovered:
+            audit("stale_jobs_recovered", count=recovered)
+        if exhausted:
+            audit("stale_jobs_failed", count=exhausted)
+        return int(recovered)
 
     def wait_for_job(self, job_id: str, timeout: Optional[int] = None) -> JobResult:
         """Wait for a job to complete."""

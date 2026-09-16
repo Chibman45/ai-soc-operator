@@ -164,64 +164,54 @@ class MISPClient(PlatformClient):
 class EnrichmentClient:
     """Unified enrichment interface across all threat intel platforms."""
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, config: dict[str, Any], credentials: dict[str, str] | None = None):
         self._clients: dict[str, Any] = {}
+        self._credentials = credentials or {}
         self._init_clients(config)
+
+    def _secret(self, name: str) -> str:
+        return self._credentials.get(name, "") or os.environ.get(name, "")
 
     def _init_clients(self, config: dict[str, Any]) -> None:
         platforms = config.get("platforms", {})
 
         if platforms.get("virustotal", {}).get("enabled"):
-            key = os.environ.get(
-                platforms["virustotal"].get("credential_env", ""), ""
-            )
+            key = self._secret(platforms["virustotal"].get("credential_env", ""))
             if key:
                 self._clients["virustotal"] = VirusTotalClient(key)
 
         if platforms.get("abuseipdb", {}).get("enabled"):
-            key = os.environ.get(
-                platforms["abuseipdb"].get("credential_env", ""), ""
-            )
+            key = self._secret(platforms["abuseipdb"].get("credential_env", ""))
             if key:
                 self._clients["abuseipdb"] = AbuseIPDBClient(key)
 
         if platforms.get("shodan", {}).get("enabled"):
-            key = os.environ.get(
-                platforms["shodan"].get("credential_env", ""), ""
-            )
+            key = self._secret(platforms["shodan"].get("credential_env", ""))
             if key:
                 self._clients["shodan"] = ShodanClient(key)
 
         if platforms.get("urlscan", {}).get("enabled"):
-            key = os.environ.get(
-                platforms["urlscan"].get("credential_env", ""), ""
-            )
+            key = self._secret(platforms["urlscan"].get("credential_env", ""))
             self._clients["urlscan"] = URLScanClient(key or None)
 
         if platforms.get("hybrid_analysis", {}).get("enabled"):
-            key = os.environ.get(
-                platforms["hybrid_analysis"].get("credential_env", ""), ""
-            )
+            key = self._secret(platforms["hybrid_analysis"].get("credential_env", ""))
             if key:
                 self._clients["hybrid-analysis"] = HybridAnalysisClient(key)
 
         if platforms.get("phishtank", {}).get("enabled"):
-            key = os.environ.get(
-                platforms["phishtank"].get("credential_env", ""), ""
-            )
+            key = self._secret(platforms["phishtank"].get("credential_env", ""))
             self._clients["phishtank"] = PhishTankClient(key or None)
 
         if platforms.get("cortex", {}).get("enabled"):
-            key = os.environ.get(
-                platforms["cortex"].get("credential_env", ""), ""
-            )
+            key = self._secret(platforms["cortex"].get("credential_env", ""))
             base_url = platforms["cortex"].get("base_url", "")
             if key and base_url:
                 from .cortex import CortexClient
                 self._clients["cortex"] = CortexClient(base_url, key)
 
         if platforms.get("misp", {}).get("enabled"):
-            key = os.environ.get(platforms["misp"].get("credential_env", ""), "")
+            key = self._secret(platforms["misp"].get("credential_env", ""))
             base_url = platforms["misp"].get("base_url", "")
             if key and base_url:
                 self._clients["misp"] = MISPClient(base_url, key)

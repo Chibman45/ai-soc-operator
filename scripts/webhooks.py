@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from flask import Blueprint, jsonify, request
+from web.security import current_org_id, session_or_api_scope
 
 try:
     from .common import audit, utc_now
@@ -21,6 +22,7 @@ webhooks_bp = Blueprint("webhooks", __name__, url_prefix="/api/webhooks")
 
 
 @webhooks_bp.route("/wazuh", methods=["POST"])
+@session_or_api_scope("alert.ingest")
 def webhook_wazuh():
     """Receive alerts from Wazuh webhook.
     
@@ -54,6 +56,7 @@ def webhook_wazuh():
 
 
 @webhooks_bp.route("/generic", methods=["POST"])
+@session_or_api_scope("alert.ingest")
 def webhook_generic():
     """Receive generic JSON alerts.
     
@@ -110,11 +113,13 @@ def _route_alert(source: str, payload: dict[str, Any]) -> tuple[Any, int]:
         conn = get_db()
         try:
             init_feature_db(conn)
+            org_id = getattr(request, "api_org_id", None) or current_org_id(conn)
             result = ingest_alert_record(
                 conn,
                 source=source,
                 source_alert_id=source_alert_id,
                 payload=payload,
+                org_id=org_id,
             )
         finally:
             conn.close()

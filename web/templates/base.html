@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>{% block title %}AI SOC Operator{% endblock %}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
@@ -40,7 +41,10 @@
             </nav>
             <div class="p-4 border-t border-gray-800">
                 <div class="text-xs text-gray-500">{{ session.get('username', 'user') }}</div>
-                <a href="{{ url_for('logout') }}" class="text-xs text-red-400 hover:text-red-300">Logout</a>
+                <form method="POST" action="{{ url_for('logout') }}" class="mt-1">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="text-xs text-red-400 hover:text-red-300">Logout</button>
+                </form>
             </div>
         </aside>
         {% endif %}
@@ -72,6 +76,20 @@
         {% include "copilot_widget.html" %}
     {% endif %}
 
+    <script>
+    // Centralize the browser-side CSRF boundary so every same-origin mutation carries the token.
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (input, init = {}) => {
+        const method = String(init.method || 'GET').toUpperCase();
+        const url = typeof input === 'string' ? input : input.url;
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && new URL(url, window.location.href).origin === window.location.origin) {
+            const headers = new Headers(init.headers || {});
+            headers.set('X-CSRF-Token', document.querySelector('meta[name="csrf-token"]').content);
+            init = {...init, headers};
+        }
+        return nativeFetch(input, init);
+    };
+    </script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

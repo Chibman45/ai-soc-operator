@@ -6,7 +6,8 @@ import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from flask import Blueprint, jsonify, make_response, session
+from flask import Blueprint, jsonify, make_response
+from web.security import current_org_id, permission_required
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -20,16 +21,6 @@ def _get_db():
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def _login_required(f):
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user_id" not in session:
-            return jsonify({"error": "unauthorized"}), 401
-        return f(*args, **kwargs)
-    return decorated
 
 
 def _generate_markdown(case, activity, chat_history) -> str:
@@ -146,10 +137,11 @@ def _markdown_to_pdf(md_content: str) -> bytes:
 
 
 @export_bp.get("/<int:case_id>/export/md")
-@_login_required
+@permission_required("report.export")
 def export_markdown(case_id: int):
     conn = _get_db()
-    case = conn.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
+    org_id = current_org_id(conn)
+    case = conn.execute("SELECT * FROM cases WHERE id = ? AND org_id = ?", (case_id, org_id)).fetchone()
     if not case:
         conn.close()
         return jsonify({"error": "not found"}), 404
@@ -181,10 +173,11 @@ def export_markdown(case_id: int):
 
 
 @export_bp.get("/<int:case_id>/export/pdf")
-@_login_required
+@permission_required("report.export")
 def export_pdf(case_id: int):
     conn = _get_db()
-    case = conn.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
+    org_id = current_org_id(conn)
+    case = conn.execute("SELECT * FROM cases WHERE id = ? AND org_id = ?", (case_id, org_id)).fetchone()
     if not case:
         conn.close()
         return jsonify({"error": "not found"}), 404
@@ -221,4 +214,26 @@ def export_pdf(case_id: int):
     response = make_response(pdf_bytes)
     response.headers["Content-Type"] = content_type
     response.headers["Content-Disposition"] = f'attachment; filename="report-{case_id}.{ext}"'
+    return response
+
+
+@export_bp.get("/<int:case_id>/export/stix")
+@permission_required("report.export")
+def export_stix(case_id: int):
+    conn = _get_db()
+    org_id = current_org_id(conn)
+    case = conn.execute("SELECT * FROM cases WHERE id = ? AND org_id = ?", (case_id, org_id)).fetchone()
+    if not case:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    observables = conn.execute(
+        "SELECT * FROM observables WHERE case_id = ? AND org_id = ? ORDER BY created_at",
+        (case_id, org_id),
+    ).fetchall()
+    conn.close()
+    from web.services.intel_export import stix_json_for_case
+
+    response = make_response(stix_json_for_case(dict(case), [dict(row) for row in observables]))
+    response.headers["Content-Type"] = "application/stix+json; charset=utf-8"
+    response.headers["Content-Disposition"] = f'attachment; filename="case-{case_id}.stix.json"'
     return response

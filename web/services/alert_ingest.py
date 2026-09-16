@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,8 @@ SUPPORTED_SOURCES = {"generic", "manual", "wazuh", "elastic", "elasticsearch"}
 def normalize_alert(source: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize SIEM-specific payloads into the internal alert shape."""
     source_key = (source or "generic").lower()
+    if source_key not in SUPPORTED_SOURCES:
+        raise ValueError(f"Unsupported alert source: {source_key}")
     if source_key == "wazuh":
         return _normalize_wazuh(payload)
     if source_key in {"elastic", "elasticsearch"}:
@@ -57,6 +60,12 @@ def ingest_alert_record(
     """Store an alert, correlate IOCs, select playbook, and optionally queue it."""
     from web.app import job_queue, load_config_for_web, _execute_run_job
 
+    if org_id is None:
+        raise ValueError("organization context is required for alert ingestion")
+    if not isinstance(payload, dict):
+        raise ValueError("alert payload must be a JSON object")
+    if len(json.dumps(payload)) > 4 * 1024 * 1024:
+        raise ValueError("alert payload exceeds the 4 MiB normalized limit")
     normalized = normalize_alert(source, payload)
     observables = observables_from_alert(normalized, supplied_observables)
     playbook_path = auto_select_playbook(normalized, ROOT / "playbooks")
@@ -64,26 +73,40 @@ def ingest_alert_record(
 
     linked_case_id = find_correlated_case(conn, observables, org_id=org_id)
     status = "linked" if linked_case_id else ("queued" if playbook_path else "new")
-    cursor = conn.execute(
-        """
-        INSERT INTO alerts
-            (org_id, source, source_alert_id, case_id, title, severity, raw_payload,
-             normalized_payload, status, selected_playbook, queued_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """,
-        (
-            org_id,
-            source,
-            source_alert_id,
-            linked_case_id,
-            normalized.get("title", "Untitled alert"),
-            normalized.get("severity", "medium"),
-            json.dumps(payload, sort_keys=True),
-            json.dumps(normalized, sort_keys=True),
-            status,
-            selected_playbook,
-        ),
-    )
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO alerts
+                (org_id, source, source_alert_id, case_id, title, severity, raw_payload,
+                 normalized_payload, status, selected_playbook, queued_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                org_id,
+                source,
+                source_alert_id,
+                linked_case_id,
+                normalized.get("title", "Untitled alert"),
+                normalized.get("severity", "medium"),
+                json.dumps(payload, sort_keys=True),
+                json.dumps(normalized, sort_keys=True),
+                status,
+                selected_playbook,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        existing = conn.execute(
+            "SELECT id, case_id, job_id, status, selected_playbook FROM alerts WHERE org_id = ? AND source = ? AND source_alert_id = ?",
+            (org_id, source, source_alert_id),
+        ).fetchone()
+        if not existing:
+            raise
+        return {
+            "alert_id": int(existing["id"]), "case_id": existing["case_id"],
+            "job_id": existing["job_id"], "status": existing["status"],
+            "playbook": existing["selected_playbook"], "normalized": normalized,
+            "observables": observables, "duplicate": True,
+        }
     alert_id = int(cursor.lastrowid)
     for obs in observables:
         upsert_observable(
@@ -102,16 +125,19 @@ def ingest_alert_record(
 
     job_id = None
     if playbook_path and not linked_case_id:
-        config = load_config_for_web()
+        config = load_config_for_web(org_id)
+        job_key = f"alert:{org_id}:{source}:{source_alert_id or alert_id}"
         job_id = job_queue.create_job(
             run_id=0,
             playbook_path=str(playbook_path),
             alert=normalized,
             config=config,
+            org_id=org_id,
+            idempotency_key=job_key,
         )
         conn.execute(
-            "UPDATE alerts SET job_id = ?, status = 'queued' WHERE id = ?",
-            (job_id, alert_id),
+            "UPDATE alerts SET job_id = ?, status = 'queued' WHERE id = ? AND org_id = ?",
+            (job_id, alert_id, org_id),
         )
         conn.commit()
 
@@ -128,34 +154,35 @@ def ingest_alert_record(
                     selected_playbook or playbook_path.name,
                     alert_id,
                     source,
+                    org_id,
                 )
-                wconn.execute("UPDATE jobs SET run_id = ? WHERE id = ?", (run_id, job_id))
-                wconn.execute("UPDATE alerts SET status = 'running' WHERE id = ?", (alert_id,))
+                wconn.execute("UPDATE jobs SET run_id = ? WHERE id = ? AND org_id = ?", (run_id, job_id, org_id))
+                wconn.execute("UPDATE alerts SET status = 'running' WHERE id = ? AND org_id = ?", (alert_id, org_id))
                 wconn.commit()
                 try:
-                    result = _execute_run_job(run_id, playbook_path, alert_data, config, progress_cb)
+                    result = _execute_run_job(run_id, playbook_path, alert_data, config, progress_cb, int(org_id or 0))
                     case = wconn.execute(
-                        "SELECT id FROM cases WHERE run_id = ? ORDER BY id DESC LIMIT 1",
-                        (run_id,),
+                        "SELECT id FROM cases WHERE run_id = ? AND org_id = ? ORDER BY id DESC LIMIT 1",
+                        (run_id, org_id),
                     ).fetchone()
                     case_id = case["id"] if case else None
                     wconn.execute(
                         """
                         UPDATE alerts
                         SET status = 'case_created', case_id = ?, first_response_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
+                        WHERE id = ? AND org_id = ?
                         """,
-                        (case_id, alert_id),
+                        (case_id, alert_id, org_id),
                     )
                     if case_id:
                         wconn.execute(
-                            "UPDATE observables SET case_id = ? WHERE alert_id = ? AND case_id IS NULL",
-                            (case_id, alert_id),
+                            "UPDATE observables SET case_id = ? WHERE alert_id = ? AND org_id = ? AND case_id IS NULL",
+                            (case_id, alert_id, org_id),
                         )
                     wconn.commit()
                     return result
                 except Exception:
-                    wconn.execute("UPDATE alerts SET status = 'failed' WHERE id = ?", (alert_id,))
+                    wconn.execute("UPDATE alerts SET status = 'failed' WHERE id = ? AND org_id = ?", (alert_id, org_id))
                     wconn.commit()
                     raise
             finally:
@@ -163,7 +190,7 @@ def ingest_alert_record(
 
         job_queue.execute_job(job_id, execute)
 
-    learn_alert(normalized, source=source, playbook=selected_playbook)
+    learn_alert(normalized, source=source, playbook=selected_playbook, org_id=org_id)
     audit(
         "alert_ingested",
         source=source,
@@ -189,14 +216,19 @@ def find_correlated_case(
     observables: list[dict[str, str]],
     org_id: int | None = None,
 ) -> int | None:
+    if org_id is None:
+        raise ValueError("organization context is required for IOC correlation")
     for obs in observables:
-        query = "SELECT case_id FROM observables WHERE type = ? AND value = ? AND case_id IS NOT NULL"
-        params: list[Any] = [obs.get("type", ""), obs.get("value", "")]
-        if org_id is not None:
-            query += " AND (org_id = ? OR org_id IS NULL)"
-            params.append(org_id)
-        query += " ORDER BY last_seen DESC LIMIT 1"
-        row = conn.execute(query, params).fetchone()
+        # Correlation is a tenant boundary: legacy NULL rows must never bridge
+        # organizations, even when their IOC values are identical.
+        row = conn.execute(
+            """
+            SELECT case_id FROM observables
+            WHERE org_id = ? AND type = ? AND value = ? AND case_id IS NOT NULL
+            ORDER BY last_seen DESC LIMIT 1
+            """,
+            (org_id, obs.get("type", ""), obs.get("value", "")),
+        ).fetchone()
         if row:
             return int(row["case_id"])
     return None
@@ -213,14 +245,16 @@ def upsert_observable(
     org_id: int | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> None:
+    if org_id is None:
+        raise ValueError("organization context is required for observable storage")
     existing = conn.execute(
         """
         SELECT id FROM observables
-        WHERE type = ? AND value = ? AND IFNULL(case_id, 0) = IFNULL(?, 0)
+        WHERE org_id = ? AND type = ? AND value = ? AND IFNULL(case_id, 0) = IFNULL(?, 0)
           AND IFNULL(alert_id, 0) = IFNULL(?, 0)
         LIMIT 1
         """,
-        (obs_type, value, case_id, alert_id),
+        (org_id, obs_type, value, case_id, alert_id),
     ).fetchone()
     if existing:
         conn.execute(
@@ -238,15 +272,15 @@ def upsert_observable(
     )
 
 
-def _create_run_for_ingested_alert(conn, playbook: str, alert_id: int, source: str) -> int:
+def _create_run_for_ingested_alert(conn, playbook: str, alert_id: int, source: str, org_id: int | None) -> int:
     cursor = conn.execute(
-        "INSERT INTO runs (playbook, alert_file, status) VALUES (?, ?, 'running')",
-        (playbook, f"ingested-alert:{alert_id}"),
+        "INSERT INTO runs (org_id, idempotency_key, playbook, alert_file, status) VALUES (?, ?, ?, ?, 'running')",
+        (org_id, f"ingested-alert:{alert_id}", playbook, f"ingested-alert:{alert_id}"),
     )
     run_id = int(cursor.lastrowid)
     conn.execute(
-        "INSERT INTO activity_log (run_id, step, status, detail) VALUES (?, 'ingest', 'running', ?)",
-        (run_id, f"Queued from {source} alert {alert_id}"),
+        "INSERT INTO activity_log (org_id, run_id, step, status, detail) VALUES (?, ?, 'ingest', 'running', ?)",
+        (org_id, run_id, f"Queued from {source} alert {alert_id}"),
     )
     return run_id
 

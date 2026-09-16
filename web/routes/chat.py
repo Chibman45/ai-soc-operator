@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import ipaddress
+import re
 from pathlib import Path
+from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request, session
+from web.security import current_org_id, permission_required
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -25,18 +29,94 @@ def _init_chat(conn):
     init_chat_db(conn)
 
 
-def _login_required(f):
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user_id" not in session:
-            return jsonify({"error": "unauthorized"}), 401
-        return f(*args, **kwargs)
-    return decorated
+_login_required = permission_required("chat.read")
+
+
+def _case_in_org(conn, case_id: int, org_id: int) -> bool:
+    return case_id == 0 or conn.execute(
+        "SELECT 1 FROM cases WHERE id = ? AND org_id = ?", (case_id, org_id)
+    ).fetchone() is not None
+
+
+def _action_requires_approval(action: dict) -> bool:
+    """Derive approval policy server-side; clients and model output are untrusted."""
+    if action.get("action_type", "tool_execution") == "tool_execution":
+        from web.services.chat import ALLOWED_TOOLS
+
+        tool = ALLOWED_TOOLS.get(action.get("tool_name"))
+        return True if tool is None else bool(tool["approval"])
+    return bool(action.get("requires_approval", True))
+
+
+_NETWORK_TOOLS = {"whois", "dig", "nslookup", "host", "curl", "nmap", "whatweb"}
+_FILE_TOOLS = {"grep", "rg", "awk", "sed", "jq", "cat", "head", "tail", "strings", "file", "sha256sum", "md5sum", "sqlite3", "yara", "exiftool", "binwalk"}
+_DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.IGNORECASE)
+
+
+def _tool_scope_target(conn, case_id: int, org_id: int, tool_name: str, args: list[str]) -> str:
+    """Return an audited target label after enforcing case and filesystem scope."""
+    if tool_name in _NETWORK_TOOLS:
+        if case_id == GLOBAL_CASE_ID:
+            rows = conn.execute("SELECT DISTINCT value FROM observables WHERE org_id = ?", (org_id,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT value FROM observables WHERE org_id = ? AND case_id = ?",
+                (org_id, case_id),
+            ).fetchall()
+        allowed = {str(row["value"]).strip().lower() for row in rows}
+        targets: list[str] = []
+        for raw in args:
+            value = str(raw).strip()
+            if not value or value.startswith("-"):
+                continue
+            parsed = urlparse(value if "://" in value else f"//{value}")
+            candidate = (parsed.hostname or value).strip("[]").lower()
+            base_candidate = candidate.split("/", 1)[0]
+            try:
+                ipaddress.ip_network(candidate, strict=False)
+                targets.append(candidate)
+            except ValueError:
+                if _DOMAIN_RE.fullmatch(base_candidate):
+                    targets.append(base_candidate)
+        if not targets or any(target not in allowed for target in targets):
+            raise PermissionError("tool target is not an observable in the authorized case scope")
+        return ",".join(sorted(set(targets)))
+
+    if tool_name in _FILE_TOOLS:
+        allowed_roots = [(ROOT / name).resolve() for name in ("evidence", "reports", "outputs", "scans")]
+        paths = []
+        for raw in args:
+            value = str(raw).strip()
+            if not value or value.startswith("-") or value in {".", ".."}:
+                continue
+            candidate = Path(value)
+            if not candidate.is_absolute() and not any(separator in value for separator in ("/", "\\")):
+                continue
+            resolved = (candidate if candidate.is_absolute() else ROOT / candidate).resolve()
+            if not any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots):
+                raise PermissionError("tool file path is outside approved evidence and report roots")
+            paths.append(str(resolved))
+        return ",".join(paths) or "local-approved-data"
+
+    return "local-host"
+
+
+def _execute_audited_tool(executor, tool_name: str, args: list[str], timeout: int, target: str) -> dict:
+    from scripts.common import Session, safe_name
+
+    operation = Session(mode="chat-tool", target=target, purpose=f"Approved {tool_name} investigation")
+    try:
+        result = executor(tool_name, args, timeout=timeout)
+        artifact = operation.path("evidence") / f"{safe_name(tool_name)}-result.json"
+        artifact.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        operation.note("Tool Result", {"Tool": tool_name, "Status": result.get("status"), "Artifact": str(artifact)})
+        return {**result, "session_id": operation.session_id}
+    finally:
+        operation.finish()
 
 
 @chat_bp.post("/<int:case_id>")
-@_login_required
+@permission_required("chat.act")
 def chat_post(case_id: int):
     from web.services.chat import build_chat_context, chat_completion
 
@@ -47,16 +127,20 @@ def chat_post(case_id: int):
 
     conn = _get_db()
     _init_chat(conn)
+    org_id = int(current_org_id(conn))
+    if not _case_in_org(conn, case_id, org_id):
+        conn.close()
+        return jsonify({"error": "not found"}), 404
 
     # Get or create thread
     thread = conn.execute(
-        "SELECT * FROM chat_threads WHERE case_id = ? AND closed = 0 ORDER BY updated_at DESC LIMIT 1",
-        (case_id,),
+        "SELECT * FROM chat_threads WHERE case_id = ? AND org_id = ? AND closed = 0 ORDER BY updated_at DESC LIMIT 1",
+        (case_id, org_id),
     ).fetchone()
     if not thread:
         cursor = conn.execute(
-            "INSERT INTO chat_threads (case_id, title, created_by) VALUES (?, 'SOC Copilot', ?)",
-            (case_id, session["user_id"]),
+            "INSERT INTO chat_threads (case_id, title, created_by, org_id) VALUES (?, 'SOC Copilot', ?, ?)",
+            (case_id, session["user_id"], org_id),
         )
         conn.commit()
         thread = conn.execute("SELECT * FROM chat_threads WHERE id = ?", (cursor.lastrowid,)).fetchone()
@@ -90,8 +174,10 @@ def chat_post(case_id: int):
     # Save suggested actions
     suggested = response.get("suggested_actions", [])
     for action in suggested:
+        requires_approval = _action_requires_approval(action)
+        action["requires_approval"] = requires_approval
         conn.execute(
-            "INSERT INTO chat_actions (thread_id, case_id, action_type, label, description, tool_name, tool_args_json, requires_approval, status, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)",
+            "INSERT INTO chat_actions (thread_id, case_id, action_type, label, description, tool_name, tool_args_json, requires_approval, status, requested_by, org_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)",
             (
                 thread["id"], case_id,
                 action.get("action_type", "tool_execution"),
@@ -99,8 +185,9 @@ def chat_post(case_id: int):
                 action.get("description", ""),
                 action.get("tool_name"),
                 json.dumps(action.get("tool_args", {})),
-                1 if action.get("requires_approval", True) else 0,
+                1 if requires_approval else 0,
                 session["user_id"],
+                org_id,
             ),
         )
 
@@ -124,10 +211,14 @@ def chat_post(case_id: int):
 def chat_history(case_id: int):
     conn = _get_db()
     _init_chat(conn)
+    org_id = int(current_org_id(conn))
+    if not _case_in_org(conn, case_id, org_id):
+        conn.close()
+        return jsonify({"error": "not found"}), 404
 
     thread = conn.execute(
-        "SELECT * FROM chat_threads WHERE case_id = ? ORDER BY updated_at DESC LIMIT 1",
-        (case_id,),
+        "SELECT * FROM chat_threads WHERE case_id = ? AND org_id = ? ORDER BY updated_at DESC LIMIT 1",
+        (case_id, org_id),
     ).fetchone()
 
     if not thread:
@@ -166,34 +257,56 @@ def chat_history(case_id: int):
 
 
 @chat_bp.post("/<int:case_id>/action/<int:action_id>/approve")
-@_login_required
+@permission_required("responder.approve")
 def chat_action_approve(case_id: int, action_id: int):
     from web.services.chat import execute_tool, execute_enrichment
 
     conn = _get_db()
     _init_chat(conn)
+    org_id = int(current_org_id(conn))
 
     action = conn.execute(
-        "SELECT * FROM chat_actions WHERE id = ? AND case_id = ?", (action_id, case_id)
+        "SELECT * FROM chat_actions WHERE id = ? AND case_id = ? AND org_id = ?", (action_id, case_id, org_id)
     ).fetchone()
     if not action:
         conn.close()
         return jsonify({"error": "not found"}), 404
 
-    conn.execute(
-        "UPDATE chat_actions SET status = 'approved', approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (session["user_id"], action_id),
-    )
+    if action["requires_approval"] and action["requested_by"] == session["user_id"]:
+        conn.close()
+        return jsonify({"error": "requester cannot approve their own action"}), 403
+
+    tool_args = json.loads(action["tool_args_json"] or "{}")
+    scoped_target = None
+    if action["action_type"] == "tool_execution" and action["tool_name"]:
+        try:
+            scoped_target = _tool_scope_target(conn, case_id, org_id, action["tool_name"], tool_args.get("args", []))
+        except PermissionError as exc:
+            conn.close()
+            return jsonify({"error": str(exc)}), 403
+
+    # The status predicate is the replay guard: only one request can claim and
+    # execute a proposed action, including under concurrent approvals.
+    claimed = conn.execute(
+        """
+        UPDATE chat_actions
+        SET status = 'approved', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND org_id = ? AND status = 'proposed'
+        """,
+        (session["user_id"], action_id, org_id),
+    ).rowcount
+    if not claimed:
+        conn.close()
+        return jsonify({"error": "action is no longer awaiting approval"}), 409
     conn.commit()
 
     # Execute tool if applicable
     result = None
     final_status = "approved"
     if action["action_type"] == "tool_execution" and action["tool_name"]:
-        tool_args = json.loads(action["tool_args_json"] or "{}")
         args = tool_args.get("args", [])
         timeout = tool_args.get("timeout_seconds", 30)
-        result = execute_tool(action["tool_name"], args, timeout=timeout)
+        result = _execute_audited_tool(execute_tool, action["tool_name"], args, timeout, scoped_target or "local-host")
         final_status = result["status"]
 
         conn.execute(
@@ -224,23 +337,27 @@ def chat_action_approve(case_id: int, action_id: int):
 
 
 @chat_bp.post("/<int:case_id>/action/<int:action_id>/reject")
-@_login_required
+@permission_required("responder.approve")
 def chat_action_reject(case_id: int, action_id: int):
     reason = request.json.get("reason", "") if request.is_json else ""
     conn = _get_db()
     _init_chat(conn)
+    org_id = int(current_org_id(conn))
 
-    conn.execute(
-        "UPDATE chat_actions SET status = 'rejected', approved_by = ?, approved_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ? AND case_id = ?",
-        (session["user_id"], json.dumps({"reason": reason}), action_id, case_id),
-    )
+    rejected = conn.execute(
+        "UPDATE chat_actions SET status = 'rejected', approved_by = ?, approved_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ? AND case_id = ? AND org_id = ? AND status = 'proposed'",
+        (session["user_id"], json.dumps({"reason": reason}), action_id, case_id, org_id),
+    ).rowcount
+    if not rejected:
+        conn.close()
+        return jsonify({"error": "action is no longer awaiting approval"}), 409
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "status": "rejected"})
 
 
 @chat_bp.post("/<int:case_id>/execute")
-@_login_required
+@permission_required("tool.execute")
 def chat_execute_direct(case_id: int):
     from web.services.chat import validate_command, execute_tool
 
@@ -249,11 +366,28 @@ def chat_execute_direct(case_id: int):
     args = payload.get("args", [])
     timeout = payload.get("timeout_seconds", 30)
 
+    conn = _get_db()
+    _init_chat(conn)
+    org_id = int(current_org_id(conn))
+    if not _case_in_org(conn, case_id, org_id):
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+
+    try:
+        scoped_target = _tool_scope_target(conn, case_id, org_id, tool_name, args)
+    except PermissionError as exc:
+        conn.close()
+        return jsonify({"ok": False, "error": str(exc)}), 403
+    conn.close()
+
     allowed, reason = validate_command(tool_name, args)
     if not allowed:
         return jsonify({"ok": False, "error": reason}), 400
+    from web.services.chat import ALLOWED_TOOLS
+    if ALLOWED_TOOLS[tool_name]["approval"]:
+        return jsonify({"ok": False, "error": "This tool requires a proposed action and independent approval"}), 409
 
-    result = execute_tool(tool_name, args, timeout=timeout)
+    result = _execute_audited_tool(execute_tool, tool_name, args, timeout, scoped_target)
 
     conn = _get_db()
     _init_chat(conn)
@@ -268,7 +402,7 @@ def chat_execute_direct(case_id: int):
 
 
 @chat_bp.post("/<int:case_id>/action")
-@_login_required
+@permission_required("chat.act")
 def chat_action_create(case_id: int):
     """Create a proposed action from the chat UI (previously missing route).
 
@@ -279,21 +413,25 @@ def chat_action_create(case_id: int):
     payload = request.get_json(force=True) or {}
     conn = _get_db()
     _init_chat(conn)
+    org_id = int(current_org_id(conn))
+    if not _case_in_org(conn, case_id, org_id):
+        conn.close()
+        return jsonify({"error": "not found"}), 404
 
     thread = conn.execute(
-        "SELECT * FROM chat_threads WHERE case_id = ? AND closed = 0 ORDER BY updated_at DESC LIMIT 1",
-        (case_id,),
+        "SELECT * FROM chat_threads WHERE case_id = ? AND org_id = ? AND closed = 0 ORDER BY updated_at DESC LIMIT 1",
+        (case_id, org_id),
     ).fetchone()
     if not thread:
         cursor = conn.execute(
-            "INSERT INTO chat_threads (case_id, title, created_by) VALUES (?, 'SOC Copilot', ?)",
-            (case_id, session["user_id"]),
+            "INSERT INTO chat_threads (case_id, title, created_by, org_id) VALUES (?, 'SOC Copilot', ?, ?)",
+            (case_id, session["user_id"], org_id),
         )
         conn.commit()
         thread = conn.execute("SELECT * FROM chat_threads WHERE id = ?", (cursor.lastrowid,)).fetchone()
 
     cursor = conn.execute(
-        "INSERT INTO chat_actions (thread_id, case_id, action_type, label, description, tool_name, tool_args_json, requires_approval, status, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)",
+        "INSERT INTO chat_actions (thread_id, case_id, action_type, label, description, tool_name, tool_args_json, requires_approval, status, requested_by, org_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)",
         (
             thread["id"], case_id,
             payload.get("action_type", "tool_execution"),
@@ -301,8 +439,9 @@ def chat_action_create(case_id: int):
             payload.get("description", ""),
             payload.get("tool_name"),
             json.dumps(payload.get("tool_args", {})),
-            1 if payload.get("requires_approval", True) else 0,
+            1 if _action_requires_approval(payload) else 0,
             session["user_id"],
+            org_id,
         ),
     )
     conn.commit()
@@ -321,7 +460,7 @@ GLOBAL_CASE_ID = 0
 
 
 @chat_bp.post("/global")
-@_login_required
+@permission_required("chat.act")
 def chat_global_post():
     from web.services.chat import build_global_context, chat_completion
 
@@ -332,15 +471,16 @@ def chat_global_post():
 
     conn = _get_db()
     _init_chat(conn)
+    org_id = int(current_org_id(conn))
 
     thread = conn.execute(
-        "SELECT * FROM chat_threads WHERE case_id = ? AND closed = 0 ORDER BY updated_at DESC LIMIT 1",
-        (GLOBAL_CASE_ID,),
+        "SELECT * FROM chat_threads WHERE case_id = ? AND org_id = ? AND closed = 0 ORDER BY updated_at DESC LIMIT 1",
+        (GLOBAL_CASE_ID, org_id),
     ).fetchone()
     if not thread:
         cursor = conn.execute(
-            "INSERT INTO chat_threads (case_id, title, created_by) VALUES (?, 'Dashboard Copilot', ?)",
-            (GLOBAL_CASE_ID, session["user_id"]),
+            "INSERT INTO chat_threads (case_id, title, created_by, org_id) VALUES (?, 'Dashboard Copilot', ?, ?)",
+            (GLOBAL_CASE_ID, session["user_id"], org_id),
         )
         conn.commit()
         thread = conn.execute("SELECT * FROM chat_threads WHERE id = ?", (cursor.lastrowid,)).fetchone()
@@ -351,7 +491,7 @@ def chat_global_post():
     )
     conn.commit()
 
-    context = build_global_context(conn, user_message)
+    context = build_global_context(conn, user_message, org_id=org_id)
     history_rows = conn.execute(
         "SELECT * FROM chat_messages WHERE thread_id = ? ORDER BY created_at ASC",
         (thread["id"],),
@@ -370,8 +510,10 @@ def chat_global_post():
 
     suggested = response.get("suggested_actions", [])
     for action in suggested:
+        requires_approval = _action_requires_approval(action)
+        action["requires_approval"] = requires_approval
         conn.execute(
-            "INSERT INTO chat_actions (thread_id, case_id, action_type, label, description, tool_name, tool_args_json, requires_approval, status, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)",
+            "INSERT INTO chat_actions (thread_id, case_id, action_type, label, description, tool_name, tool_args_json, requires_approval, status, requested_by, org_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)",
             (
                 thread["id"], GLOBAL_CASE_ID,
                 action.get("action_type", "tool_execution"),
@@ -379,8 +521,9 @@ def chat_global_post():
                 action.get("description", ""),
                 action.get("tool_name"),
                 json.dumps(action.get("tool_args", {})),
-                1 if action.get("requires_approval", True) else 0,
+                1 if requires_approval else 0,
                 session["user_id"],
+                org_id,
             ),
         )
 
@@ -404,10 +547,11 @@ def chat_global_post():
 def chat_global_history():
     conn = _get_db()
     _init_chat(conn)
+    org_id = int(current_org_id(conn))
 
     thread = conn.execute(
-        "SELECT * FROM chat_threads WHERE case_id = ? ORDER BY updated_at DESC LIMIT 1",
-        (GLOBAL_CASE_ID,),
+        "SELECT * FROM chat_threads WHERE case_id = ? AND org_id = ? ORDER BY updated_at DESC LIMIT 1",
+        (GLOBAL_CASE_ID, org_id),
     ).fetchone()
 
     if not thread:
