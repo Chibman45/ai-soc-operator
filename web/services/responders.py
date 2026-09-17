@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ipaddress
 from datetime import datetime, timezone
 from typing import Any
 
@@ -173,7 +174,13 @@ def reject_responder_action(conn, action_id: int, rejected_by: int, org_id: int,
     return {"id": action_id, "status": "rejected"}
 
 
-def execute_responder_action(conn, action_id: int, org_id: int, real_execution_enabled: bool = False) -> dict[str, Any]:
+def execute_responder_action(
+    conn,
+    action_id: int,
+    org_id: int,
+    real_execution_enabled: bool = False,
+    live_executor=None,
+) -> dict[str, Any]:
     row = conn.execute("SELECT * FROM responder_actions WHERE id = ? AND org_id = ?", (action_id, org_id)).fetchone()
     if not row:
         raise ValueError("Responder action not found")
@@ -203,12 +210,20 @@ def execute_responder_action(conn, action_id: int, org_id: int, real_execution_e
         }
         status = "executed"
     else:
-        result = {
-            "executed": False,
-            "mode": "blocked",
-            "message": "No real responder adapter is configured.",
-        }
-        status = "failed"
+        try:
+            if row["action_type"] != "add_thehive_comment":
+                in_scope = conn.execute(
+                    "SELECT 1 FROM observables WHERE org_id = ? AND case_id = ? AND value = ? LIMIT 1",
+                    (org_id, row["case_id"], row["target"]),
+                ).fetchone()
+                if not in_scope:
+                    raise PermissionError("live responder target is not an observable on this case")
+            executor = live_executor or _execute_live_responder
+            result = executor(conn, row, org_id)
+            status = "executed"
+        except Exception as exc:
+            result = {"executed": False, "mode": "live", "message": str(exc)[:500]}
+            status = "failed"
     conn.execute(
         """
         UPDATE responder_actions
@@ -219,6 +234,94 @@ def execute_responder_action(conn, action_id: int, org_id: int, real_execution_e
     )
     audit("responder_action_execution_recorded", action_id=action_id, status=status)
     return {"id": action_id, "status": status, "result": result}
+
+
+def _execute_live_responder(conn, row, org_id: int) -> dict[str, Any]:
+    """Execute only adapters that have a concrete, tenant-scoped implementation."""
+    from scripts.orchestrator import build_clients
+    from web.app import load_config_for_web
+    from web.services.credential_vault import open_secret
+
+    credentials = {
+        item["key_name"]: open_secret(item["key_value"])
+        for item in conn.execute(
+            "SELECT key_name, key_value FROM credentials WHERE org_id = ?",
+            (org_id,),
+        ).fetchall()
+    }
+    clients = build_clients(load_config_for_web(org_id), credentials=credentials)
+    action_type = str(row["action_type"])
+    target = str(row["target"])
+    case = conn.execute(
+        "SELECT id, case_id, title FROM cases WHERE id = ? AND org_id = ?",
+        (row["case_id"], org_id),
+    ).fetchone()
+    if not case:
+        raise RuntimeError("the responder case is no longer available")
+
+    if action_type in {"add_thehive_comment", "add_thehive_observable"}:
+        client = clients.get("thehive")
+        external_case_id = str(case["case_id"] or "").strip()
+        if not client or not external_case_id:
+            raise RuntimeError("TheHive is not configured or the case has no TheHive id")
+        if action_type == "add_thehive_comment":
+            response = client.add_comment(external_case_id, target)
+        else:
+            response = client.add_observable(external_case_id, _thehive_data_type(target), target)
+        return {"executed": True, "mode": "live", "platform": "thehive", "response_id": _response_id(response)}
+
+    if action_type == "push_misp_indicator":
+        client = clients.get("misp")
+        if not client:
+            raise RuntimeError("MISP is not configured")
+        event = client.create_event(f"AI SOC case {case['id']}: {case['title']}")
+        event_id = _response_id(event)
+        if not event_id:
+            raise RuntimeError("MISP did not return an event id")
+        attribute = client.add_attribute(event_id, _misp_attribute_type(target), target)
+        return {
+            "executed": True,
+            "mode": "live",
+            "platform": "misp",
+            "event_id": event_id,
+            "attribute_id": _response_id(attribute),
+        }
+    raise RuntimeError("this responder does not have a live adapter")
+
+
+def _response_id(response: Any) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    candidates = [response, response.get("Event"), response.get("Attribute")]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("id") is not None:
+            return str(candidate["id"])
+    return None
+
+
+def _thehive_data_type(value: str) -> str:
+    kind = _ioc_kind(value)
+    return {"ip": "ip", "url": "url", "domain": "domain", "hash": "hash"}.get(kind, "other")
+
+
+def _misp_attribute_type(value: str) -> str:
+    kind = _ioc_kind(value)
+    return {"ip": "ip-dst", "url": "url", "domain": "domain", "hash": "sha256"}.get(kind, "text")
+
+
+def _ioc_kind(value: str) -> str:
+    try:
+        ipaddress.ip_address(value)
+        return "ip"
+    except ValueError:
+        pass
+    if value.startswith(("https://", "http://")):
+        return "url"
+    if len(value) == 64 and all(character in "0123456789abcdefABCDEF" for character in value):
+        return "hash"
+    if "." in value and " " not in value:
+        return "domain"
+    return "other"
 
 
 def _approval_digest(preview: dict[str, Any]) -> str:

@@ -1,6 +1,6 @@
 # Handoff — AI SOC Operator
 
-_Last updated: 2026-09-16_
+_Last updated: 2026-09-17_
 
 This document is a self-contained brief for the next agent/developer picking up
 this work. It covers **what the overall goal is**, **what has been implemented**,
@@ -8,26 +8,28 @@ this work. It covers **what the overall goal is**, **what has been implemented**
 
 ## Current release status
 
-Phases 0-7 of the production-hardening plan are implemented on
+Phases 0-10 now have a production-oriented single-node baseline on
 `codex/phase-0-7-production-hardening`. The release now includes centralized
 multi-role authorization, active organization isolation, CSRF and session
 hardening, encrypted stored credentials, authenticated alert ingestion, a live
 alert queue, SLA metrics, durable local job controls, approval-gated responder
-dry-runs, and reviewable self-learning promotion states.
+execution, notification delivery, verified backups, non-root containers, CI
+security checks, and reviewable self-learning promotion states.
 
-The full local test suite passes with **218 tests**. This is an application-level
-hardening milestone, not a claim of full production readiness. The remaining
-deployment and release gates are tracked in
+The full local test suite passes with **228 tests**. This is not a claim that a
+specific environment is production-approved. Remaining deployment evidence and
+scale-out work are tracked in
 [`docs/PRODUCTION_ROADMAP.md`](docs/PRODUCTION_ROADMAP.md):
 
-- Phase 8: notification delivery, SLA scheduling, and threat-intel delivery.
-- Phase 9: PostgreSQL/RLS, external workers, containers, TLS, rate limiting,
-  observability, backups, and disaster recovery.
-- Phase 10: CI/CD security gates, SBOM/provenance, staging, load, and rollback.
+- Provide managed TLS and secret storage in the target environment.
+- Run and record notification, restore, responder, staging soak, load, and rollback drills.
+- Migrate to PostgreSQL/RLS and Redis/Celery before multi-host scaling.
+- Pin third-party CI actions by immutable commit and curate a hashed Python lock file.
 
-The self-learning subsystem only creates redacted, reviewable drafts. It cannot
-autonomously install code, change permissions, publish playbooks, or bypass the
-evaluation, approval, shadow, canary, and rollback workflow.
+The self-learning subsystem creates redacted drafts and immutable capability
+proposals. After independent human approval, the worker may publish a canary
+skill, enable a catalogued responder, or run an allowlisted installer. It cannot
+approve itself, execute free-form shell commands, or bypass environment gates.
 
 ---
 

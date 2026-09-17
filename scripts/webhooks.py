@@ -8,10 +8,11 @@ Supports:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from flask import Blueprint, jsonify, request
-from web.security import current_org_id, session_or_api_scope
+from web.security import consume_rate_limit, current_org_id, session_or_api_scope
 
 try:
     from .common import audit, utc_now
@@ -114,6 +115,11 @@ def _route_alert(source: str, payload: dict[str, Any]) -> tuple[Any, int]:
         try:
             init_feature_db(conn)
             org_id = getattr(request, "api_org_id", None) or current_org_id(conn)
+            rate_limit = max(1, int(os.environ.get("AI_SOC_INGEST_RATE_PER_MINUTE", "120")))
+            identity = getattr(request, "api_client_id", None) or request.remote_addr or "session"
+            if not consume_rate_limit(conn, f"ingest:{org_id}:{identity}", rate_limit):
+                audit("alert_ingest_rate_limited", org_id=org_id, identity=str(identity))
+                return jsonify({"status": "error", "error": "ingestion rate limit exceeded"}), 429
             result = ingest_alert_record(
                 conn,
                 source=source,

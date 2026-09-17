@@ -17,6 +17,10 @@ class WebRouteRegistrationTests(unittest.TestCase):
         self.assertIn("/api/cases/<int:case_id>/export/stix", routes)
         self.assertIn("/api/cases/<int:case_id>/responders", routes)
         self.assertIn("/api/service-clients", routes)
+        self.assertIn("/api/capabilities/proposals", routes)
+        self.assertIn("/api/notifications", routes)
+        self.assertIn("/health/live", routes)
+        self.assertIn("/health/ready", routes)
 
 
 if __name__ == "__main__":

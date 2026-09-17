@@ -5,6 +5,7 @@ jinja2>=3.1.0
 python-dateutil>=2.8.0
 flask>=3.0.0
 cryptography>=42.0.0
+gunicorn>=22.0.0
 
 # Document parsing (playbook upload)
 pdfminer.six>=20221105

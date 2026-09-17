@@ -160,6 +160,27 @@ class MISPClient(PlatformClient):
     def event_search(self, body: dict[str, Any]) -> dict[str, Any]:
         return self.post("/events/restSearch", body=body)
 
+    def create_event(self, info: str) -> dict[str, Any]:
+        """Create a private MISP event for an explicitly approved export."""
+        return self.post(
+            "/events/add",
+            body={"Event": {"info": info, "distribution": 0, "threat_level_id": 2, "analysis": 1}},
+        )
+
+    def add_attribute(self, event_id: str, attribute_type: str, value: str) -> dict[str, Any]:
+        return self.post(
+            f"/attributes/add/{event_id}",
+            body={
+                "Attribute": {
+                    "type": attribute_type,
+                    "category": "Network activity" if attribute_type in {"ip-src", "ip-dst", "domain", "url"} else "Payload delivery",
+                    "value": value,
+                    "to_ids": True,
+                    "distribution": 0,
+                }
+            },
+        )
+
 
 class EnrichmentClient:
     """Unified enrichment interface across all threat intel platforms."""

@@ -7,6 +7,7 @@ import hmac
 import json
 import secrets
 import sqlite3
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
@@ -30,6 +31,28 @@ def get_security_db() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn
+
+
+def consume_rate_limit(conn: sqlite3.Connection, bucket_key: str, limit: int, window_seconds: int = 60) -> bool:
+    """Consume one database-backed request slot shared by all WSGI workers."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    window = datetime.fromtimestamp(now - (now % window_seconds), timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """
+        INSERT INTO api_rate_limits (bucket_key, window_start, request_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(bucket_key, window_start) DO UPDATE SET request_count = request_count + 1
+        """,
+        (bucket_key[:200], window),
+    )
+    count = conn.execute(
+        "SELECT request_count FROM api_rate_limits WHERE bucket_key = ? AND window_start = ?",
+        (bucket_key[:200], window),
+    ).fetchone()["request_count"]
+    # Opportunistic cleanup keeps this security table bounded.
+    conn.execute("DELETE FROM api_rate_limits WHERE window_start < datetime('now', '-1 day')")
+    conn.commit()
+    return int(count) <= max(1, limit)
 
 
 def csrf_token() -> str:

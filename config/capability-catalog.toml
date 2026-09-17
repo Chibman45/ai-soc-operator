@@ -1,0 +1,44 @@
+# Approved capability catalog. Learning output may reference only these IDs.
+# Installation remains disabled until an admin enables the matching environment
+# gate and a different authorized user approves the immutable proposal.
+
+[capabilities.jq]
+kind = "linux_package"
+package = "jq"
+reason = "Parse structured alert and enrichment JSON without shell string handling."
+risk = "Installs an operating-system package from the configured distro repository."
+
+[capabilities.yara]
+kind = "linux_package"
+package = "yara"
+reason = "Evaluate approved YARA rules against case evidence."
+risk = "Adds a native scanning tool that must remain constrained to evidence paths."
+
+[capabilities.tshark]
+kind = "linux_package"
+package = "tshark"
+reason = "Inspect packet captures attached to an authorized case."
+risk = "Packet tooling can expose sensitive traffic and requires scoped evidence handling."
+
+[capabilities.misp-push]
+kind = "responder_enable"
+responder = "push_misp_indicator"
+reason = "Publish an approved case indicator to the configured MISP instance."
+risk = "Creates threat-intelligence data on an external platform. Every action still requires case approval."
+
+[capabilities.thehive-comment]
+kind = "responder_enable"
+responder = "add_thehive_comment"
+reason = "Add an approved analyst note to the linked TheHive case."
+risk = "Writes case content to an external platform. Every action still requires case approval."
+
+# Python plugins require every transitive artifact and SHA-256 hash to be
+# listed before execution. The empty list intentionally makes this example
+# non-installable until an administrator curates it.
+[capabilities.stix2-plugin]
+kind = "python_plugin"
+package = "stix2"
+version = "3.0.1"
+requirements = []
+reason = "Validate and manipulate STIX 2.1 bundles with the standard library."
+risk = "Installs third-party Python code into the repository-local plugin directory."

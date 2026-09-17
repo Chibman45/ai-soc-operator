@@ -6,15 +6,15 @@ All platform credentials and connections are managed through a built-in web port
 
 ## Release Status
 
-Application hardening Phases 0-7 are implemented and covered by 218 tests. This
+Application hardening Phases 0-10 now have a single-node implementation baseline. This
 includes organization-scoped RBAC, authenticated SIEM ingestion, the live alert
 queue, SLA metrics, encrypted credentials, durable local jobs, approval-gated
-responder dry-runs, and controlled self-learning drafts.
+responder approvals, and controlled self-learning drafts and publication.
 
-This milestone is not yet the final production deployment. Notifications and
-intel delivery (Phase 8), PostgreSQL/external workers/containers/TLS/operations
-(Phase 9), and CI/CD release assurance (Phase 10) remain intentionally deferred.
-See [the production roadmap](docs/PRODUCTION_ROADMAP.md) and
+Phase 8 notification/intel delivery, Phase 9 container/operations controls, and
+Phase 10 CI release assurance are implemented, but production approval still
+depends on environment evidence. PostgreSQL/Redis remain the scale-out path.
+See [the production roadmap](docs/PRODUCTION_ROADMAP.md), [operations runbook](docs/OPERATIONS_RUNBOOK.md), and
 [security policy](SECURITY.md) before deploying beyond a controlled environment.
 
 ## Quick Start
@@ -174,7 +174,7 @@ Three playbooks are included: identity compromise, phishing response, and malwar
 - **Session management**: evidence, artifacts, and reports tied to session IDs
 - **No destructive commands**: `rm -rf`, `shred`, `mkfs`, etc. are blocked
 - **Credential isolation**: API keys are encrypted at rest in SQLite and are never written to generated config files or logs
-- **Controlled learning**: learning evidence is redacted and produces reviewable drafts only; publishing requires evaluation and staged human promotion
+- **Controlled learning**: learning evidence is redacted; skill publication, responder enablement, and allowlisted installs require an immutable proposal, an explanation, independent human approval, expiry, audit evidence, and explicit environment gates
 
 ## Project Structure
 

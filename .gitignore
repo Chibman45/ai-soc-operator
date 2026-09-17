@@ -25,6 +25,7 @@ config/scope.toml
 
 # Runtime artifacts
 audit/
+backups/
 evidence/
 outputs/
 scans/

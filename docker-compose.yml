@@ -1,0 +1,54 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    environment:
+      AI_SOC_ENV: production
+      AI_SOC_BIND: 0.0.0.0
+      AI_SOC_REQUIRE_WORKER: "1"
+      AI_SOC_SESSION_SECRET: ${AI_SOC_SESSION_SECRET:?set AI_SOC_SESSION_SECRET}
+      AI_SOC_CREDENTIAL_KEY: ${AI_SOC_CREDENTIAL_KEY:?set AI_SOC_CREDENTIAL_KEY}
+    ports:
+      - "127.0.0.1:${AI_SOC_PORT:-5051}:5000"
+    volumes: &soc_volumes
+      - soc_data:/app/data
+      - soc_audit:/app/audit
+      - soc_evidence:/app/evidence
+      - soc_reports:/app/reports/generated
+      - soc_backups:/app/backups
+      - soc_skills:/app/skills/generated
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "scripts.operations_worker", "--interval", "15"]
+    environment:
+      AI_SOC_ENV: production
+      AI_SOC_SESSION_SECRET: ${AI_SOC_SESSION_SECRET:?set AI_SOC_SESSION_SECRET}
+      AI_SOC_CREDENTIAL_KEY: ${AI_SOC_CREDENTIAL_KEY:?set AI_SOC_CREDENTIAL_KEY}
+      AI_SOC_SLACK_WEBHOOK_URL: ${AI_SOC_SLACK_WEBHOOK_URL:-}
+      AI_SOC_SMTP_HOST: ${AI_SOC_SMTP_HOST:-}
+      AI_SOC_NOTIFY_EMAIL_TO: ${AI_SOC_NOTIFY_EMAIL_TO:-}
+    volumes: *soc_volumes
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  soc_data:
+  soc_audit:
+  soc_evidence:
+  soc_reports:
+  soc_backups:
+  soc_skills:

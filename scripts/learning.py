@@ -1,13 +1,14 @@
 """Local learning store for playbook, case, and alert outcomes.
 
 The learning layer records operational patterns and creates reviewable Codex
-skill drafts. It does not auto-install skills or mutate playbooks.
+skill drafts. Publication is delegated to the approval-gated capability ledger.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 from collections import Counter
 from pathlib import Path
@@ -356,7 +357,10 @@ class LearningStore:
             "under_review": {"approved", "rejected"},
             "approved": {"shadow", "rejected"},
             "shadow": {"canary", "rolled_back"},
-            "canary": {"published", "rolled_back"},
+            # Publication has a dedicated method because it must atomically
+            # create an immutable capability proposal for independent review.
+            "canary": {"rolled_back"},
+            "publication_requested": {"rolled_back"},
             "published": {"rolled_back"},
             "rejected": set(),
             "rolled_back": set(),
@@ -364,7 +368,7 @@ class LearningStore:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT status FROM skill_suggestions WHERE id = ? AND org_id = ?",
+                "SELECT status, slug FROM skill_suggestions WHERE id = ? AND org_id = ?",
                 (suggestion_id, org_id),
             ).fetchone()
             if not row:
@@ -372,23 +376,85 @@ class LearningStore:
             current = str(row["status"])
             if status not in transitions.get(current, set()):
                 raise ValueError(f"Invalid learning transition: {current} -> {status}")
-            if status in {"approved", "shadow", "canary", "published"}:
+            if status in {"approved", "shadow", "canary", "publication_requested"}:
                 evaluation = conn.execute(
                     "SELECT passed FROM skill_evaluations WHERE suggestion_id = ? AND org_id = ? ORDER BY id DESC LIMIT 1",
                     (suggestion_id, org_id),
                 ).fetchone()
                 if not evaluation or not evaluation["passed"]:
                     raise PermissionError("A passing evaluation is required before promotion")
-            published_at = "CURRENT_TIMESTAMP" if status == "published" else "published_at"
+            if current == "published" and status == "rolled_back":
+                self._archive_published_skill(str(row["slug"]), suggestion_id)
             conn.execute(
-                f"UPDATE skill_suggestions SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP, published_at = {published_at}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (status, reviewed_by, suggestion_id),
+                "UPDATE skill_suggestions SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND org_id = ?",
+                (status, reviewed_by, suggestion_id, org_id),
             )
             conn.commit()
         finally:
             conn.close()
         audit("skill_suggestion_transitioned", suggestion_id=suggestion_id, org_id=org_id, status=status, reviewed_by=reviewed_by)
         return {"id": suggestion_id, "status": status}
+
+    def _archive_published_skill(self, slug: str, suggestion_id: int) -> None:
+        published_root = (ROOT / "skills" / "generated").resolve()
+        source = (published_root / slug).resolve()
+        if not source.is_relative_to(published_root):
+            raise PermissionError("published skill path escaped its controlled root")
+        if not source.exists():
+            return
+        archive_root = (ROOT / "data" / "learning" / "rolled_back").resolve()
+        archive_root.mkdir(parents=True, exist_ok=True)
+        destination = archive_root / f"{slug}-{suggestion_id}-{utc_now().replace(':', '')}"
+        # Moving the directory out of generated skills makes rollback effective
+        # immediately while retaining the exact artifact for audit and recovery.
+        shutil.move(str(source), str(destination))
+
+    def request_publication(
+        self,
+        suggestion_id: int,
+        *,
+        org_id: int,
+        requested_by: int | None = None,
+        source: str = "learning",
+    ) -> dict[str, Any]:
+        """Create a human-approved publication request for a canary skill."""
+        from web.services.capabilities import create_capability_proposal
+
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM skill_suggestions WHERE id = ? AND org_id = ?",
+                (suggestion_id, org_id),
+            ).fetchone()
+            if not row:
+                raise ValueError("Skill suggestion not found")
+            if row["status"] != "canary":
+                raise ValueError("Only a canary skill can request publication")
+            evaluation = conn.execute(
+                "SELECT passed FROM skill_evaluations WHERE suggestion_id = ? AND org_id = ? ORDER BY id DESC LIMIT 1",
+                (suggestion_id, org_id),
+            ).fetchone()
+            if not evaluation or not evaluation["passed"]:
+                raise PermissionError("A passing evaluation is required before publication request")
+            conn.execute(
+                "UPDATE skill_suggestions SET status = 'publication_requested', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND org_id = ? AND status = 'canary'",
+                (suggestion_id, org_id),
+            )
+            proposal = create_capability_proposal(
+                conn,
+                org_id=org_id,
+                kind="skill_publish",
+                target=str(row["slug"]),
+                reason=f"Publish evaluated canary skill: {row['title']}. {row['reason']}",
+                manifest={"suggestion_id": suggestion_id, "slug": row["slug"]},
+                requested_by=requested_by,
+                source=source,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("skill_publication_requested", suggestion_id=suggestion_id, org_id=org_id, proposal_id=proposal["id"])
+        return proposal
 
     def _write_skill_draft(
         self,
@@ -440,7 +506,7 @@ def _draft_skill_markdown(title: str, category: str, subject: str, reason: str) 
 name: {skill_name}
 description: >
   Draft skill suggested by AI SOC Operator learning events for {category}: {subject}.
-  Review, edit, and install manually before use.
+  Evaluate in shadow and canary modes before requesting approval to publish.
 ---
 
 # {title}
@@ -467,7 +533,7 @@ Use this draft when investigating repeated `{category}` signals related to `{sub
 - Do not run active tests outside configured scope.
 - Do not expose credentials or sensitive evidence.
 - Require approval before platform writes or containment actions.
-- Save generated artifacts as reviewable drafts before installation.
+- Never treat generated instructions as executable until evaluation and independent approval succeed.
 """
 
 

@@ -48,6 +48,19 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS api_rate_limits (
+    bucket_key TEXT NOT NULL,
+    window_start TIMESTAMP NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_key, window_start)
+);
+
+CREATE TABLE IF NOT EXISTS operations_state (
+    component TEXT PRIMARY KEY,
+    heartbeat_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    details_json TEXT NOT NULL DEFAULT '{}'
+);
+
 -- Feature 1: Alert ingestion
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,6 +169,45 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS capability_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    target TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'ai',
+    manifest_json TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    requested_by INTEGER,
+    approved_by INTEGER,
+    approved_at TIMESTAMP,
+    approval_expires_at TIMESTAMP,
+    executed_at TIMESTAMP,
+    rejected_by INTEGER,
+    rejected_at TIMESTAMP,
+    rejection_reason TEXT,
+    result_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (requested_by) REFERENCES users(id),
+    FOREIGN KEY (approved_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS responder_capabilities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    responder_type TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    enabled_by_proposal_id INTEGER,
+    enabled_at TIMESTAMP,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(org_id, responder_type),
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (enabled_by_proposal_id) REFERENCES capability_proposals(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_observables_value ON observables(value);
 CREATE INDEX IF NOT EXISTS idx_observables_case_id ON observables(case_id);
 CREATE INDEX IF NOT EXISTS idx_observables_alert_id ON observables(alert_id);
@@ -166,6 +218,8 @@ CREATE INDEX IF NOT EXISTS idx_responder_actions_case_id ON responder_actions(ca
 CREATE INDEX IF NOT EXISTS idx_memberships_user_org ON organization_memberships(user_id, org_id);
 CREATE INDEX IF NOT EXISTS idx_api_clients_org ON api_clients(org_id);
 CREATE INDEX IF NOT EXISTS idx_login_attempts_window ON login_attempts(username, ip_address, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_delivery ON notifications(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_capability_proposals_org_status ON capability_proposals(org_id, status, created_at);
 """
 
 
@@ -228,6 +282,25 @@ def init_feature_db(conn) -> None:
         },
     )
 
+    _add_missing_columns(
+        conn,
+        "notifications",
+        {
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "max_attempts": "INTEGER NOT NULL DEFAULT 5",
+            "next_attempt_at": "TIMESTAMP",
+            "last_error": "TEXT",
+            "dedup_key": "TEXT",
+            "dead_lettered_at": "TIMESTAMP",
+        },
+    )
+    # This index must be created after upgrading older notification tables that
+    # did not yet have the deduplication column.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_org_dedup "
+        "ON notifications(org_id, dedup_key) WHERE dedup_key IS NOT NULL"
+    )
+
     # Add columns to existing credentials table if missing.
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(credentials)").fetchall()}
     alter_statements = []
@@ -264,9 +337,9 @@ def init_feature_db(conn) -> None:
     # Seed default roles if empty
     import json
     default_roles = [
-        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "playbook.manage", "learning.review", "api_client.manage", "sla.view"]),
-        ("manager", ["chat.read", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "sla.view", "learning.review"]),
-        ("senior_analyst", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "tool.execute", "responder.approve", "learning.review", "sla.view"]),
+        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "playbook.manage", "learning.review", "api_client.manage", "sla.view", "notification.manage", "capability.propose", "capability.approve", "capability.execute"]),
+        ("manager", ["chat.read", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "sla.view", "learning.review", "notification.manage", "capability.approve"]),
+        ("senior_analyst", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "tool.execute", "responder.approve", "learning.review", "sla.view", "capability.propose"]),
         ("analyst", ["chat.read", "chat.act", "case.update", "alert.ingest", "report.export"]),
         ("read_only", ["chat.read", "report.export"]),
     ]

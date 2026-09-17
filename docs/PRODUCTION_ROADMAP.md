@@ -11,19 +11,18 @@
 - Phase 6: responder proposal, approval, rejection, execution-preview history, separation of duties, expiry, and tamper binding.
 - Phase 7: redacted learning evidence, evaluation records, controlled promotion states, canary, and rollback status.
 
-## Explicitly Deferred: Phases 8-10
+## Implemented Baseline: Phases 8-10
 
 ### Phase 8: Notifications And Intel Delivery
 
-Wire Slack and SMTP delivery workers, SLA warning/breach scheduling, dead-letter notifications, STIX delivery UX, and approval-gated MISP synchronization.
+Slack/SMTP/console workers, SLA and job scans, retry/dead-letter handling, STIX export, and separately approved MISP synchronization are implemented.
 
 ### Phase 9: Deployment And Operations
 
-Add PostgreSQL with row-level security, an external Redis/Celery queue, non-root containers, production WSGI/reverse proxy, TLS, rate limiting, centralized telemetry, backup/restore, and disaster-recovery drills.
+The single-node profile now has non-root containers, Gunicorn, readiness probes, shared ingestion rate limiting, worker telemetry, and verified SQLite backups. TLS termination is an operator deployment requirement. PostgreSQL row-level security and Redis/Celery remain the mandatory scale-out migration before multi-host operation.
 
 ### Phase 10: CI/CD And Release Assurance
 
-Add pinned lock files, test matrices, SAST, dependency/container/secret scanning, SBOM and provenance, signed images, staging soak tests, load tests, and controlled release rollback.
+CI now runs the test matrix, coverage, SAST, dependency, container, and secret scans. Tagged releases produce an SBOM, keyless signature, and provenance attestation. Staging soak/load evidence and a practiced rollback remain release-environment gates.
 
-The application-level controls in Phases 0-7 are prerequisites, not a claim that deployment is production-ready before Phases 8-10 pass.
-
+These controls provide a production-oriented single-node baseline. A release is not production-approved until the environment-specific TLS, backup restore, staging soak, load, notification, responder, and rollback gates have evidence.
