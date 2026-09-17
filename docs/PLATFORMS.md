@@ -12,6 +12,11 @@ Each platform can store:
 
 These are saved server-side in SQLite, not in `config/platforms.toml`.
 
+The AI provider also stores an organization-scoped authentication mode and
+model identifier. API-key mode uses the encrypted `OPENAI_API_KEY`. ChatGPT
+OAuth mode uses an official Codex CLI device login kept in the application's
+local protected data directory; OAuth tokens are not stored in database rows.
+
 ## Supported platform keys
 
 - `OPENAI_API_KEY`
@@ -53,6 +58,8 @@ The frontend shows those results inline with a green tick, red cross, or grey da
 ## Runtime config generation
 
 Before a run starts, the web app regenerates `config/platforms.toml` from database state so the orchestrator still reads TOML, but the TOML file is always current.
+The generated `[ai]` section contains only the selected provider, model, and
+organization id. It never contains an API key or OAuth token.
 
 ## Operational notes
 
@@ -60,3 +67,5 @@ Before a run starts, the web app regenerates `config/platforms.toml` from databa
 - Base URLs are plain-text fields
 - Connection tests use short timeouts and catch errors per platform
 - Platform settings should be edited in the web portal, not by hand-editing TOML
+- Only users with `credential.manage` can connect, disconnect, or select an AI provider
+- ChatGPT OAuth requires the official `codex` CLI on the application host

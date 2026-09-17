@@ -66,11 +66,24 @@ def build_clients(
         # CLI deployments keep env compatibility; the web path passes a tenant-scoped map.
         return credentials.get(name, "") or os.environ.get(name, "")
 
-    # OpenAI GPT-5.6 for LLM steps
-    openai_key = secret("OPENAI_API_KEY")
-    if openai_key:
-        from .soc_client.openai import OpenAIClient
-        clients["openai"] = OpenAIClient(openai_key)
+    # The generated configuration keeps CLI/background jobs on the same
+    # organization-selected AI provider as the web portal.
+    ai_config = config.get("ai", {})
+    ai_provider = ai_config.get("provider", "api_key")
+    ai_model = ai_config.get("model", "gpt-5.6")
+    if ai_provider == "codex_oauth":
+        from .soc_client.codex_oauth import CodexOAuthClient
+
+        clients["openai"] = CodexOAuthClient(
+            org_id=int(ai_config.get("org_id", 1)),
+            model=ai_model,
+        )
+    else:
+        openai_key = secret("OPENAI_API_KEY")
+        if openai_key:
+            from .soc_client.openai import OpenAIClient
+
+            clients["openai"] = OpenAIClient(openai_key, model=ai_model)
 
     # TheHive
     thehive_cfg = platforms.get("thehive", {})

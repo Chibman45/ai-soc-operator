@@ -7,7 +7,6 @@ Schema tables: chat_threads, chat_messages, chat_actions, chat_approvals, tool_e
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -495,8 +494,14 @@ context and cite them by id. If the question is ambiguous across many cases, ask
 brief clarifying question rather than guessing."""
 
 
-def chat_completion(context: dict[str, Any], history: list[dict], user_message: str, global_mode: bool = False) -> dict[str, Any]:
-    """Call GPT-5.6 for chat response.
+def chat_completion(
+    context: dict[str, Any],
+    history: list[dict],
+    user_message: str,
+    global_mode: bool = False,
+    ai_client=None,
+) -> dict[str, Any]:
+    """Call the organization's selected AI provider for a chat response.
 
     Args:
         context: Case-specific or global SOC context
@@ -504,61 +509,29 @@ def chat_completion(context: dict[str, Any], history: list[dict], user_message: 
         user_message: Current user question
         global_mode: If True, use GLOBAL_SYSTEM_PROMPT (dashboard copilot)
     """
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    if not openai_key:
+    if ai_client is None:
         return {
-            "reasoning": ["No OpenAI API key configured"],
-            "answer": "I need an OpenAI API key configured to analyze cases. Please set OPENAI_API_KEY.",
+            "reasoning": ["No organization AI provider configured"],
+            "answer": "An administrator must configure the organization AI provider before I can analyze cases.",
             "citations": [],
             "suggested_actions": [],
         }
 
     try:
-        import urllib.request
-        import ssl
-
         system_prompt = GLOBAL_SYSTEM_PROMPT if global_mode else SOC_SYSTEM_PROMPT
-        messages = [{"role": "system", "content": system_prompt}]
-
-        # Add context
         context_str = json.dumps(context, indent=2)
         label = "SOC-wide context" if global_mode else "Case context"
-        messages.append({
-            "role": "user",
-            "content": f"{label}:\n{context_str}\n\n"
-        })
-
-        # Add history
+        transcript = [f"{label}:\n{context_str}", "Conversation history:"]
         for msg in history[-10:]:
             role = "assistant" if msg["sender_type"] == "assistant" else "user"
-            messages.append({"role": role, "content": msg["content"]})
-
-        messages.append({"role": "user", "content": user_message})
-
-        body = json.dumps({
-            "model": "gpt-5.6",
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 2048,
-        }).encode("utf-8")
-
-        request = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {openai_key}",
-            },
-            method="POST",
+            transcript.append(f"{role}: {msg['content']}")
+        transcript.append(f"Current user request: {user_message}")
+        content = ai_client.chat(
+            "\n\n".join(transcript),
+            system=system_prompt,
+            temperature=0.2,
+            max_tokens=2048,
         )
-
-        ctx = ssl.create_default_context()
-        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
-
-        with opener.open(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-
-        content = result["choices"][0]["message"]["content"]
 
         # Try to parse as JSON
         if content.startswith("```"):

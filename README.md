@@ -102,6 +102,28 @@ Platform credentials are **never stored in config files**. They are encrypted in
 4. Enter base URLs and API keys for the platforms you want to use
 5. Click **Test Connections** to validate each one
 
+### Choosing the organization AI agent
+
+An administrator selects one shared AI mode from **Credentials -> AI Agent**:
+
+- **OpenAI API key** sends model requests directly to the OpenAI API using the
+  encrypted organization `OPENAI_API_KEY`.
+- **ChatGPT OAuth** starts the official Codex CLI device-login flow. The admin
+  opens the displayed OpenAI verification page, enters the one-time code, and
+  then selects a supported Codex model.
+
+ChatGPT OAuth requires the `codex` executable on the application host (or an
+explicit `AI_SOC_CODEX_BIN` path). Its login state is stored under the local
+`data/codex-oauth/org-<id>/` directory and is never returned to analysts or
+written into generated configuration. OAuth inference runs in an empty
+temporary workspace with a read-only sandbox and a scrubbed environment. The
+admin can disconnect it from the same page.
+
+The selection is organization-wide. Copilot chat, document parsing,
+organization-policy extraction, and playbook LLM steps all load the same mode
+and model. A ChatGPT subscription is not treated as an OpenAI API key; the two
+options remain separate authentication and billing paths.
+
 Supported platforms:
 
 | Platform | What it does |

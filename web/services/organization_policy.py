@@ -132,6 +132,7 @@ def create_policy_draft(
     created_by: int,
     llm_callback: Callable[[str, str], str] | None,
     known_playbooks: list[str],
+    extraction_model: str | None = None,
 ) -> dict[str, Any]:
     suffix = source_path.suffix.lower()
     if suffix not in {".yaml", ".yml", ".json", ".pdf", ".docx", ".md", ".txt"}:
@@ -149,13 +150,13 @@ def create_policy_draft(
         extraction_model = "structured-input"
     else:
         if not llm_callback:
-            raise ValueError("an organization OpenAI credential is required to analyze this document")
+            raise ValueError("an organization AI provider is required to analyze this document")
         extracted = extract_policy_with_ai(
             extract_text(source_path),
             llm_callback=llm_callback,
             known_playbooks=known_playbooks,
         )
-        extraction_model = MODEL
+        extraction_model = extraction_model or MODEL
     normalized = normalize_policy(extracted, known_playbooks=known_playbooks)
     policy_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
     policy_digest = hashlib.sha256(policy_json.encode("utf-8")).hexdigest()

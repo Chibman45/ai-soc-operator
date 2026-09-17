@@ -168,6 +168,32 @@ CREATE TABLE IF NOT EXISTS infrastructure_migrations (
     FOREIGN KEY (requested_by) REFERENCES users(id)
 );
 
+CREATE TABLE IF NOT EXISTS ai_provider_config (
+    org_id INTEGER PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'api_key' CHECK(provider IN ('api_key', 'codex_oauth')),
+    model TEXT NOT NULL DEFAULT 'gpt-5.6',
+    configured_by INTEGER,
+    configured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (configured_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS codex_device_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    requested_by INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'starting',
+    verification_uri TEXT,
+    user_code TEXT,
+    process_id INTEGER,
+    error_message TEXT,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (requested_by) REFERENCES users(id)
+);
+
 CREATE TABLE IF NOT EXISTS api_rate_limits (
     bucket_key TEXT NOT NULL,
     window_start TIMESTAMP NOT NULL,
@@ -366,6 +392,7 @@ CREATE INDEX IF NOT EXISTS idx_external_objects_local_case ON external_objects(o
 CREATE INDEX IF NOT EXISTS idx_external_objects_local_alert ON external_objects(org_id, local_alert_id, platform);
 CREATE INDEX IF NOT EXISTS idx_intel_events_org_updated ON intel_events(org_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_infrastructure_migrations_org ON infrastructure_migrations(org_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_codex_device_sessions_org ON codex_device_sessions(org_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_delivery ON notifications(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_capability_proposals_org_status ON capability_proposals(org_id, status, created_at);
 """

@@ -17,7 +17,6 @@ from werkzeug.security import generate_password_hash
 
 from scripts.common import ROOT, audit
 from web.security import current_org_id, permission_required
-from web.services.credential_vault import open_secret
 from web.services.database import connect_database
 from web.services.organization_policy import (
     active_policy,
@@ -483,16 +482,14 @@ def upload_policy():
     org_id = int(current_org_id(conn))
     known_playbooks = sorted(path.name for path in (ROOT / "playbooks").glob("*.yaml"))
     llm_callback = None
+    extraction_model = None
     if suffix not in {".yaml", ".yml", ".json"}:
-        credential = conn.execute(
-            "SELECT key_value FROM credentials WHERE org_id = ? AND key_name = 'OPENAI_API_KEY'",
-            (org_id,),
-        ).fetchone()
-        if credential:
-            from scripts.soc_client.openai import OpenAIClient
+        from web.services.ai_provider import load_ai_client, provider_config
 
-            client = OpenAIClient(open_secret(credential["key_value"]))
+        client = load_ai_client(conn, org_id)
+        if client:
             llm_callback = lambda system, prompt: client.chat(prompt, system=system)
+            extraction_model = provider_config(conn, org_id)["model"]
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
@@ -506,6 +503,7 @@ def upload_policy():
             created_by=int(session["user_id"]),
             llm_callback=llm_callback,
             known_playbooks=known_playbooks,
+            extraction_model=extraction_model,
         )
         conn.commit()
         flash(f"Policy draft {result['id']} extracted. Review it before approval.", "success")

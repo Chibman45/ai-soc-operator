@@ -33,8 +33,11 @@ class OpenAIClient:
     Uses only stdlib (urllib) — no pip dependency on the openai package.
     """
 
-    def __init__(self, api_key: str | None = None):
-        self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+    def __init__(self, api_key: str | None = None, model: str = MODEL):
+        # An explicit empty value is meaningful for non-API-key subclasses such
+        # as the Codex OAuth adapter and must not fall back to a process secret.
+        self._api_key = os.environ.get("OPENAI_API_KEY", "") if api_key is None else api_key
+        self.model = model
         self._ssl_context = ssl.create_default_context()
 
     def chat(
@@ -50,7 +53,7 @@ class OpenAIClient:
         messages.append({"role": "user", "content": prompt})
 
         body = json.dumps({
-            "model": MODEL,
+            "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -76,7 +79,7 @@ class OpenAIClient:
         content = result["choices"][0]["message"]["content"]
         audit(
             "openai_call",
-            model=MODEL,
+            model=self.model,
             tokens_used=result.get("usage", {}).get("total_tokens", 0),
         )
         return content

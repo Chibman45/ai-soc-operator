@@ -331,12 +331,20 @@ def save_platform_settings(conn: sqlite3.Connection, form: Any, org_id: int) -> 
 def build_platforms_toml(org_id: int | None = None) -> str:
     conn = get_db()
     org_id = org_id or current_org_id(conn)
+    from web.services.ai_provider import provider_config
+
+    ai_config = provider_config(conn, int(org_id))
     creds = {row["key_name"]: open_secret(row["key_value"]) for row in conn.execute("SELECT key_name, key_value FROM credentials WHERE org_id = ?", (org_id,)).fetchall()}
     rows = conn.execute("SELECT platform, base_url, enabled FROM platform_config WHERE org_id = ? ORDER BY platform", (org_id,)).fetchall()
     conn.close()
     lines = [
         "# AI SOC Operator — Platform Configuration",
         "# Auto-generated from the web portal",
+        "",
+        "[ai]",
+        f'provider = {json.dumps(ai_config["provider"])}',
+        f'model = {json.dumps(ai_config["model"])}',
+        f"org_id = {int(org_id)}",
         "",
     ]
     for row in rows:
@@ -528,11 +536,39 @@ def logout():
 def credentials():
     conn = get_db()
     org_id = current_org_id(conn)
+    from scripts.soc_client.codex_oauth import codex_executable, codex_login_status
+    from web.services.ai_provider import (
+        API_MODEL_SUGGESTIONS,
+        CODEX_MODEL_SUGGESTIONS,
+        provider_config,
+        save_provider_config,
+    )
     if request.method == "POST":
-        save_platform_settings(conn, request.form, int(org_id))
-        conn.commit()
-        flash("Credentials and platform connections saved", "success")
-        return redirect(url_for("dashboard"))
+        try:
+            save_platform_settings(conn, request.form, int(org_id))
+            save_provider_config(
+                conn,
+                org_id=int(org_id),
+                user_id=int(session["user_id"]),
+                provider=request.form.get("AI_PROVIDER", "api_key").strip(),
+                model=request.form.get("AI_MODEL", "").strip(),
+            )
+            conn.commit()
+            write_platforms_toml(int(org_id))
+            audit(
+                "ai_provider_configured",
+                org_id=org_id,
+                user_id=session["user_id"],
+                provider=request.form.get("AI_PROVIDER", "api_key"),
+                model=request.form.get("AI_MODEL", ""),
+            )
+            flash("Credentials, AI provider, and platform connections saved", "success")
+        except (ValueError, OSError) as exc:
+            conn.rollback()
+            flash(str(exc), "error")
+        finally:
+            conn.close()
+        return redirect(url_for("credentials"))
 
     existing = {
         row["key_name"]: row["key_value"][:8] + "****"
@@ -542,6 +578,9 @@ def credentials():
         row["platform"]: {"base_url": row["base_url"], "enabled": bool(row["enabled"])}
         for row in conn.execute("SELECT platform, base_url, enabled FROM platform_config WHERE org_id = ?", (org_id,)).fetchall()
     }
+    ai_config = provider_config(conn, int(org_id))
+    codex_available = bool(codex_executable())
+    codex_connected = codex_login_status(int(org_id)) if codex_available else False
     conn.close()
     return render_template(
         "credentials.html",
@@ -549,6 +588,11 @@ def credentials():
         platform_existing=platform_existing,
         platform_defaults=PLATFORM_DEFAULTS,
         platform_placeholders=PLATFORM_URL_PLACEHOLDERS,
+        ai_config=ai_config,
+        api_models=API_MODEL_SUGGESTIONS,
+        codex_models=CODEX_MODEL_SUGGESTIONS,
+        codex_available=codex_available,
+        codex_connected=codex_connected,
     )
 
 
@@ -1125,12 +1169,17 @@ def upload_playbook():
 
     from scripts.playbook_parser import parse_playbook_document
 
-    # For YAML, parse directly; for PDF/DOCX/MD, use LLM parser
+    # Non-structured documents use whichever organization AI provider the
+    # administrator selected, so OAuth and API-key behavior stays consistent.
     openai_client = None
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    if openai_key and suffix not in (".yaml", ".yml"):
-        from scripts.soc_client.openai import OpenAIClient
-        openai_client = OpenAIClient(openai_key)
+    if suffix not in (".yaml", ".yml"):
+        conn = get_db()
+        try:
+            from web.services.ai_provider import load_ai_client
+
+            openai_client = load_ai_client(conn, int(current_org_id(conn)))
+        finally:
+            conn.close()
 
     if openai_client:
         def llm_callback(system_prompt, user_prompt):
@@ -1162,7 +1211,7 @@ def upload_playbook():
         else:
             # Non-YAML: extract → LLM → validate → save
             if not llm_callback:
-                flash("PDF/DOCX parsing requires an OpenAI API key. Set OPENAI_API_KEY.", "error")
+                flash("PDF/DOCX parsing requires a configured organization AI provider.", "error")
                 return redirect(url_for("playbooks"))
             result = parse_playbook_document(Path(tmp.name), llm_callback)
             if not result["valid"]:
@@ -1401,10 +1450,23 @@ def api_secrets_test_all():
     org_id = current_org_id(conn)
     creds = {row["key_name"]: open_secret(row["key_value"]) for row in conn.execute("SELECT key_name, key_value FROM credentials WHERE org_id = ?", (org_id,)).fetchall()}
     platform_cfg = {row["platform"]: row["base_url"] for row in conn.execute("SELECT platform, base_url FROM platform_config WHERE org_id = ?", (org_id,)).fetchall()}
+    from scripts.soc_client.codex_oauth import codex_login_status
+    from web.services.ai_provider import provider_config
+
+    ai_config = provider_config(conn, int(org_id))
     conn.close()
 
     key_for_platform = {plat: kn for kn, plat in PLATFORM_CREDENTIAL_KEYS if plat}
-    results = [_test_platform_connection("openai", "", creds.get("OPENAI_API_KEY", ""))]
+    if ai_config["provider"] == "codex_oauth":
+        connected = codex_login_status(int(org_id))
+        results = [{
+            "platform": "openai",
+            "label": "ChatGPT OAuth (Codex)",
+            "status": "ok" if connected else "auth_failed",
+            "message": f'{ai_config["model"]} is connected' if connected else "OAuth login is disconnected",
+        }]
+    else:
+        results = [_test_platform_connection("openai", "", creds.get("OPENAI_API_KEY", ""))]
     for platform in PLATFORM_DEFAULTS:
         key_name = key_for_platform.get(platform)
         api_key = creds.get(key_name, "") if key_name else ""
@@ -1435,6 +1497,7 @@ from web.routes.features import features_bp
 from web.routes.export import export_bp
 from web.routes.operations import operations_bp
 from web.routes.admin import admin_bp
+from web.routes.ai_provider import ai_provider_bp
 
 app.register_blueprint(chat_bp)
 app.register_blueprint(webhooks_bp)
@@ -1442,6 +1505,7 @@ app.register_blueprint(features_bp)
 app.register_blueprint(export_bp)
 app.register_blueprint(operations_bp)
 app.register_blueprint(admin_bp)
+app.register_blueprint(ai_provider_bp)
 
 # WSGI imports must initialize the schema too; production servers do not execute __main__.
 init_db()

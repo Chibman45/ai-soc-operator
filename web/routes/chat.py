@@ -172,7 +172,14 @@ def chat_post(case_id: int):
     ).fetchall()
     history = [{"sender_type": r["sender_type"], "content": r["content"]} for r in history_rows]
 
-    response = chat_completion(context, history, user_message)
+    from web.services.ai_provider import load_ai_client
+
+    response = chat_completion(
+        context,
+        history,
+        user_message,
+        ai_client=load_ai_client(conn, int(org_id)),
+    )
 
     # Save assistant message
     answer = response.get("answer", "")
@@ -524,7 +531,15 @@ def chat_global_post():
     ).fetchall()
     history = [{"sender_type": r["sender_type"], "content": r["content"]} for r in history_rows]
 
-    response = chat_completion(context, history, user_message, global_mode=True)
+    from web.services.ai_provider import load_ai_client
+
+    response = chat_completion(
+        context,
+        history,
+        user_message,
+        global_mode=True,
+        ai_client=load_ai_client(conn, int(org_id)),
+    )
 
     answer = response.get("answer", "")
     citations = json.dumps(response.get("citations", []))
