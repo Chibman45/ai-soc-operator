@@ -7,17 +7,20 @@
 
     <div class="grid grid-cols-3 gap-4">
         {% for pb in playbooks %}
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 hover:border-blue-600 transition cursor-pointer"
-             onclick="runPlaybook('{{ pb.name }}')">
+        <div class="bg-gray-900 border border-gray-800 rounded-lg p-5 {% if can('tool.execute') %}hover:border-blue-600 cursor-pointer{% endif %} transition"
+             {% if can('tool.execute') %}onclick="runPlaybook('{{ pb.name }}')"{% endif %}>
             <div class="text-lg font-medium mb-2">📋 {{ pb.name }}</div>
-            <div class="text-sm text-gray-400 mb-4">Click to run this playbook</div>
+            <div class="text-sm text-gray-400 mb-4">{% if can('tool.execute') %}Available for execution{% else %}Available for review{% endif %}</div>
+            {% if can('tool.execute') %}
             <button class="w-full py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition">
                 ▶ Execute
             </button>
+            {% endif %}
         </div>
         {% endfor %}
 
-        <div class="bg-gray-900/50 border border-gray-700 border-dashed rounded-xl p-5 flex flex-col items-center justify-center text-gray-600">
+        {% if can('playbook.manage') %}
+        <div class="bg-gray-900/50 border border-gray-700 border-dashed rounded-lg p-5 flex flex-col items-center justify-center text-gray-600">
             <div class="text-3xl mb-2">+</div>
             <div class="text-sm">Upload custom playbook</div>
             <form method="POST" action="{{ url_for('upload_playbook') }}" enctype="multipart/form-data" class="mt-3">
@@ -26,6 +29,10 @@
                 <button type="submit" class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs transition">Upload</button>
             </form>
         </div>
+        {% endif %}
+        {% if not playbooks %}
+        <div class="col-span-3 py-10 text-center text-gray-500">No playbooks are allowed by your active organization policy.</div>
+        {% endif %}
     </div>
 </div>
 
@@ -35,7 +42,8 @@ function runPlaybook(name) {
         const form = document.createElement('form');
         form.method = 'POST';
         form.action = '/run';
-        form.innerHTML = '<input type="hidden" name="playbook" value="' + name + '">';
+        form.innerHTML = '<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">' +
+            '<input type="hidden" name="playbook" value="' + name + '">';
         document.body.appendChild(form);
         form.submit();
     }

@@ -69,6 +69,36 @@ def ingest_alert_record(
     normalized = normalize_alert(source, payload)
     observables = observables_from_alert(normalized, supplied_observables)
     playbook_path = auto_select_playbook(normalized, ROOT / "playbooks")
+    if playbook_path:
+        from web.services.organization_policy import (
+            allowed_playbooks_for_organization,
+            policy_allows_organization_target,
+        )
+
+        available = [path.name for path in (ROOT / "playbooks").glob("*.yaml")]
+        if playbook_path.name not in allowed_playbooks_for_organization(
+            conn,
+            org_id=int(org_id),
+            available=available,
+        ):
+            audit(
+                "organization_policy_auto_playbook_denied",
+                org_id=org_id,
+                playbook=playbook_path.name,
+                source=source,
+            )
+            playbook_path = None
+        elif any(
+            not policy_allows_organization_target(conn, org_id=int(org_id), target=item["value"])
+            for item in observables
+        ):
+            audit(
+                "organization_policy_auto_scope_denied",
+                org_id=org_id,
+                playbook=playbook_path.name,
+                source=source,
+            )
+            playbook_path = None
     selected_playbook = playbook_path.name if playbook_path else None
 
     linked_case_id = find_correlated_case(conn, observables, org_id=org_id)

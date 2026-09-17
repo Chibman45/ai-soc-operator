@@ -32,6 +32,15 @@ from web.services.capabilities import (
 ROOT = Path(__file__).resolve().parents[2]
 operations_bp = Blueprint("operations", __name__)
 ALLOWED_API_SCOPES = {"alert.ingest"}
+SCOPED_RESPONDERS = {
+    "block_ip",
+    "isolate_host",
+    "disable_user",
+    "reset_user_credential",
+    "add_thehive_observable",
+    "run_cortex_analyzer",
+    "push_misp_indicator",
+}
 
 
 def _db() -> sqlite3.Connection:
@@ -99,6 +108,24 @@ def propose_case_responder(case_id: int):
     if not _case_exists(conn, case_id, org_id):
         conn.close()
         return jsonify({"error": "not found"}), 404
+    if action_type in SCOPED_RESPONDERS:
+        observable = conn.execute(
+            "SELECT 1 FROM observables WHERE org_id = ? AND case_id = ? AND lower(value) = lower(?)",
+            (org_id, case_id, target),
+        ).fetchone()
+        if not observable:
+            conn.close()
+            return jsonify({"error": "responder target is not an observable in this case"}), 403
+        from web.services.organization_policy import policy_allows_target
+
+        if not policy_allows_target(
+            conn,
+            org_id=org_id,
+            user_id=int(session["user_id"]),
+            target=target,
+        ):
+            conn.close()
+            return jsonify({"error": "responder target is outside your approved organization policy scope"}), 403
     try:
         action = create_responder_action(
             conn,

@@ -116,6 +116,66 @@ Supported platforms:
 | MISP | Internal threat intelligence attribute/event search |
 | OpenAI | GPT model for LLM steps in playbooks (classification, summarization) |
 
+## Single-user and local multi-user operation
+
+The first account created by bootstrap is the administrator for the default
+organization. A single operator can keep using that account with no additional
+configuration. For a team on the same local network:
+
+1. Sign in as the bootstrap administrator.
+2. Open **Administration -> Users** and create an invitation.
+3. Select any manual roles that should exist independently of organization policy.
+4. Share the one-time HTTPS activation link securely with the intended user.
+5. The user opens the link, sets a password of at least 12 characters, and signs in.
+
+The activation link expires after 24 hours and is stored only as a SHA-256 digest.
+An administrator can suspend a membership or reset its activation link. The
+organization must always retain at least one active administrator.
+
+Platform credentials belong to the organization, not to individual analysts.
+Authorized workflows load those encrypted credentials on the server. The API
+keys are never copied into an invited user's account, browser, prompt, or report.
+
+### Organization playbook access policy
+
+Open **Administration -> Organization Policy** to submit YAML, JSON, PDF, DOCX,
+Markdown, or text. Structured YAML/JSON is parsed directly. Other document types
+use the organization's configured OpenAI credential to extract a policy draft.
+AI output is untrusted and cannot grant access: an administrator must review the
+normalized JSON and approve its exact digest before it becomes active.
+
+An explicit structured policy can use this form:
+
+```yaml
+access_policy:
+  organization_name: Example SOC
+  role_policies:
+    analyst:
+      playbooks: [identity-compromise.yaml]
+      scope:
+        hosts: [workstation-01]
+        cidrs: [10.20.0.0/16]
+        domains: ['*.example.internal']
+        users: [alice@example.internal]
+        indicators: []
+  users:
+    - username: alice
+      roles: [analyst]
+      playbooks: []
+      scope:
+        hosts: []
+        cidrs: []
+        domains: []
+        users: []
+        indicators: []
+```
+
+Role-based and user-specific playbook and target scope are combined. The active
+policy limits playbook listings, manual runs, automated alert selection, network
+tools, and responder proposals. Existing global scope controls remain in force,
+so the effective boundary is the intersection of installation scope, case
+observables, RBAC permissions, and the approved organization policy.
+
 The web application builds a tenant-scoped runtime configuration in memory
 before every playbook run. The bootstrap CLI remains the only supported way to
 initialize `config/platforms.toml`; do not edit it manually.

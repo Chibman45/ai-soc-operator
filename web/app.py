@@ -36,7 +36,14 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from scripts.job_queue import JobQueue
 from scripts.learning import LearningStore, learn_alert, learn_case, learn_playbook_result
 from scripts.common import audit
-from web.security import csrf_token, current_org_id, enforce_csrf, login_required as secure_login_required, permission_required
+from web.security import (
+    csrf_token,
+    current_org_id,
+    enforce_csrf,
+    login_required as secure_login_required,
+    permission_required,
+    permissions_for_user,
+)
 from web.services.credential_vault import open_secret, seal_secret
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -78,6 +85,20 @@ app.config.update(
 )
 app.before_request(enforce_csrf)
 app.jinja_env.globals["csrf_token"] = csrf_token
+
+
+@app.context_processor
+def template_permissions():
+    """Expose current permissions for navigation and action visibility only."""
+    user_id = session.get("user_id")
+    if user_id is None:
+        return {"can": lambda _permission: False}
+    conn = get_db()
+    try:
+        permissions = permissions_for_user(conn, int(user_id), current_org_id(conn))
+    finally:
+        conn.close()
+    return {"can": lambda permission: permission in permissions}
 
 
 @app.after_request
@@ -417,7 +438,13 @@ def login():
                 """,
                 (user["id"], user["default_org_id"]),
             ).fetchone()
-        valid = bool(user and membership and not user["disabled_at"] and verify_password(password, user["password_hash"]))
+        valid = bool(
+            user
+            and membership
+            and not user["disabled_at"]
+            and not user["must_change_password"]
+            and verify_password(password, user["password_hash"])
+        )
         conn.execute(
             "INSERT INTO login_attempts (username, ip_address, succeeded) VALUES (?, ?, ?)",
             (username, request.remote_addr or "", 1 if valid else 0),
@@ -434,6 +461,7 @@ def login():
             session["user_id"] = user["id"]
             session["username"] = user["username"]
             session["org_id"] = membership["org_id"]
+            session["session_version"] = int(user["session_version"] or 0)
             csrf_token()
             audit("login_success", user_id=user["id"], org_id=membership["org_id"], ip_address=request.remote_addr)
             conn.close()
@@ -482,6 +510,7 @@ def setup():
             session["user_id"] = user_id
             session["username"] = username
             session["org_id"] = org_id
+            session["session_version"] = 0
             csrf_token()
             audit("initial_admin_created", user_id=user_id, org_id=org_id)
             return redirect(url_for("credentials"))
@@ -590,6 +619,46 @@ def run_agent():
 
     conn = get_db()
     org_id = current_org_id(conn)
+    from web.services.alert_ingest import normalize_alert, observables_from_alert
+    from web.services.organization_policy import allowed_playbooks_for_user, policy_allows_target
+
+    available = [path.name for path in (ROOT / "playbooks").glob("*.yaml")]
+    allowed = allowed_playbooks_for_user(
+        conn,
+        org_id=int(org_id),
+        user_id=int(session["user_id"]),
+        available=available,
+    )
+    if playbook not in allowed:
+        conn.close()
+        audit(
+            "organization_policy_playbook_denied",
+            org_id=org_id,
+            user_id=session["user_id"],
+            playbook=playbook,
+        )
+        return jsonify({"error": "playbook is outside your approved organization policy"}), 403
+    normalized_alert = normalize_alert("manual", alert)
+    scoped_observables = observables_from_alert(normalized_alert)
+    denied_targets = [
+        item["value"]
+        for item in scoped_observables
+        if not policy_allows_target(
+            conn,
+            org_id=int(org_id),
+            user_id=int(session["user_id"]),
+            target=item["value"],
+        )
+    ]
+    if denied_targets:
+        conn.close()
+        audit(
+            "organization_policy_alert_scope_denied",
+            org_id=org_id,
+            user_id=session["user_id"],
+            target_count=len(denied_targets),
+        )
+        return jsonify({"error": "alert contains targets outside your approved organization policy scope"}), 403
     idempotency_key = request.headers.get("Idempotency-Key") or secrets.token_urlsafe(24)
     existing_run = conn.execute(
         "SELECT id FROM runs WHERE org_id = ? AND idempotency_key = ?",
@@ -934,10 +1003,22 @@ def api_activity():
 @login_required
 def playbooks():
     pb_dir = ROOT / "playbooks"
-    playbooks = []
+    available = []
     if pb_dir.is_dir():
         for f in sorted(pb_dir.glob("*.yaml")):
-            playbooks.append({"name": f.name, "path": str(f)})
+            available.append(f.name)
+    conn = get_db()
+    org_id = int(current_org_id(conn))
+    from web.services.organization_policy import allowed_playbooks_for_user
+
+    permitted = allowed_playbooks_for_user(
+        conn,
+        org_id=org_id,
+        user_id=int(session["user_id"]),
+        available=available,
+    )
+    conn.close()
+    playbooks = [{"name": name, "path": str(pb_dir / name)} for name in permitted]
     return render_template("playbooks.html", playbooks=playbooks)
 
 
@@ -1278,12 +1359,14 @@ from scripts.webhooks import webhooks_bp
 from web.routes.features import features_bp
 from web.routes.export import export_bp
 from web.routes.operations import operations_bp
+from web.routes.admin import admin_bp
 
 app.register_blueprint(chat_bp)
 app.register_blueprint(webhooks_bp)
 app.register_blueprint(features_bp)
 app.register_blueprint(export_bp)
 app.register_blueprint(operations_bp)
+app.register_blueprint(admin_bp)
 
 # WSGI imports must initialize the schema too; production servers do not execute __main__.
 init_db()

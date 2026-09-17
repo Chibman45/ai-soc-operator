@@ -88,13 +88,24 @@ def current_org_id(conn: sqlite3.Connection | None = None) -> int | None:
     try:
         if org_id is not None:
             row = conn.execute(
-                "SELECT org_id FROM organization_memberships WHERE user_id = ? AND org_id = ? AND status = 'active'",
-                (user_id, int(org_id)),
+                """
+                SELECT om.org_id FROM organization_memberships om
+                JOIN users u ON u.id = om.user_id
+                WHERE om.user_id = ? AND om.org_id = ? AND om.status = 'active'
+                  AND u.disabled_at IS NULL AND COALESCE(u.session_version, 0) = ?
+                """,
+                (user_id, int(org_id), int(session.get("session_version", 0))),
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT org_id FROM organization_memberships WHERE user_id = ? AND status = 'active' ORDER BY id LIMIT 1",
-                (user_id,),
+                """
+                SELECT om.org_id FROM organization_memberships om
+                JOIN users u ON u.id = om.user_id
+                WHERE om.user_id = ? AND om.status = 'active'
+                  AND u.disabled_at IS NULL AND COALESCE(u.session_version, 0) = ?
+                ORDER BY om.id LIMIT 1
+                """,
+                (user_id, int(session.get("session_version", 0))),
             ).fetchone()
         if row:
             session["org_id"] = int(row["org_id"])

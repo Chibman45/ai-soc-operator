@@ -19,7 +19,15 @@ The interactive Linux bootstrap can also configure local HTTPS using a private
 CA, Nginx, loopback-only Gunicorn, and deployment-gated `ProxyFix` without a
 public domain.
 
-The full local test suite passes with **233 tests** (plus one OpenSSL integration
+Local multi-user administration is now available. The bootstrap account is the
+initial organization admin; it can issue one-time activation links, assign
+manual roles, suspend memberships, and reset activation. Organization playbooks
+can be converted into reviewable access-policy drafts. Only an explicit admin
+approval activates policy-managed roles, allowed playbooks, and per-user target
+scope. AI extraction never changes authorization by itself, and organization
+credentials remain encrypted server-side rather than being distributed to users.
+
+The full local test suite passes with **236 tests** (plus one OpenSSL integration
 test skipped on the Windows development host). This is not a claim that a
 specific environment is production-approved. Remaining deployment evidence and
 scale-out work are tracked in

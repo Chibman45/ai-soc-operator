@@ -25,6 +25,9 @@ class WebRouteRegistrationTests(unittest.TestCase):
         self.assertIn("/api/notifications", routes)
         self.assertIn("/health/live", routes)
         self.assertIn("/health/ready", routes)
+        self.assertIn("/admin/users", routes)
+        self.assertIn("/admin/policy", routes)
+        self.assertIn("/activate/<token>", routes)
 
     def test_proxy_fix_is_enabled_only_by_deployment_flag(self):
         environment = os.environ.copy()

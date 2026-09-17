@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Organization policy - AI SOC Operator{% endblock %}
+{% block content %}
+<div class="space-y-6 max-w-6xl">
+    <div>
+        <h2 class="text-xl font-bold">Organization access policy</h2>
+        <p class="text-sm text-gray-400 mt-1">Extract user roles, allowed playbooks, and target scope from the organization playbook.</p>
+    </div>
+
+    <section class="border-y border-gray-800 py-5">
+        <h3 class="font-semibold mb-2">Submit organization playbook</h3>
+        <p class="text-xs text-gray-500 mb-4">AI extraction produces a draft only. No permissions change until an admin reviews and approves it.</p>
+        <form method="POST" action="{{ url_for('admin.upload_policy') }}" enctype="multipart/form-data" class="flex flex-wrap items-center gap-3">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="file" name="policy" accept=".yaml,.yml,.json,.pdf,.docx,.md,.txt" required class="text-sm text-gray-300">
+            <button class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium">Extract draft</button>
+        </form>
+    </section>
+
+    {% if active %}
+    <section>
+        <h3 class="font-semibold mb-3">Active policy</h3>
+        <div class="border border-green-900 bg-green-950/20 rounded-lg p-4">
+            <div class="text-sm text-green-300">Version {{ active.version }} · approved {{ active.approved_at }}</div>
+            <div class="text-xs text-gray-500 mt-1 font-mono break-all">Digest: {{ active.policy_digest }}</div>
+            <pre class="mt-3 max-h-72 overflow-auto bg-gray-950 p-3 rounded text-xs text-gray-300 whitespace-pre-wrap">{{ active.policy_json }}</pre>
+        </div>
+    </section>
+    {% endif %}
+
+    <section>
+        <h3 class="font-semibold mb-3">Review history</h3>
+        <div class="space-y-4">
+            {% for draft in drafts %}
+            <article class="border border-gray-800 rounded-lg p-4">
+                <div class="flex flex-wrap justify-between gap-3">
+                    <div>
+                        <div class="font-medium">Draft {{ draft.id }} · {{ draft.source_name }}</div>
+                        <div class="text-xs text-gray-500 mt-1">{{ draft.created_at }} · {{ draft.extraction_model }} · {{ draft.status }}</div>
+                    </div>
+                    {% if draft.status == 'draft' %}
+                    <div class="flex gap-2">
+                        <button onclick="approvePolicy({{ draft.id }})" class="px-3 py-1.5 bg-green-700 hover:bg-green-600 rounded-lg text-sm">Approve</button>
+                        <button onclick="rejectPolicy({{ draft.id }})" class="px-3 py-1.5 bg-red-800 hover:bg-red-700 rounded-lg text-sm">Reject</button>
+                    </div>
+                    {% endif %}
+                </div>
+                <div class="text-xs text-gray-500 mt-2 font-mono break-all">Digest: {{ draft.policy_digest }}</div>
+                <pre class="mt-3 max-h-80 overflow-auto bg-gray-950 p-3 rounded text-xs text-gray-300 whitespace-pre-wrap">{{ draft.extracted_json }}</pre>
+                {% if draft.rejection_reason %}<div class="mt-2 text-sm text-red-300">Rejected: {{ draft.rejection_reason }}</div>{% endif %}
+            </article>
+            {% else %}
+            <div class="text-sm text-gray-500 py-6">No policy drafts yet.</div>
+            {% endfor %}
+        </div>
+    </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+async function approvePolicy(id) {
+    if (!confirm('Approve this exact policy draft and replace policy-managed role assignments?')) return;
+    const response = await fetch(`/api/admin/policies/${id}/approve`, {method: 'POST'});
+    const result = await response.json();
+    if (!response.ok) return alert(result.error || 'Approval failed');
+    const unresolved = result.unresolved_users.length ? ` Unresolved users: ${result.unresolved_users.join(', ')}` : '';
+    alert(`Policy version ${result.version} activated.${unresolved}`);
+    location.reload();
+}
+async function rejectPolicy(id) {
+    const reason = prompt('Reason for rejection:');
+    if (!reason) return;
+    const response = await fetch(`/api/admin/policies/${id}/reject`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({reason})});
+    const result = await response.json();
+    if (!response.ok) return alert(result.error || 'Rejection failed');
+    location.reload();
+}
+</script>
+{% endblock %}

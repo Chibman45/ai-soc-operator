@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from flask import Blueprint, jsonify, request, session
+from scripts.common import audit
 from web.security import (
     current_org_id,
     login_required as _login_required,
@@ -200,11 +201,19 @@ def assign_role(user_id: int):
         return jsonify({"ok": False, "error": "role already assigned"}), 409
 
     conn.execute(
-        "INSERT INTO user_roles (user_id, role_id, org_id) VALUES (?, ?, ?)",
+        "INSERT INTO user_roles (user_id, role_id, org_id, source, policy_id) VALUES (?, ?, ?, 'manual', NULL)",
         (user_id, role_id, org_id),
     )
     conn.commit()
     conn.close()
+    audit(
+        "organization_user_role_assigned",
+        org_id=org_id,
+        user_id=user_id,
+        role_id=role_id,
+        actor_id=session.get("user_id"),
+        source="manual",
+    )
     return jsonify({"ok": True})
 
 
@@ -213,13 +222,24 @@ def assign_role(user_id: int):
 def remove_role(user_id: int, role_id: int):
     conn = _get_db()
     org_id = current_org_id(conn)
+    assignment = conn.execute(
+        "SELECT source FROM user_roles WHERE user_id = ? AND role_id = ? AND org_id = ?",
+        (user_id, role_id, org_id),
+    ).fetchone()
+    if assignment and assignment["source"] == "policy":
+        conn.close()
+        return jsonify({"error": "role is managed by the active organization policy"}), 409
     role = conn.execute("SELECT name FROM roles WHERE id = ?", (role_id,)).fetchone()
     if role and role["name"] == "admin":
         admin_count = conn.execute(
             """
             SELECT COUNT(DISTINCT ur.user_id)
-            FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+            FROM user_roles ur
+            JOIN roles r ON r.id = ur.role_id
+            JOIN organization_memberships om ON om.user_id = ur.user_id AND om.org_id = ur.org_id
+            JOIN users u ON u.id = ur.user_id
             WHERE ur.org_id = ? AND r.name = 'admin'
+              AND om.status = 'active' AND u.disabled_at IS NULL
             """,
             (org_id,),
         ).fetchone()[0]
@@ -239,6 +259,14 @@ def remove_role(user_id: int, role_id: int):
         return jsonify({"error": "role assignment not found"}), 404
     conn.commit()
     conn.close()
+    audit(
+        "organization_user_role_removed",
+        org_id=org_id,
+        user_id=user_id,
+        role_id=role_id,
+        actor_id=session.get("user_id"),
+        source="manual",
+    )
     return jsonify({"ok": True})
 
 

@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}Users - AI SOC Operator{% endblock %}
+{% block content %}
+<div class="space-y-6 max-w-6xl">
+    <div>
+        <h2 class="text-xl font-bold">Organization users</h2>
+        <p class="text-sm text-gray-400 mt-1">Invite local-network users and control their organization membership.</p>
+    </div>
+
+    <section class="border-y border-gray-800 py-5">
+        <h3 class="font-semibold mb-4">Create invitation</h3>
+        <form id="invite-form" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <label class="text-sm text-gray-400">Username
+                <input name="username" required pattern="[A-Za-z0-9_.-]{3,64}" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-gray-100">
+            </label>
+            <label class="text-sm text-gray-400">Display name
+                <input name="display_name" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-gray-100">
+            </label>
+            <label class="text-sm text-gray-400">Email
+                <input name="email" type="email" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-gray-100">
+            </label>
+            <fieldset class="md:col-span-3">
+                <legend class="text-sm text-gray-400 mb-2">Manual roles</legend>
+                <div class="flex flex-wrap gap-4">
+                    {% for role in roles %}
+                    <label class="inline-flex items-center gap-2 text-sm">
+                        <input type="checkbox" name="role_ids" value="{{ role.id }}" class="accent-blue-500"> {{ role.name }}
+                    </label>
+                    {% endfor %}
+                </div>
+                <p class="text-xs text-gray-500 mt-2">An approved organization policy may also assign roles to an exact matching username.</p>
+            </fieldset>
+            <div class="md:col-span-3">
+                <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium">Create invitation</button>
+            </div>
+        </form>
+        <div id="activation-result" class="hidden mt-4 p-4 bg-blue-950 border border-blue-800 rounded-lg">
+            <div class="text-sm font-medium text-blue-200">One-time activation link</div>
+            <div class="flex gap-2 mt-2">
+                <input id="activation-url" readonly class="flex-1 px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-xs">
+                <button type="button" onclick="copyActivation()" class="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm">Copy</button>
+            </div>
+            <p class="text-xs text-gray-400 mt-2">Share this link securely. It expires in 24 hours and is shown only in this response.</p>
+        </div>
+    </section>
+
+    <div class="border border-gray-800 rounded-lg overflow-x-auto">
+        <table class="w-full min-w-[760px]">
+            <thead class="bg-gray-900 text-left text-xs text-gray-500 uppercase">
+                <tr><th class="px-4 py-3">User</th><th class="px-4 py-3">Roles</th><th class="px-4 py-3">Status</th><th class="px-4 py-3">Actions</th></tr>
+            </thead>
+            <tbody>
+                {% for user in users %}
+                <tr class="border-t border-gray-800">
+                    <td class="px-4 py-3">
+                        <div class="font-medium">{{ user.display_name or user.username }}</div>
+                        <div class="text-xs text-gray-500">{{ user.username }}{% if user.email %} · {{ user.email }}{% endif %}</div>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-300">
+                        <div>{{ user.role_names or 'No role' }}</div>
+                        <div class="flex flex-wrap gap-x-3 gap-y-1 mt-2">
+                            {% for role in roles %}
+                            <label class="text-xs {% if role.id in user.policy_role_ids %}text-blue-300{% else %}text-gray-500{% endif %}">
+                                <input type="checkbox"
+                                    onchange="changeRole({{ user.id }}, {{ role.id }}, this.checked)"
+                                    {% if role.id in user.assigned_role_ids %}checked{% endif %}
+                                    {% if role.id in user.policy_role_ids %}disabled title="Managed by organization policy"{% endif %}
+                                    class="accent-blue-500">
+                                {{ role.name }}{% if role.id in user.policy_role_ids %} (policy){% endif %}
+                            </label>
+                            {% endfor %}
+                        </div>
+                    </td>
+                    <td class="px-4 py-3 text-sm">
+                        {% if user.status == 'suspended' %}<span class="text-red-300">Suspended</span>
+                        {% elif user.must_change_password %}<span class="text-yellow-300">Activation pending</span>
+                        {% else %}<span class="text-green-300">Active</span>{% endif %}
+                    </td>
+                    <td class="px-4 py-3">
+                        <div class="flex gap-3 text-sm">
+                            {% if user.id != session.get('user_id') %}
+                                {% if user.status == 'active' %}
+                                <button onclick="userAction({{ user.id }}, 'suspend')" class="text-red-400 hover:text-red-300">Suspend</button>
+                                {% else %}
+                                <button onclick="userAction({{ user.id }}, 'resume')" class="text-green-400 hover:text-green-300">Resume</button>
+                                {% endif %}
+                            {% endif %}
+                            <button onclick="resetActivation({{ user.id }})" class="text-blue-400 hover:text-blue-300">Reset activation</button>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const inviteForm = document.getElementById('invite-form');
+inviteForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const data = new FormData(inviteForm);
+    const body = {
+        username: data.get('username'), display_name: data.get('display_name'), email: data.get('email'),
+        role_ids: data.getAll('role_ids').map(Number)
+    };
+    const response = await fetch('/api/admin/users', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const result = await response.json();
+    if (!response.ok) return alert(result.error || 'Unable to create invitation');
+    showActivation(result.activation_url);
+});
+function showActivation(url) {
+    document.getElementById('activation-url').value = new URL(url, window.location.origin).href;
+    document.getElementById('activation-result').classList.remove('hidden');
+}
+async function copyActivation() {
+    await navigator.clipboard.writeText(document.getElementById('activation-url').value);
+}
+async function userAction(userId, action) {
+    const response = await fetch(`/api/admin/users/${userId}/${action}`, {method: 'POST'});
+    const result = await response.json();
+    if (!response.ok) return alert(result.error || 'Action failed');
+    location.reload();
+}
+async function resetActivation(userId) {
+    const response = await fetch(`/api/admin/users/${userId}/reset-activation`, {method: 'POST'});
+    const result = await response.json();
+    if (!response.ok) return alert(result.error || 'Reset failed');
+    showActivation(result.activation_url);
+}
+async function changeRole(userId, roleId, assign) {
+    const response = await fetch(`/api/users/${userId}/roles${assign ? '' : '/' + roleId}`, {
+        method: assign ? 'POST' : 'DELETE',
+        headers: assign ? {'Content-Type': 'application/json'} : {},
+        body: assign ? JSON.stringify({role_id: roleId}) : null
+    });
+    const result = await response.json();
+    if (!response.ok) {
+        alert(result.error || 'Role update failed');
+        return location.reload();
+    }
+    location.reload();
+}
+</script>
+{% endblock %}

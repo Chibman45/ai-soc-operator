@@ -53,7 +53,14 @@ _FILE_TOOLS = {"grep", "rg", "awk", "sed", "jq", "cat", "head", "tail", "strings
 _DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.IGNORECASE)
 
 
-def _tool_scope_target(conn, case_id: int, org_id: int, tool_name: str, args: list[str]) -> str:
+def _tool_scope_target(
+    conn,
+    case_id: int,
+    org_id: int,
+    tool_name: str,
+    args: list[str],
+    user_id: int | None = None,
+) -> str:
     """Return an audited target label after enforcing case and filesystem scope."""
     if tool_name in _NETWORK_TOOLS:
         if case_id == GLOBAL_CASE_ID:
@@ -80,6 +87,14 @@ def _tool_scope_target(conn, case_id: int, org_id: int, tool_name: str, args: li
                     targets.append(base_candidate)
         if not targets or any(target not in allowed for target in targets):
             raise PermissionError("tool target is not an observable in the authorized case scope")
+        if user_id is not None:
+            from web.services.organization_policy import policy_allows_target
+
+            if any(
+                not policy_allows_target(conn, org_id=org_id, user_id=user_id, target=target)
+                for target in targets
+            ):
+                raise PermissionError("tool target is outside your approved organization policy scope")
         return ",".join(sorted(set(targets)))
 
     if tool_name in _FILE_TOOLS:
@@ -280,7 +295,14 @@ def chat_action_approve(case_id: int, action_id: int):
     scoped_target = None
     if action["action_type"] == "tool_execution" and action["tool_name"]:
         try:
-            scoped_target = _tool_scope_target(conn, case_id, org_id, action["tool_name"], tool_args.get("args", []))
+            scoped_target = _tool_scope_target(
+                conn,
+                case_id,
+                org_id,
+                action["tool_name"],
+                tool_args.get("args", []),
+                int(session["user_id"]),
+            )
         except PermissionError as exc:
             conn.close()
             return jsonify({"error": str(exc)}), 403
@@ -374,7 +396,7 @@ def chat_execute_direct(case_id: int):
         return jsonify({"error": "not found"}), 404
 
     try:
-        scoped_target = _tool_scope_target(conn, case_id, org_id, tool_name, args)
+        scoped_target = _tool_scope_target(conn, case_id, org_id, tool_name, args, int(session["user_id"]))
     except PermissionError as exc:
         conn.close()
         return jsonify({"ok": False, "error": str(exc)}), 403

@@ -48,6 +48,58 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS user_invitations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    token_hash TEXT UNIQUE NOT NULL,
+    created_by INTEGER NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    used_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS organization_policy_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    source_name TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    evidence_path TEXT NOT NULL,
+    extracted_json TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    extraction_model TEXT,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'approved', 'rejected')),
+    created_by INTEGER NOT NULL,
+    approved_by INTEGER,
+    approved_at TIMESTAMP,
+    rejected_by INTEGER,
+    rejected_at TIMESTAMP,
+    rejection_reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    FOREIGN KEY (approved_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS organization_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    policy_json TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    source_draft_id INTEGER NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    approved_by INTEGER NOT NULL,
+    approved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(org_id, version),
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (source_draft_id) REFERENCES organization_policy_drafts(id),
+    FOREIGN KEY (approved_by) REFERENCES users(id)
+);
+
 CREATE TABLE IF NOT EXISTS api_rate_limits (
     bucket_key TEXT NOT NULL,
     window_start TIMESTAMP NOT NULL,
@@ -218,6 +270,9 @@ CREATE INDEX IF NOT EXISTS idx_responder_actions_case_id ON responder_actions(ca
 CREATE INDEX IF NOT EXISTS idx_memberships_user_org ON organization_memberships(user_id, org_id);
 CREATE INDEX IF NOT EXISTS idx_api_clients_org ON api_clients(org_id);
 CREATE INDEX IF NOT EXISTS idx_login_attempts_window ON login_attempts(username, ip_address, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_user_invitations_org_user ON user_invitations(org_id, user_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_org_policy_drafts_status ON organization_policy_drafts(org_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_org_policies_active ON organization_policies(org_id, active, version);
 CREATE INDEX IF NOT EXISTS idx_notifications_delivery ON notifications(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_capability_proposals_org_status ON capability_proposals(org_id, status, created_at);
 """
@@ -227,8 +282,20 @@ def init_feature_db(conn) -> None:
     """Initialize feature tables. Safe to call multiple times."""
     conn.executescript(FEATURE_SCHEMA)
 
-    _add_missing_columns(conn, "users", {"default_org_id": "INTEGER", "password_changed_at": "TIMESTAMP", "disabled_at": "TIMESTAMP"})
-    _add_missing_columns(conn, "user_roles", {"org_id": "INTEGER"})
+    _add_missing_columns(
+        conn,
+        "users",
+        {
+            "default_org_id": "INTEGER",
+            "password_changed_at": "TIMESTAMP",
+            "disabled_at": "TIMESTAMP",
+            "display_name": "TEXT",
+            "email": "TEXT",
+            "must_change_password": "INTEGER NOT NULL DEFAULT 0",
+            "session_version": "INTEGER NOT NULL DEFAULT 0",
+        },
+    )
+    _add_missing_columns(conn, "user_roles", {"org_id": "INTEGER", "source": "TEXT NOT NULL DEFAULT 'manual'", "policy_id": "INTEGER"})
     _add_missing_columns(conn, "credentials", {"org_id": "INTEGER"})
     _add_missing_columns(conn, "platform_config", {"org_id": "INTEGER"})
     _add_missing_columns(
@@ -337,7 +404,7 @@ def init_feature_db(conn) -> None:
     # Seed default roles if empty
     import json
     default_roles = [
-        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "playbook.manage", "learning.review", "api_client.manage", "sla.view", "notification.manage", "capability.propose", "capability.approve", "capability.execute"]),
+        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "user.manage", "policy.manage", "policy.approve", "playbook.manage", "learning.review", "api_client.manage", "sla.view", "notification.manage", "capability.propose", "capability.approve", "capability.execute"]),
         ("manager", ["chat.read", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "sla.view", "learning.review", "notification.manage", "capability.approve"]),
         ("senior_analyst", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "tool.execute", "responder.approve", "learning.review", "sla.view", "capability.propose"]),
         ("analyst", ["chat.read", "chat.act", "case.update", "alert.ingest", "report.export"]),
