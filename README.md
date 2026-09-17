@@ -45,7 +45,7 @@ Open the URL, log in with the credentials you created during bootstrap, and conf
 
 ## What Bootstrap Does
 
-Bootstrap runs 7 steps automatically:
+Bootstrap runs 8 steps automatically:
 
 1. **System check** — Python 3.10+ and required system tools
 2. **Virtual environment** — creates `.venv`, installs all Python dependencies into it
@@ -53,11 +53,33 @@ Bootstrap runs 7 steps automatically:
 4. **Codex skills** — installs SOC orchestrator and analyst skills to `~/.agents/skills/`
 5. **Target scope** — sets up `config/scope.toml` with your authorized hosts/CIDRs/domains
 6. **Web portal admin account** — creates your login for the web portal (hashed password stored in local SQLite DB)
-7. **Self-test** — loads all playbooks and runs the full test suite
+7. **Local HTTPS** — on Linux, offers to install Nginx, creates a private local CA, and configures trusted HTTPS without requiring a public domain
+8. **Self-test** — loads all playbooks and runs the full test suite
 
 ### Sudo handling
 
 Before running any command that requires elevated privileges, bootstrap checks for passwordless sudo (`sudo -n true`). If available, it runs automatically. If not, it prints the exact command for you to copy-paste and run manually, then continues without blocking.
+
+### Local HTTPS
+
+On Linux, the full bootstrap offers local HTTPS by default. After approval it
+installs Nginx and OpenSSL when needed, generates a private CA and a 397-day
+server certificate for `localhost`, the machine hostname, and its current LAN
+IP, then asks separately before changing the operating-system trust store.
+
+Nginx owns ports 80 and 443 and proxies to Gunicorn on
+`127.0.0.1:5000`. The application enables `ProxyFix` only in this generated
+reverse-proxy mode. No public domain or Internet certificate service is needed.
+Other analyst workstations must import `data/tls/local-ca.crt` before their
+browsers will trust the local portal.
+Never distribute `data/tls/local-ca.key`; bootstrap restricts it to the local
+OS account because possession of that key permits signing trusted certificates.
+
+To configure or repair only this layer, run:
+
+```bash
+python3 bootstrap.py --setup-local-https
+```
 
 ### After bootstrap
 

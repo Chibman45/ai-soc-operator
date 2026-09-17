@@ -22,6 +22,7 @@ env/
 # Generated config (contains credentials)
 config/platforms.toml
 config/scope.toml
+config/local-https.json
 
 # Runtime artifacts
 audit/

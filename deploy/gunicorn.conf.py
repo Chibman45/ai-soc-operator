@@ -2,7 +2,7 @@ import os
 
 # SQLite is the single-node profile's serialization boundary. One process with
 # multiple threads prevents accidental multi-process write contention.
-bind = "0.0.0.0:5000"
+bind = os.environ.get("AI_SOC_GUNICORN_BIND", "0.0.0.0:5000")
 workers = 1
 threads = int(os.environ.get("AI_SOC_GUNICORN_THREADS", "4"))
 worker_class = "gthread"

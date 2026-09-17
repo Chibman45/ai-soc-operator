@@ -15,8 +15,12 @@ hardening, encrypted stored credentials, authenticated alert ingestion, a live
 alert queue, SLA metrics, durable local job controls, approval-gated responder
 execution, notification delivery, verified backups, non-root containers, CI
 security checks, and reviewable self-learning promotion states.
+The interactive Linux bootstrap can also configure local HTTPS using a private
+CA, Nginx, loopback-only Gunicorn, and deployment-gated `ProxyFix` without a
+public domain.
 
-The full local test suite passes with **228 tests**. This is not a claim that a
+The full local test suite passes with **233 tests** (plus one OpenSSL integration
+test skipped on the Windows development host). This is not a claim that a
 specific environment is production-approved. Remaining deployment evidence and
 scale-out work are tracked in
 [`docs/PRODUCTION_ROADMAP.md`](docs/PRODUCTION_ROADMAP.md):

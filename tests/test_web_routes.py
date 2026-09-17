@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import unittest
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 from web.app import app
 
@@ -21,6 +25,28 @@ class WebRouteRegistrationTests(unittest.TestCase):
         self.assertIn("/api/notifications", routes)
         self.assertIn("/health/live", routes)
         self.assertIn("/health/ready", routes)
+
+    def test_proxy_fix_is_enabled_only_by_deployment_flag(self):
+        environment = os.environ.copy()
+        environment["AI_SOC_BEHIND_PROXY"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from flask import request; from werkzeug.middleware.proxy_fix import ProxyFix; "
+                "from web.app import app; assert isinstance(app.wsgi_app, ProxyFix); "
+                "app.add_url_rule('/_proxy-probe', '_proxy_probe', lambda: {'secure': request.is_secure, 'host': request.host}); "
+                "response=app.test_client().get('/_proxy-probe', headers={'X-Forwarded-Proto':'https','X-Forwarded-Host':'soc-console.local'}); "
+                "assert response.json == {'secure': True, 'host': 'soc-console.local'}",
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

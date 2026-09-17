@@ -31,6 +31,7 @@ from flask import (
     url_for,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from scripts.job_queue import JobQueue
 from scripts.learning import LearningStore, learn_alert, learn_case, learn_playbook_result
@@ -42,6 +43,12 @@ ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "soc_operator.db"
 
 app = Flask(__name__)
+
+# Forwarded headers are trusted only when deployment explicitly enables the
+# reverse-proxy boundary. The bootstrap binds Gunicorn to loopback in this mode,
+# so untrusted clients cannot bypass Nginx and forge these values directly.
+if os.environ.get("AI_SOC_BEHIND_PROXY", "").lower() in {"1", "true", "yes"}:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
 
 def _session_secret() -> str:

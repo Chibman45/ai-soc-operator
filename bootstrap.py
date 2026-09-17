@@ -11,21 +11,24 @@ After cloning the repo, run this once. It will:
 1. Check Python version and system requirements
 2. Install Python dependencies
 3. Detect already-installed security tools
-4. Configure the web portal admin account
-5. Validate connectivity to configured platforms
-6. Install the Codex skill to ~/.agents/skills/
-7. Run a self-test
+4. Install the Codex skill to ~/.agents/skills/
+5. Configure target scope
+6. Configure the web portal admin account
+7. Optionally configure local HTTPS through Nginx
+8. Run a self-test
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import hashlib
 import json
 import os
 import platform
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -39,6 +42,8 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "config"
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "soc_operator.db"
+TLS_DIR = DATA_DIR / "tls"
+LOCAL_HTTPS_MARKER = CONFIG_DIR / "local-https.json"
 VENV_DIR = ROOT / ".venv"
 SKILLS_SRC = ROOT / "skills"
 SKILLS_DEST = Path.home() / ".agents" / "skills"
@@ -72,6 +77,17 @@ def header(msg: str) -> None:
     print(f"{BOLD}{CYAN}{'─' * 60}{RESET}\n")
 
 
+def _configure_console_encoding() -> None:
+    """Keep bootstrap output usable on Windows consoles with legacy encodings."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def sudo_available() -> bool:
     if platform.system() != "Linux":
         return False
@@ -81,7 +97,7 @@ def sudo_available() -> bool:
 
 def print_manual_sudo(command: list[str]) -> None:
     print("Run this manually with sudo, then re-run bootstrap:")
-    print("  " + " ".join(command))
+    print("  " + shlex.join(command))
 
 
 # ── Step 1: System checks ──
@@ -202,7 +218,7 @@ KNOWN_TOOLS = {
 
 
 def detect_tools() -> dict[str, bool]:
-    header("Step 2/6 — Installed Tools Detection")
+    header("Step 2/8 — Installed Tools Detection")
     found = {}
     for tool, meta in KNOWN_TOOLS.items():
         path = shutil.which(tool)
@@ -270,6 +286,327 @@ def install_tools(found: dict[str, bool]) -> None:
     status("Missing tools installed")
 
 
+# ── Local HTTPS: private CA + Nginx reverse proxy ──
+
+def _linux_package_command(packages: list[str]) -> list[str] | None:
+    """Return one allowlisted package-manager command without invoking a shell."""
+    package_names = sorted(set(packages))
+    for manager, prefix in (
+        ("apt-get", ["apt-get", "install", "-y"]),
+        ("dnf", ["dnf", "install", "-y"]),
+        ("yum", ["yum", "install", "-y"]),
+        ("zypper", ["zypper", "--non-interactive", "install"]),
+        ("pacman", ["pacman", "--noconfirm", "-S"]),
+        ("apk", ["apk", "add", "--no-cache"]),
+    ):
+        if shutil.which(manager):
+            return [*prefix, *package_names]
+    return None
+
+
+def _run_privileged(command: list[str], *, capture_output: bool = True) -> subprocess.CompletedProcess[str] | None:
+    """Run an exact privileged argv or print it for manual execution."""
+    if platform.system() != "Linux":
+        return None
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        argv = command
+    elif sudo_available():
+        argv = ["sudo", "-n", *command]
+    else:
+        print_manual_sudo(["sudo", *command])
+        return None
+    return subprocess.run(argv, capture_output=capture_output, text=True, timeout=120, check=False)
+
+
+def _local_network_identity() -> tuple[str, str]:
+    import ipaddress
+    import socket
+
+    hostname = socket.gethostname().strip().lower()
+    hostname = "".join(ch for ch in hostname if ch.isalnum() or ch in {"-", "."}).strip(".-") or "localhost"
+    lan_ip = "127.0.0.1"
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        candidate = sock.getsockname()[0]
+        sock.close()
+        if not ipaddress.ip_address(candidate).is_unspecified:
+            lan_ip = candidate
+    except OSError:
+        pass
+    return hostname, lan_ip
+
+
+def _certificate_extensions(hostname: str, lan_ip: str) -> str:
+    import ipaddress
+
+    ipaddress.ip_address(lan_ip)
+    dns_names = ["localhost"]
+    if hostname != "localhost":
+        dns_names.extend([hostname, f"{hostname}.local"])
+    lines = [
+        "basicConstraints=critical,CA:FALSE",
+        "keyUsage=critical,digitalSignature,keyEncipherment",
+        "extendedKeyUsage=serverAuth",
+        "subjectAltName=@alt_names",
+        "[alt_names]",
+    ]
+    lines.extend(f"DNS.{index}={name}" for index, name in enumerate(dns_names, start=1))
+    addresses = ["127.0.0.1"]
+    if lan_ip not in addresses:
+        addresses.append(lan_ip)
+    lines.extend(f"IP.{index}={address}" for index, address in enumerate(addresses, start=1))
+    return "\n".join(lines) + "\n"
+
+
+def _render_local_nginx_config(hostname: str, lan_ip: str) -> str:
+    names = list(dict.fromkeys(["localhost", hostname, f"{hostname}.local", lan_ip]))
+    server_names = " ".join(names)
+    allowed_hosts = "\n".join(f"    {name} 1;" for name in names)
+    return f"""# Generated by AI SOC Operator bootstrap. Re-run bootstrap to update.
+map $host $ai_soc_valid_host {{
+    default 0;
+{allowed_hosts}
+}}
+
+server {{
+    listen 80;
+    listen [::]:80;
+    server_name {server_names};
+    if ($ai_soc_valid_host = 0) {{ return 444; }}
+    return 301 https://$host$request_uri;
+}}
+
+server {{
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name {server_names};
+    if ($ai_soc_valid_host = 0) {{ return 444; }}
+
+    ssl_certificate /etc/ai-soc-operator/tls/server.crt;
+    ssl_certificate_key /etc/ai-soc-operator/tls/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+    server_tokens off;
+
+    client_max_body_size 5m;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 120s;
+    proxy_read_timeout 120s;
+
+    location / {{
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+    }}
+}}
+"""
+
+
+def _ensure_local_runtime_secrets() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    secrets_to_create = {
+        DATA_DIR / ".session_secret": secrets.token_hex(32),
+        DATA_DIR / ".credential_key": base64.urlsafe_b64encode(os.urandom(32)).decode("ascii"),
+    }
+    for path, value in secrets_to_create.items():
+        if not path.exists():
+            path.write_text(value, encoding="ascii")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+
+def _generate_local_certificate(hostname: str, lan_ip: str) -> bool:
+    TLS_DIR.mkdir(parents=True, exist_ok=True)
+    ca_key = TLS_DIR / "local-ca.key"
+    ca_cert = TLS_DIR / "local-ca.crt"
+    server_key = TLS_DIR / "server.key"
+    server_csr = TLS_DIR / "server.csr"
+    server_cert = TLS_DIR / "server.crt"
+    extensions = TLS_DIR / "server-extensions.cnf"
+    extensions.write_text(_certificate_extensions(hostname, lan_ip), encoding="ascii")
+
+    commands: list[list[str]] = []
+    if not ca_key.exists() or not ca_cert.exists():
+        commands.extend(
+            [
+                ["openssl", "genrsa", "-out", str(ca_key), "3072"],
+                [
+                    "openssl", "req", "-x509", "-new", "-sha256", "-days", "3650",
+                    "-key", str(ca_key), "-out", str(ca_cert),
+                    "-subj", "/CN=AI SOC Operator Local CA",
+                ],
+            ]
+        )
+    commands.extend(
+        [
+            ["openssl", "genrsa", "-out", str(server_key), "3072"],
+            [
+                "openssl", "req", "-new", "-sha256", "-key", str(server_key),
+                "-out", str(server_csr), "-subj", f"/CN={hostname}",
+            ],
+            [
+                "openssl", "x509", "-req", "-sha256", "-days", "397",
+                "-in", str(server_csr), "-CA", str(ca_cert), "-CAkey", str(ca_key),
+                "-CAcreateserial", "-out", str(server_cert), "-extfile", str(extensions),
+            ],
+            ["openssl", "verify", "-CAfile", str(ca_cert), str(server_cert)],
+        ]
+    )
+    for command in commands:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+        if result.returncode != 0:
+            error(f"Certificate generation failed: {result.stderr.strip()[:500]}")
+            return False
+    for path in (ca_key, server_key):
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    server_csr.unlink(missing_ok=True)
+    status("Local CA and HTTPS server certificate generated")
+    return True
+
+
+def _install_local_ca(ca_cert: Path) -> bool:
+    distro = ""
+    try:
+        values = {}
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value.strip().strip('"')
+        distro = f"{values.get('ID', '')} {values.get('ID_LIKE', '')}".lower()
+    except OSError:
+        pass
+    if shutil.which("update-ca-certificates"):
+        destination = (
+            "/etc/pki/trust/anchors/ai-soc-operator-local-ca.crt"
+            if any(name in distro for name in ("suse", "opensuse"))
+            else "/usr/local/share/ca-certificates/ai-soc-operator-local-ca.crt"
+        )
+        update_command = ["update-ca-certificates"]
+    elif shutil.which("update-ca-trust"):
+        destination = "/etc/pki/ca-trust/source/anchors/ai-soc-operator-local-ca.crt"
+        update_command = ["update-ca-trust", "extract"]
+    else:
+        if shutil.which("trust"):
+            anchored = _run_privileged(["trust", "anchor", str(ca_cert)])
+            return bool(anchored and anchored.returncode == 0)
+        warn(f"No supported system trust command found. Import this CA manually: {ca_cert}")
+        return False
+    copied = _run_privileged(["install", "-m", "0644", str(ca_cert), destination])
+    if not copied or copied.returncode != 0:
+        return False
+    updated = _run_privileged(update_command)
+    return bool(updated and updated.returncode == 0)
+
+
+def setup_local_https(*, ask_enable: bool = True) -> bool:
+    """Configure local TLS after explicit consent to privileged host changes."""
+    header("Step 7/8 - Local HTTPS")
+    if platform.system() != "Linux":
+        warn("Automatic Nginx HTTPS setup is currently available only on Linux")
+        return False
+    if ask_enable:
+        answer = input("Enable local HTTPS with Nginx? [Y/n] ").strip().lower()
+        if answer not in {"", "y", "yes"}:
+            if LOCAL_HTTPS_MARKER.exists():
+                warn("Local HTTPS setup skipped; the existing HTTPS configuration was left unchanged")
+            else:
+                warn("Local HTTPS setup skipped; the portal remains loopback HTTP")
+            return False
+
+    missing = [binary for binary in ("nginx", "openssl") if not shutil.which(binary)]
+    if missing:
+        command = _linux_package_command(missing)
+        if not command:
+            warn("No supported Linux package manager found for Nginx/OpenSSL")
+            return False
+        print(f"The following system packages are required: {', '.join(missing)}")
+        answer = input("Approve installation of these packages? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            warn("Package installation was not approved")
+            return False
+        installed = _run_privileged(command)
+        if not installed or installed.returncode != 0:
+            if installed:
+                error(f"Package installation failed: {installed.stderr.strip()[:500]}")
+            return False
+
+    hostname, lan_ip = _local_network_identity()
+    if not _generate_local_certificate(hostname, lan_ip):
+        return False
+    _ensure_local_runtime_secrets()
+    staged_config = TLS_DIR / "ai-soc-operator.nginx.conf"
+    staged_config.write_text(_render_local_nginx_config(hostname, lan_ip), encoding="utf-8")
+
+    nginx_config_dir = Path("/etc/nginx/http.d") if Path("/etc/nginx/http.d").is_dir() else Path("/etc/nginx/conf.d")
+    install_steps = [
+        ["install", "-d", "-m", "0755", "/etc/ai-soc-operator/tls"],
+        ["install", "-d", "-m", "0755", str(nginx_config_dir)],
+        ["install", "-m", "0644", str(TLS_DIR / "server.crt"), "/etc/ai-soc-operator/tls/server.crt"],
+        ["install", "-m", "0600", str(TLS_DIR / "server.key"), "/etc/ai-soc-operator/tls/server.key"],
+        ["install", "-m", "0644", str(staged_config), str(nginx_config_dir / "ai-soc-operator.conf")],
+    ]
+    for command in install_steps:
+        result = _run_privileged(command)
+        if not result or result.returncode != 0:
+            if result:
+                error(f"Nginx file installation failed: {result.stderr.strip()[:500]}")
+            return False
+
+    nginx_test = _run_privileged(["nginx", "-t"])
+    if not nginx_test or nginx_test.returncode != 0:
+        if nginx_test:
+            error(f"Nginx configuration validation failed: {nginx_test.stderr.strip()[:500]}")
+        return False
+    nginx_dump = _run_privileged(["nginx", "-T"])
+    rendered = "" if not nginx_dump else f"{nginx_dump.stdout}\n{nginx_dump.stderr}"
+    if not nginx_dump or nginx_dump.returncode != 0 or "AI SOC Operator bootstrap" not in rendered:
+        error("Nginx does not include the generated AI SOC Operator configuration")
+        return False
+    if shutil.which("systemctl"):
+        reload_result = _run_privileged(["systemctl", "enable", "--now", "nginx"])
+        if reload_result and reload_result.returncode == 0:
+            reload_result = _run_privileged(["systemctl", "reload", "nginx"])
+    else:
+        reload_result = _run_privileged(["nginx", "-s", "reload"])
+        if reload_result and reload_result.returncode != 0:
+            reload_result = _run_privileged(["nginx"])
+    if not reload_result or reload_result.returncode != 0:
+        error("Nginx could not be started or reloaded")
+        return False
+
+    trust_answer = input("Trust the generated local CA on this machine? [Y/n] ").strip().lower()
+    trusted = trust_answer in {"", "y", "yes"} and _install_local_ca(TLS_DIR / "local-ca.crt")
+    if trusted:
+        status("Local CA added to the operating-system trust store")
+    else:
+        warn(f"Import {TLS_DIR / 'local-ca.crt'} into each browser/client that should trust this portal")
+
+    marker = {
+        "enabled": True,
+        "hostname": hostname,
+        "lan_ip": lan_ip,
+        "local_url": "https://localhost",
+        "network_url": f"https://{lan_ip}",
+        "ca_certificate": str(TLS_DIR / "local-ca.crt"),
+        "ca_trusted_locally": trusted,
+    }
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    LOCAL_HTTPS_MARKER.write_text(json.dumps(marker, indent=2), encoding="utf-8")
+    status(f"Local HTTPS configured: {marker['local_url']}")
+    return True
+
+
 
 PLATFORM_DEFAULTS = {
     "thehive": "https://thehive.example.com",
@@ -286,6 +623,7 @@ PLATFORM_DEFAULTS = {
 
 
 def write_blank_platform_config() -> None:
+    header("Step 3/8 — Platform Configuration")
     output = CONFIG_DIR / "platforms.toml"
     # Ensure config/ exists and is owned by current user (not root from a sudo run)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -314,7 +652,7 @@ def write_blank_platform_config() -> None:
 # ── Step 5: Validate connectivity ──
 
 def validate_connectivity(config: dict[str, Any]) -> None:
-    header("Step 5/6 — Connectivity Validation")
+    header("Connectivity Validation")
     import ssl
     import urllib.error
     import urllib.request
@@ -352,7 +690,7 @@ def validate_connectivity(config: dict[str, Any]) -> None:
 # ── Step 6: Install Codex skills ──
 
 def install_skills() -> bool:
-    header("Step 3/6 — Installing Codex Skills")
+    header("Step 4/8 — Installing Codex Skills")
     if not SKILLS_SRC.is_dir():
         warn(f"Skills source not found: {SKILLS_SRC}")
         return False
@@ -433,7 +771,7 @@ def install_system_command() -> None:
 # ── Step 7: Scope configuration ──
 
 def configure_scope() -> None:
-    header("Step 4/6 — Target Scope")
+    header("Step 5/8 — Target Scope")
     scope_file = CONFIG_DIR / "scope.toml"
     if scope_file.exists():
         status(f"Scope already configured: {scope_file}")
@@ -497,7 +835,7 @@ def hash_password(password: str, salt: str | None = None) -> str:
 
 
 def setup_web_credentials() -> None:
-    header("Step 5/6 — Web Portal Admin Account")
+    header("Step 6/8 — Web Portal Admin Account")
     create_account = input("Create web portal admin account? [Y/n] ").strip().lower()
     if create_account in {"n", "no"}:
         warn("Skipping web portal setup")
@@ -548,7 +886,7 @@ def setup_web_credentials() -> None:
 # ── Step 9: Self-test ──
 
 def run_self_test() -> bool:
-    header("Step 6/6 — Self-Test")
+    header("Step 8/8 — Self-Test")
     # Test playbook loading
     try:
         sys.path.insert(0, str(ROOT))
@@ -605,6 +943,7 @@ def run_self_test() -> bool:
 # ── Main ──
 
 def main() -> int:
+    _configure_console_encoding()
     parser = argparse.ArgumentParser(
         description="AI SOC Operator — Bootstrap CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -620,6 +959,10 @@ def main() -> int:
     parser.add_argument(
         "--validate", action="store_true",
         help="Validate existing configuration",
+    )
+    parser.add_argument(
+        "--setup-local-https", action="store_true",
+        help="Configure Nginx and a private local CA for HTTPS",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -644,6 +987,9 @@ def main() -> int:
         install_skills()
         return 0
 
+    if args.setup_local_https:
+        return 0 if setup_local_https(ask_enable=False) else 1
+
     # ── Validate mode ──
     if args.validate:
         config = load_existing_config()
@@ -664,6 +1010,7 @@ def main() -> int:
     install_system_command()
     configure_scope()
     setup_web_credentials()
+    https_enabled = setup_local_https()
     run_self_test()
 
     header("Bootstrap Complete")
@@ -671,6 +1018,8 @@ def main() -> int:
     print(f"\nNext steps:")
     print(f"  1. Review config/platforms.toml and config/scope.toml")
     print(f"  2. Open the web portal → Settings → Platform Connections to add your API keys and base URLs")
+    if https_enabled:
+        print(f"     Portal URL: https://localhost")
     print(f"  3. Activate the virtual environment:")
     print(f"     source .venv/bin/activate")
     print(f"  4. Run an alert through the orchestrator:")

@@ -10,3 +10,4 @@ evidence
 reports/generated
 config/platforms.toml
 config/scope.toml
+config/local-https.json
