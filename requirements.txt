@@ -6,6 +6,9 @@ python-dateutil>=2.8.0
 flask>=3.0.0
 cryptography>=42.0.0
 gunicorn>=22.0.0
+psycopg[binary]>=3.2.0
+redis>=5.0.0
+celery>=5.4.0
 
 # Document parsing (playbook upload)
 pdfminer.six>=20221105

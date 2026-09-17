@@ -14,16 +14,17 @@ from scripts.job_queue import JobQueue
 from web.services.capabilities import execute_capability_proposal
 from web.services.notifications import dispatch_pending, notify_case_event
 from web.services.schema_features import init_feature_db
+from web.services.database import connect_database
+from web.services.credential_vault import open_secret
+from web.services.external_sync import sync_misp_events, sync_thehive_cases
 
 
 DB_PATH = ROOT / "data" / "soc_operator.db"
+_LAST_EXTERNAL_SYNC = 0.0
 
 
 def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
+    conn = connect_database(db_path)
     init_feature_db(conn)
     return conn
 
@@ -112,6 +113,48 @@ def recover_stale_capabilities(conn: sqlite3.Connection) -> int:
     return int(result.rowcount)
 
 
+def synchronize_external_platforms(conn) -> list[dict]:
+    """Pull configured TheHive cases and MISP events with idempotent mappings."""
+    global _LAST_EXTERNAL_SYNC
+    if os.environ.get("AI_SOC_EXTERNAL_SYNC", "1").lower() not in {"1", "true", "yes"}:
+        return []
+    interval = max(30, int(os.environ.get("AI_SOC_EXTERNAL_SYNC_INTERVAL", "300")))
+    if time.monotonic() - _LAST_EXTERNAL_SYNC < interval:
+        return []
+    _LAST_EXTERNAL_SYNC = time.monotonic()
+    from scripts.orchestrator import build_clients
+    from web.app import load_config_for_web
+
+    results: list[dict] = []
+    for organization in conn.execute("SELECT id FROM organizations ORDER BY id").fetchall():
+        org_id = int(organization["id"])
+        credentials = {
+            row["key_name"]: open_secret(row["key_value"])
+            for row in conn.execute(
+                "SELECT key_name, key_value FROM credentials WHERE org_id = ?", (org_id,)
+            ).fetchall()
+        }
+        clients = build_clients(load_config_for_web(org_id), credentials=credentials)
+        for platform, syncer in (("thehive", sync_thehive_cases), ("misp", sync_misp_events)):
+            client = clients.get(platform)
+            if not client:
+                continue
+            try:
+                results.append(
+                    syncer(
+                        conn,
+                        org_id=org_id,
+                        client=client,
+                        limit=max(1, int(os.environ.get("AI_SOC_EXTERNAL_SYNC_LIMIT", "5000"))),
+                    )
+                )
+                conn.commit()
+            except Exception as exc:
+                conn.commit()  # Preserve the integration error state for operators.
+                audit("external_sync_failed", org_id=org_id, platform=platform, error=str(exc)[:500])
+    return results
+
+
 def run_once(db_path: Path = DB_PATH) -> dict:
     # JobQueue owns the jobs schema, so initialize it before notification scans
     # on a brand-new deployment.
@@ -121,6 +164,7 @@ def run_once(db_path: Path = DB_PATH) -> dict:
         queued = scan_workflow_notifications(conn)
         stale_capabilities = recover_stale_capabilities(conn)
         capabilities = execute_approved_capabilities(conn)
+        integrations = synchronize_external_platforms(conn)
         notifications = dispatch_pending(conn, limit=50)
         conn.execute(
             """
@@ -129,7 +173,7 @@ def run_once(db_path: Path = DB_PATH) -> dict:
             ON CONFLICT(component) DO UPDATE SET
                 heartbeat_at = CURRENT_TIMESTAMP, details_json = excluded.details_json
             """,
-            (json.dumps({"notifications": len(notifications), "capabilities": len(capabilities)}),),
+            (json.dumps({"notifications": len(notifications), "capabilities": len(capabilities), "integrations": len(integrations)}),),
         )
         conn.commit()
     finally:
@@ -141,6 +185,7 @@ def run_once(db_path: Path = DB_PATH) -> dict:
         "executed_capabilities": len(capabilities),
         "recovered_capabilities": stale_capabilities,
         "recovered_jobs": recovered,
+        "synchronized_integrations": len(integrations),
     }
     audit("operations_worker_cycle", **result)
     return result

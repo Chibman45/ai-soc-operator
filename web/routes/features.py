@@ -5,15 +5,19 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from flask import Blueprint, jsonify, request, session
 from scripts.common import audit
 from web.security import (
+    claim_case_for_mutation,
     current_org_id,
     login_required as _login_required,
     permission_required as _require_permission,
+    permissions_for_user,
     role_required as _require_role,
     session_or_api_scope,
 )
+from web.services.database import connect_database
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -21,12 +25,8 @@ features_bp = Blueprint("features", __name__)
 
 
 def _get_db():
-    import sqlite3
     db_path = ROOT / "data" / "soc_operator.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_database(db_path)
 
 
 def _parse_utc(value: str | None) -> datetime | None:
@@ -427,6 +427,7 @@ def poller_poll_once():
 def assign_case(case_id: int):
     payload = request.get_json(force=True)
     assignee_id = payload.get("assignee_id")
+    expected_version = payload.get("expected_version")
 
     conn = _get_db()
     org_id = current_org_id(conn)
@@ -435,16 +436,78 @@ def assign_case(case_id: int):
         if not member:
             conn.close()
             return jsonify({"error": "assignee is not an active organization member"}), 400
-    updated = conn.execute(
-        "UPDATE cases SET assignee_id = ?, first_response_at = COALESCE(first_response_at, CURRENT_TIMESTAMP) WHERE id = ? AND org_id = ?",
-        (assignee_id, case_id, org_id),
-    ).rowcount
+    query = """
+        UPDATE cases SET assignee_id = ?,
+            first_response_at = COALESCE(first_response_at, CURRENT_TIMESTAMP),
+            row_version = COALESCE(row_version, 0) + 1
+        WHERE id = ? AND org_id = ?
+    """
+    params = [assignee_id, case_id, org_id]
+    if expected_version is not None:
+        query += " AND COALESCE(row_version, 0) = ?"
+        params.append(int(expected_version))
+    updated = conn.execute(query, params).rowcount
     if not updated:
         conn.close()
-        return jsonify({"error": "not found"}), 404
+        return jsonify({"error": "case changed or was not found"}), 409
     conn.commit()
     conn.close()
+    audit("case_assigned", org_id=org_id, case_id=case_id, assignee_id=assignee_id, actor_id=session.get("user_id"))
+    return jsonify({"ok": True, "assignee_id": assignee_id})
 
+
+@features_bp.post("/api/cases/<int:case_id>/claim")
+@_require_permission("case.update")
+def claim_case(case_id: int):
+    conn = _get_db()
+    org_id = int(current_org_id(conn))
+    user_id = int(session["user_id"])
+    claimed = conn.execute(
+        """
+        UPDATE cases SET assignee_id = ?, first_response_at = COALESCE(first_response_at, CURRENT_TIMESTAMP),
+            row_version = COALESCE(row_version, 0) + 1
+        WHERE id = ? AND org_id = ? AND assignee_id IS NULL
+        """,
+        (user_id, case_id, org_id),
+    ).rowcount
+    owner = conn.execute(
+        "SELECT assignee_id FROM cases WHERE id = ? AND org_id = ?",
+        (case_id, org_id),
+    ).fetchone()
+    if not owner:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if not claimed and owner["assignee_id"] != user_id:
+        conn.close()
+        return jsonify({"error": "case is already assigned"}), 409
+    conn.commit()
+    conn.close()
+    audit("case_claimed", org_id=org_id, case_id=case_id, actor_id=user_id)
+    return jsonify({"ok": True, "assignee_id": user_id})
+
+
+@features_bp.post("/api/cases/<int:case_id>/release")
+@_require_permission("case.update")
+def release_case(case_id: int):
+    conn = _get_db()
+    org_id = int(current_org_id(conn))
+    user_id = int(session["user_id"])
+    elevated = "case.assign" in permissions_for_user(conn, user_id, org_id)
+    query = """
+        UPDATE cases SET assignee_id = NULL, row_version = COALESCE(row_version, 0) + 1
+        WHERE id = ? AND org_id = ?
+    """
+    params: list[Any] = [case_id, org_id]
+    if not elevated:
+        query += " AND assignee_id = ?"
+        params.append(user_id)
+    updated = conn.execute(query, params).rowcount
+    if not updated:
+        conn.close()
+        return jsonify({"error": "case is not assigned to you"}), 409
+    conn.commit()
+    conn.close()
+    audit("case_released", org_id=org_id, case_id=case_id, actor_id=user_id)
     return jsonify({"ok": True})
 
 
@@ -484,8 +547,12 @@ def case_sla(case_id: int):
 def close_case(case_id: int):
     conn = _get_db()
     org_id = current_org_id(conn)
+    if not claim_case_for_mutation(conn, case_id, int(session["user_id"]), int(org_id)):
+        conn.close()
+        return jsonify({"error": "case is assigned to another analyst"}), 409
     updated = conn.execute(
-        "UPDATE cases SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ? AND org_id = ? AND status != 'closed'",
+        "UPDATE cases SET status = 'closed', closed_at = CURRENT_TIMESTAMP, row_version = row_version + 1 "
+        "WHERE id = ? AND org_id = ? AND status != 'closed'",
         (case_id, org_id),
     ).rowcount
     if not updated:
@@ -493,6 +560,7 @@ def close_case(case_id: int):
         return jsonify({"error": "not found or already closed"}), 404
     conn.commit()
     conn.close()
+    audit("case_closed", org_id=org_id, case_id=case_id, actor_id=session["user_id"])
     return jsonify({"ok": True})
 
 
@@ -565,10 +633,9 @@ def add_observable(case_id: int):
     init_feature_db(conn)
 
     org_id = current_org_id(conn)
-    case = conn.execute("SELECT 1 FROM cases WHERE id = ? AND org_id = ?", (case_id, org_id)).fetchone()
-    if not case:
+    if not claim_case_for_mutation(conn, case_id, int(session["user_id"]), int(org_id)):
         conn.close()
-        return jsonify({"error": "not found"}), 404
+        return jsonify({"error": "case is assigned to another analyst"}), 409
     conn.execute(
         "INSERT INTO observables (org_id, case_id, type, value, source) VALUES (?, ?, ?, ?, ?)",
         (org_id, case_id, obs_type, obs_value, source),

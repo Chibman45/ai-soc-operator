@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from flask import Blueprint, jsonify, make_response
 from web.security import current_org_id, permission_required
+from web.services.database import connect_database
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -15,12 +16,8 @@ export_bp = Blueprint("export", __name__, url_prefix="/api/cases")
 
 
 def _get_db():
-    import sqlite3
     db_path = ROOT / "data" / "soc_operator.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_database(db_path)
 
 
 def _generate_markdown(case, activity, chat_history) -> str:

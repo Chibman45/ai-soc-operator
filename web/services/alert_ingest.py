@@ -58,7 +58,8 @@ def ingest_alert_record(
     org_id: int | None = None,
 ) -> dict[str, Any]:
     """Store an alert, correlate IOCs, select playbook, and optionally queue it."""
-    from web.app import job_queue, load_config_for_web, _execute_run_job
+    from web.app import job_queue, load_config_for_web
+    from web.services.playbook_jobs import dispatch_playbook_job
 
     if org_id is None:
         raise ValueError("organization context is required for alert ingestion")
@@ -171,54 +172,7 @@ def ingest_alert_record(
         )
         conn.commit()
 
-        def execute(alert_data: dict, progress_cb):
-            # Runs in a background worker thread. sqlite3 connections are bound
-            # to the thread that created them, so open a fresh connection here
-            # rather than reusing the request-thread `conn`.
-            from web.app import get_db
-
-            wconn = get_db()
-            try:
-                run_id = _create_run_for_ingested_alert(
-                    wconn,
-                    selected_playbook or playbook_path.name,
-                    alert_id,
-                    source,
-                    org_id,
-                )
-                wconn.execute("UPDATE jobs SET run_id = ? WHERE id = ? AND org_id = ?", (run_id, job_id, org_id))
-                wconn.execute("UPDATE alerts SET status = 'running' WHERE id = ? AND org_id = ?", (alert_id, org_id))
-                wconn.commit()
-                try:
-                    result = _execute_run_job(run_id, playbook_path, alert_data, config, progress_cb, int(org_id or 0))
-                    case = wconn.execute(
-                        "SELECT id FROM cases WHERE run_id = ? AND org_id = ? ORDER BY id DESC LIMIT 1",
-                        (run_id, org_id),
-                    ).fetchone()
-                    case_id = case["id"] if case else None
-                    wconn.execute(
-                        """
-                        UPDATE alerts
-                        SET status = 'case_created', case_id = ?, first_response_at = CURRENT_TIMESTAMP
-                        WHERE id = ? AND org_id = ?
-                        """,
-                        (case_id, alert_id, org_id),
-                    )
-                    if case_id:
-                        wconn.execute(
-                            "UPDATE observables SET case_id = ? WHERE alert_id = ? AND org_id = ? AND case_id IS NULL",
-                            (case_id, alert_id, org_id),
-                        )
-                    wconn.commit()
-                    return result
-                except Exception:
-                    wconn.execute("UPDATE alerts SET status = 'failed' WHERE id = ? AND org_id = ?", (alert_id, org_id))
-                    wconn.commit()
-                    raise
-            finally:
-                wconn.close()
-
-        job_queue.execute_job(job_id, execute)
+        dispatch_playbook_job(job_queue, job_id)
 
     learn_alert(normalized, source=source, playbook=selected_playbook, org_id=org_id)
     audit(

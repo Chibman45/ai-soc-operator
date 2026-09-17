@@ -35,12 +35,15 @@
                 <a href="{{ url_for('reports') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.endpoint == 'reports' %}bg-gray-800 text-blue-400{% endif %}">
                     📄 Reports
                 </a>
+                <a href="{{ url_for('threat_intel') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.endpoint == 'threat_intel' %}bg-gray-800 text-blue-400{% endif %}">
+                    🔎 Threat Intel
+                </a>
                 {% if can('credential.manage') %}
                 <a href="{{ url_for('credentials') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.endpoint == 'credentials' %}bg-gray-800 text-blue-400{% endif %}">
                     🔑 Credentials
                 </a>
                 {% endif %}
-                {% if can('user.manage') or can('policy.manage') %}
+                {% if can('user.manage') or can('policy.manage') or can('infrastructure.manage') %}
                 <div class="pt-4 pb-1 px-3 text-xs uppercase text-gray-600">Administration</div>
                 {% endif %}
                 {% if can('user.manage') %}
@@ -51,6 +54,11 @@
                 {% if can('policy.manage') %}
                 <a href="{{ url_for('admin.policy_page') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.endpoint == 'admin.policy_page' %}bg-gray-800 text-blue-400{% endif %}">
                     🧭 Organization Policy
+                </a>
+                {% endif %}
+                {% if can('infrastructure.manage') %}
+                <a href="{{ url_for('admin.infrastructure_page') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.endpoint == 'admin.infrastructure_page' %}bg-gray-800 text-blue-400{% endif %}">
+                    ⚙ Infrastructure
                 </a>
                 {% endif %}
             </nav>

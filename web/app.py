@@ -16,6 +16,7 @@ import os
 import secrets
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,7 @@ from web.security import (
     permissions_for_user,
 )
 from web.services.credential_vault import open_secret, seal_secret
+from web.services.database import connect_database
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "soc_operator.db"
@@ -120,7 +122,7 @@ job_queue = JobQueue(DB_PATH)
 
 # ── Database ──
 
-def get_db() -> sqlite3.Connection:
+def get_db():
     data_dir = DB_PATH.parent
     data_dir.mkdir(parents=True, exist_ok=True)
     # Check writability — common failure when bootstrap ran as root
@@ -141,11 +143,7 @@ def get_db() -> sqlite3.Connection:
             file=sys.stderr,
         )
         sys.exit(1)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
+    return connect_database(DB_PATH)
 
 
 def init_db() -> None:
@@ -579,24 +577,40 @@ def dashboard():
         """,
         (org_id,),
     ).fetchall()
-    # SQLite computes the operational metrics from persisted UTC timestamps so
-    # dashboard values survive process restarts and can be audited later.
-    sla = conn.execute(
-        """
-        SELECT
-          ROUND(AVG(CASE WHEN first_response_at IS NOT NULL
-            THEN (julianday(first_response_at) - julianday(COALESCE(opened_at, created_at))) * 24 END), 2) AS mtta_hours,
-          ROUND(AVG(CASE WHEN closed_at IS NOT NULL
-            THEN (julianday(closed_at) - julianday(COALESCE(opened_at, created_at))) * 24 END), 2) AS mttr_hours
-        FROM cases WHERE org_id = ?
-        """,
+    # Compute from stored UTC values in Python so SQLite and PostgreSQL produce
+    # identical metrics without backend-specific date functions.
+    metric_rows = conn.execute(
+        "SELECT created_at, opened_at, first_response_at, closed_at FROM cases WHERE org_id = ?",
         (org_id,),
-    ).fetchone()
+    ).fetchall()
+    response_hours = [_elapsed_hours(row["opened_at"] or row["created_at"], row["first_response_at"]) for row in metric_rows]
+    resolution_hours = [_elapsed_hours(row["opened_at"] or row["created_at"], row["closed_at"]) for row in metric_rows]
+    response_hours = [value for value in response_hours if value is not None]
+    resolution_hours = [value for value in resolution_hours if value is not None]
+    sla = {
+        "mtta_hours": round(sum(response_hours) / len(response_hours), 2) if response_hours else None,
+        "mttr_hours": round(sum(resolution_hours) / len(resolution_hours), 2) if resolution_hours else None,
+    }
     conn.close()
     return render_template(
         "dashboard.html", runs=runs, cases=cases, activity=recent_log,
         alerts=alerts, sla=sla,
     )
+
+
+def _elapsed_hours(start: Any, end: Any) -> float | None:
+    if not start or not end:
+        return None
+    def parse(value: Any) -> datetime:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc)
+    try:
+        return max(0.0, (parse(end) - parse(start)).total_seconds() / 3600)
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Routes: Agent Run ──
@@ -689,17 +703,9 @@ def run_agent():
         idempotency_key=idempotency_key,
     )
     learn_alert(alert, source="manual_run", playbook=playbook, org_id=int(org_id))
-    job_queue.execute_job(
-        job_id,
-        lambda alert_data, progress_cb: _execute_run_job(
-            run_id,
-            playbook_path,
-            alert_data,
-            config,
-            progress_cb,
-            int(org_id),
-        ),
-    )
+    from web.services.playbook_jobs import dispatch_playbook_job
+
+    dispatch_playbook_job(job_queue, job_id)
 
     return jsonify({"run_id": run_id, "job_id": job_id, "status": "queued"})
 
@@ -795,11 +801,38 @@ def _execute_run_job(
         case_title = f"Auto-created from {playbook_path.name}"
         case_summary = result_json[:500]
         severity = result.get("triage_result", {}).get("tier", "medium")
+        external_thehive_id = _thehive_case_id(result)
         cursor = conn.execute(
-            "INSERT INTO cases (org_id, run_id, title, severity, status, summary, report_path, opened_at) VALUES (?, ?, ?, ?, 'open', ?, ?, CURRENT_TIMESTAMP)",
-            (org_id, run_id, case_title, severity, case_summary, result.get("report_path")),
+            """
+            INSERT INTO cases
+                (org_id, run_id, case_id, title, severity, status, summary, report_path,
+                 opened_at, source_platform)
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, CURRENT_TIMESTAMP, ?)
+            """,
+            (
+                org_id,
+                run_id,
+                external_thehive_id,
+                case_title,
+                severity,
+                case_summary,
+                result.get("report_path"),
+                "thehive" if external_thehive_id else "local",
+            ),
         )
         case_id = cursor.lastrowid
+        if external_thehive_id:
+            from web.services.external_sync import record_external_object
+
+            record_external_object(
+                conn,
+                org_id=org_id,
+                platform="thehive",
+                object_type="case",
+                external_id=external_thehive_id,
+                local_case_id=int(case_id),
+                payload={"source": "playbook", "run_id": run_id},
+            )
         conn.execute(
             "INSERT INTO activity_log (org_id, run_id, step, status, detail) VALUES (?, ?, 'complete', 'done', 'Playbook execution completed')",
             (org_id, run_id),
@@ -834,6 +867,19 @@ def _execute_run_job(
         conn.close()
 
 
+def _thehive_case_id(result: dict[str, Any]) -> str | None:
+    """Find the external case created by a completed TheHive playbook step."""
+    for step in (result.get("steps") or {}).values():
+        if (
+            isinstance(step, dict)
+            and step.get("type") == "thehive"
+            and step.get("status") == "completed"
+            and step.get("case_id")
+        ):
+            return str(step["case_id"])
+    return None
+
+
 # ── Routes: Cases ──
 
 @app.route("/cases")
@@ -850,11 +896,23 @@ def cases():
     elif assignment == "unassigned":
         where += " AND assignee_id IS NULL"
     cases = conn.execute(
-        f"SELECT * FROM cases WHERE {where} ORDER BY created_at DESC",
+        f"""
+        SELECT c.*, u.username AS assignee_name
+        FROM cases c LEFT JOIN users u ON u.id = c.assignee_id
+        WHERE {where.replace('org_id', 'c.org_id')} ORDER BY c.created_at DESC
+        """,
         params,
     ).fetchall()
+    members = conn.execute(
+        """
+        SELECT u.id, u.username FROM organization_memberships om
+        JOIN users u ON u.id = om.user_id
+        WHERE om.org_id = ? AND om.status = 'active' ORDER BY lower(u.username)
+        """,
+        (org_id,),
+    ).fetchall()
     conn.close()
-    return render_template("cases.html", cases=cases)
+    return render_template("cases.html", cases=cases, members=members, assignment=assignment)
 
 
 @app.route("/cases/<int:case_id>")
@@ -953,6 +1011,23 @@ def reports():
     ).fetchall()
     conn.close()
     return render_template("reports.html", cases=cases_with_reports)
+
+
+@app.route("/intel")
+@login_required
+def threat_intel():
+    conn = get_db()
+    org_id = current_org_id(conn)
+    events = conn.execute(
+        "SELECT * FROM intel_events WHERE org_id = ? ORDER BY updated_at DESC LIMIT 250",
+        (org_id,),
+    ).fetchall()
+    sync_state = conn.execute(
+        "SELECT * FROM integration_sync_state WHERE org_id = ? AND platform = 'misp' AND object_type = 'event'",
+        (org_id,),
+    ).fetchone()
+    conn.close()
+    return render_template("intel.html", events=events, sync_state=sync_state)
 
 
 # ── Routes: API (for AJAX) ──

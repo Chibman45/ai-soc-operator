@@ -7,9 +7,11 @@ Jobs can be paused, resumed, cancelled, and monitored via web portal.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -61,15 +63,23 @@ class JobQueue:
 
     def __init__(self, db_path: Path = ROOT / "data" / "soc_operator.db"):
         self.db_path = db_path
-        self._workers: dict[str, threading.Thread] = {}
+        self.max_workers = max(1, int(os.environ.get("AI_SOC_LOCAL_MAX_WORKERS", "4")))
+        self._pool = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="soc-job")
+        self._workers: dict[str, Future] = {}
+        self._worker_lock = threading.Lock()
         self._executors: dict[str, Callable] = {}
         self._init_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get database connection."""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
+        from web.services.database import connect_database
+
+        conn = connect_database(self.db_path)
+        # Queue-only bootstrap databases may be created before the web schema.
+        # SQLite historically permits that ordering; PostgreSQL deployments are
+        # initialized from the complete migrated schema before workers start.
+        if isinstance(conn, sqlite3.Connection):
+            conn.execute("PRAGMA foreign_keys = OFF")
         return conn
 
     def _init_schema(self) -> None:
@@ -364,71 +374,81 @@ class JobQueue:
         self._executors[job_id] = executor
 
         def worker():
+            self.run_job(job_id, executor, worker_id=f"local-{threading.get_ident()}")
+        # A bounded pool prevents an alert burst from creating one operating-
+        # system thread per alert while preserving durable pending job rows.
+        future = self._pool.submit(worker)
+        with self._worker_lock:
+            self._workers[job_id] = future
+        future.add_done_callback(lambda _future: self._forget_worker(job_id))
+
+    def run_job(
+        self,
+        job_id: str,
+        executor: Callable[[dict[str, Any], Callable[[float], None]], dict[str, Any]],
+        *,
+        worker_id: str = "worker",
+    ) -> bool:
+        """Atomically claim and execute one persisted job in the current process."""
+        try:
+            conn = self._get_conn()
             try:
-                worker_id = f"local-{threading.get_ident()}"
-                conn = self._get_conn()
-                try:
-                    claimed = conn.execute(
-                        """
-                        UPDATE jobs
-                        SET status = ?, started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
-                            attempt_count = attempt_count + 1, worker_id = ?,
-                            lease_expires_at = datetime('now', '+5 minutes'), updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ? AND status = ? AND cancel_requested = 0
-                          AND attempt_count < max_attempts
-                        """,
-                        (JobStatus.RUNNING.value, worker_id, job_id, JobStatus.PENDING.value),
-                    ).rowcount
-                    conn.commit()
-                finally:
-                    conn.close()
-                if not claimed:
-                    return
-
-                # Load job data
-                conn = self._get_conn()
-                try:
-                    job = conn.execute(
-                        "SELECT * FROM jobs WHERE id = ?", (job_id,)
-                    ).fetchone()
-                    if not job:
-                        self.update_job_status(job_id, JobStatus.FAILED, error="Job not found")
-                        return
-
-                    alert = json.loads(job["alert_json"])
-                except Exception as e:
-                    self.update_job_status(job_id, JobStatus.FAILED, error=str(e))
-                    return
-                finally:
-                    conn.close()
-
-                # Define progress callback
-                def update_progress(progress: float):
-                    if 0 <= progress <= 1.0:
-                        control = self.get_job(job_id).status
-                        if control == JobStatus.CANCELLED:
-                            raise JobCancelled("Job cancellation requested")
-                        if control == JobStatus.PAUSED:
-                            raise JobPaused("Job pause requested")
-                        self.update_job_progress(job_id, progress)
-
-                # Execute
-                result = executor(alert, update_progress)
-                self.update_job_status(job_id, JobStatus.COMPLETED, result=result)
-
-            except JobPaused:
-                audit("job_worker_paused", job_id=job_id)
-            except JobCancelled:
-                self.update_job_status(job_id, JobStatus.CANCELLED, error="Cancelled by user")
-            except Exception as e:
-                self.update_job_status(job_id, JobStatus.FAILED, error=str(e)[:500])
+                claimed = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                        attempt_count = attempt_count + 1, worker_id = ?,
+                        lease_expires_at = datetime('now', '+5 minutes'), updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = ? AND cancel_requested = 0
+                      AND attempt_count < max_attempts
+                    """,
+                    (JobStatus.RUNNING.value, worker_id, job_id, JobStatus.PENDING.value),
+                ).rowcount
+                conn.commit()
             finally:
-                self._workers.pop(job_id, None)
+                conn.close()
+            if not claimed:
+                return False
 
-        # Start worker in non-daemon thread
-        thread = threading.Thread(target=worker, daemon=False)
-        self._workers[job_id] = thread
-        thread.start()
+            conn = self._get_conn()
+            try:
+                job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if not job:
+                    self.update_job_status(job_id, JobStatus.FAILED, error="Job not found")
+                    return False
+                alert = json.loads(job["alert_json"])
+            finally:
+                conn.close()
+
+            def update_progress(progress: float):
+                if 0 <= progress <= 1.0:
+                    control = self.get_job(job_id).status
+                    if control == JobStatus.CANCELLED:
+                        raise JobCancelled("Job cancellation requested")
+                    if control == JobStatus.PAUSED:
+                        raise JobPaused("Job pause requested")
+                    self.update_job_progress(job_id, progress)
+
+            result = executor(alert, update_progress)
+            self.update_job_status(job_id, JobStatus.COMPLETED, result=result)
+            return True
+        except JobPaused:
+            audit("job_worker_paused", job_id=job_id)
+        except JobCancelled:
+            self.update_job_status(job_id, JobStatus.CANCELLED, error="Cancelled by user")
+        except Exception as exc:
+            self.update_job_status(job_id, JobStatus.FAILED, error=str(exc)[:500])
+        return False
+
+    def _forget_worker(self, job_id: str) -> None:
+        with self._worker_lock:
+            self._workers.pop(job_id, None)
+
+    def worker_stats(self) -> dict[str, int]:
+        with self._worker_lock:
+            active = sum(1 for future in self._workers.values() if future.running())
+            queued = sum(1 for future in self._workers.values() if not future.running() and not future.done())
+        return {"max_workers": self.max_workers, "active": active, "queued": queued}
 
     def recover_stale_jobs(self) -> int:
         """Retry recoverable leases and fail jobs that exhausted their attempts."""

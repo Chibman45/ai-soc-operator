@@ -260,8 +260,16 @@ def _execute_live_responder(conn, row, org_id: int) -> dict[str, Any]:
         raise RuntimeError("the responder case is no longer available")
 
     if action_type in {"add_thehive_comment", "add_thehive_observable"}:
+        from web.services.external_sync import external_id_for_case
+
         client = clients.get("thehive")
-        external_case_id = str(case["case_id"] or "").strip()
+        external_case_id = external_id_for_case(
+            conn,
+            org_id=org_id,
+            platform="thehive",
+            local_case_id=int(case["id"]),
+            object_type="case",
+        ) or str(case["case_id"] or "").strip()
         if not client or not external_case_id:
             raise RuntimeError("TheHive is not configured or the case has no TheHive id")
         if action_type == "add_thehive_comment":
@@ -271,20 +279,69 @@ def _execute_live_responder(conn, row, org_id: int) -> dict[str, Any]:
         return {"executed": True, "mode": "live", "platform": "thehive", "response_id": _response_id(response)}
 
     if action_type == "push_misp_indicator":
+        from web.services.external_sync import external_id_for_case, record_external_object
+
         client = clients.get("misp")
         if not client:
             raise RuntimeError("MISP is not configured")
-        event = client.create_event(f"AI SOC case {case['id']}: {case['title']}")
-        event_id = _response_id(event)
+        export_key = f"case:{case['id']}:{hashlib.sha256(target.lower().encode('utf-8')).hexdigest()}"
+        existing_export = conn.execute(
+            """
+            SELECT metadata_json FROM external_objects
+            WHERE org_id = ? AND platform = 'misp' AND object_type = 'attribute_export'
+              AND external_id = ?
+            """,
+            (org_id, export_key),
+        ).fetchone()
+        if existing_export:
+            metadata = json.loads(existing_export["metadata_json"] or "{}")
+            return {
+                "executed": True,
+                "mode": "live",
+                "platform": "misp",
+                "idempotent_replay": True,
+                "event_id": metadata.get("event_id"),
+                "attribute_id": metadata.get("attribute_id"),
+            }
+        event_id = external_id_for_case(
+            conn,
+            org_id=org_id,
+            platform="misp",
+            local_case_id=int(case["id"]),
+            object_type="event",
+        )
         if not event_id:
-            raise RuntimeError("MISP did not return an event id")
+            event = client.create_event(f"AI SOC case {case['id']}: {case['title']}")
+            event_id = _response_id(event)
+            if not event_id:
+                raise RuntimeError("MISP did not return an event id")
+            record_external_object(
+                conn,
+                org_id=org_id,
+                platform="misp",
+                object_type="event",
+                external_id=event_id,
+                local_case_id=int(case["id"]),
+                payload=event,
+            )
         attribute = client.add_attribute(event_id, _misp_attribute_type(target), target)
+        attribute_id = _response_id(attribute)
+        record_external_object(
+            conn,
+            org_id=org_id,
+            platform="misp",
+            object_type="attribute_export",
+            external_id=export_key,
+            local_case_id=int(case["id"]),
+            payload=attribute,
+            metadata={"event_id": event_id, "attribute_id": attribute_id, "target": target},
+        )
         return {
             "executed": True,
             "mode": "live",
             "platform": "misp",
             "event_id": event_id,
-            "attribute_id": _response_id(attribute),
+            "attribute_id": attribute_id,
         }
     raise RuntimeError("this responder does not have a live adapter")
 

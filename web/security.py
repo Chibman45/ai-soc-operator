@@ -15,6 +15,7 @@ from typing import Any, Callable
 from flask import abort, jsonify, redirect, request, session, url_for
 
 from scripts.common import audit
+from web.services.database import connect_database
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,11 +27,7 @@ CSRF_EXEMPT_ENDPOINTS = {
 
 
 def get_security_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
+    return connect_database(DB_PATH)
 
 
 def consume_rate_limit(conn: sqlite3.Connection, bucket_key: str, limit: int, window_seconds: int = 60) -> bool:
@@ -147,6 +144,27 @@ def roles_for_user(conn: sqlite3.Connection, user_id: int, org_id: int | None) -
     query += " AND ur.org_id = ? AND EXISTS (SELECT 1 FROM organization_memberships om WHERE om.user_id = ur.user_id AND om.org_id = ur.org_id AND om.status = 'active')"
     params.append(org_id)
     return {str(row["name"]) for row in conn.execute(query, params).fetchall()}
+
+
+def claim_case_for_mutation(conn: sqlite3.Connection, case_id: int, user_id: int, org_id: int) -> bool:
+    """Atomically claim an unassigned case or verify elevated cross-case access."""
+    conn.execute(
+        """
+        UPDATE cases SET assignee_id = ?, first_response_at = COALESCE(first_response_at, CURRENT_TIMESTAMP),
+            row_version = COALESCE(row_version, 0) + 1
+        WHERE id = ? AND org_id = ? AND assignee_id IS NULL
+        """,
+        (user_id, case_id, org_id),
+    )
+    row = conn.execute(
+        "SELECT assignee_id FROM cases WHERE id = ? AND org_id = ?",
+        (case_id, org_id),
+    ).fetchone()
+    if not row:
+        return False
+    if row["assignee_id"] in {None, user_id}:
+        return True
+    return "case.assign" in permissions_for_user(conn, user_id, org_id)
 
 
 def _deny(permission: str | None = None):

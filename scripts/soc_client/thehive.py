@@ -69,11 +69,12 @@ class TheHiveClient(PlatformClient):
         query: dict[str, Any] | None = None,
         sort: list[str] | None = None,
         limit: int = 50,
+        start: int = 0,
     ) -> list[dict[str, Any]]:
         body: dict[str, Any] = {
             "query": query or {},
             "sort": sort or ["-createdAt"],
-            "range": f"0-{limit}",
+            "range": f"{max(0, start)}-{max(0, start) + max(1, limit) - 1}",
         }
         return self.post("/api/v1/case/_search", body=body)
 

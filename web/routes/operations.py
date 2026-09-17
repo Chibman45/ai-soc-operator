@@ -13,7 +13,7 @@ from flask import Blueprint, jsonify, request, session
 
 from scripts.common import audit
 from scripts.learning import LearningStore
-from web.security import current_org_id, permission_required
+from web.security import claim_case_for_mutation, current_org_id, permission_required
 from web.services.responders import (
     approve_responder_action,
     create_responder_action,
@@ -27,6 +27,8 @@ from web.services.capabilities import (
     propose_catalog_capability,
     reject_capability_proposal,
 )
+from web.services.external_sync import sync_misp_events, sync_thehive_cases
+from web.services.database import connect_database
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,11 +46,7 @@ SCOPED_RESPONDERS = {
 
 
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(ROOT / "data" / "soc_operator.db"))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
+    return connect_database(ROOT / "data" / "soc_operator.db")
 
 
 def _case_exists(conn: sqlite3.Connection, case_id: int, org_id: int) -> bool:
@@ -69,7 +67,7 @@ def health_ready():
             "SELECT heartbeat_at FROM operations_state WHERE component = 'operations_worker' "
             "AND heartbeat_at >= datetime('now', '-2 minutes')"
         ).fetchone()
-    except sqlite3.Error:
+    except Exception:
         conn.close()
         return jsonify({"status": "not_ready", "database": False}), 503
     conn.close()
@@ -77,6 +75,57 @@ def health_ready():
     if require_worker and not row:
         return jsonify({"status": "not_ready", "database": True, "worker": False}), 503
     return jsonify({"status": "ready", "database": True, "worker": bool(row)})
+
+
+@operations_bp.get("/api/integrations/status")
+@permission_required("chat.read")
+def integration_status():
+    conn = _db()
+    org_id = int(current_org_id(conn))
+    rows = conn.execute(
+        "SELECT * FROM integration_sync_state WHERE org_id = ? ORDER BY platform, object_type",
+        (org_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify({"ok": True, "integrations": [dict(row) for row in rows]})
+
+
+@operations_bp.post("/api/integrations/sync/<platform>")
+@permission_required("alert.ingest")
+def sync_integration(platform: str):
+    if platform not in {"thehive", "misp"}:
+        return jsonify({"error": "supported sync platforms are thehive and misp"}), 400
+    from scripts.orchestrator import build_clients
+    from web.app import load_config_for_web
+    from web.services.credential_vault import open_secret
+
+    conn = _db()
+    org_id = int(current_org_id(conn))
+    credentials = {
+        row["key_name"]: open_secret(row["key_value"])
+        for row in conn.execute(
+            "SELECT key_name, key_value FROM credentials WHERE org_id = ?",
+            (org_id,),
+        ).fetchall()
+    }
+    clients = build_clients(load_config_for_web(org_id), credentials=credentials)
+    client = clients.get(platform)
+    if not client:
+        conn.close()
+        return jsonify({"error": f"{platform} is not configured or enabled"}), 409
+    try:
+        result = (
+            sync_thehive_cases(conn, org_id=org_id, client=client)
+            if platform == "thehive"
+            else sync_misp_events(conn, org_id=org_id, client=client)
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.commit()
+        conn.close()
+        return jsonify({"error": str(exc)[:500]}), 502
+    conn.close()
+    return jsonify({"ok": True, **result})
 
 
 @operations_bp.get("/api/cases/<int:case_id>/responders")
@@ -108,6 +157,9 @@ def propose_case_responder(case_id: int):
     if not _case_exists(conn, case_id, org_id):
         conn.close()
         return jsonify({"error": "not found"}), 404
+    if not claim_case_for_mutation(conn, case_id, int(session["user_id"]), org_id):
+        conn.close()
+        return jsonify({"error": "case is assigned to another analyst"}), 409
     if action_type in SCOPED_RESPONDERS:
         observable = conn.execute(
             "SELECT 1 FROM observables WHERE org_id = ? AND case_id = ? AND lower(value) = lower(?)",

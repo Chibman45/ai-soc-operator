@@ -8,7 +8,8 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request, session
-from web.security import current_org_id, permission_required
+from web.security import claim_case_for_mutation, current_org_id, permission_required
+from web.services.database import connect_database
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -16,12 +17,8 @@ chat_bp = Blueprint("chat", __name__, url_prefix="/api/chat")
 
 
 def _get_db():
-    import sqlite3
     db_path = ROOT / "data" / "soc_operator.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_database(db_path)
 
 
 def _init_chat(conn):
@@ -394,12 +391,19 @@ def chat_execute_direct(case_id: int):
     if not _case_in_org(conn, case_id, org_id):
         conn.close()
         return jsonify({"error": "not found"}), 404
+    if case_id != GLOBAL_CASE_ID and not claim_case_for_mutation(
+        conn, case_id, int(session["user_id"]), org_id
+    ):
+        conn.close()
+        return jsonify({"error": "case is assigned to another analyst"}), 409
 
     try:
         scoped_target = _tool_scope_target(conn, case_id, org_id, tool_name, args, int(session["user_id"]))
     except PermissionError as exc:
         conn.close()
         return jsonify({"ok": False, "error": str(exc)}), 403
+    # Persist an automatic claim before the tool runs outside this transaction.
+    conn.commit()
     conn.close()
 
     allowed, reason = validate_command(tool_name, args)

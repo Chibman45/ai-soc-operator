@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}Infrastructure - AI SOC Operator{% endblock %}
+{% block content %}
+<div class="space-y-6 max-w-5xl">
+    <div>
+        <h2 class="text-xl font-bold">Infrastructure</h2>
+        <p class="text-sm text-gray-400 mt-1">SQLite remains active until a verified migration completes and the services restart.</p>
+    </div>
+
+    <section class="border-y border-gray-800 py-5">
+        <div class="flex items-center justify-between mb-4">
+            <h3 class="font-semibold">Scale-out services</h3>
+            <span class="text-xs px-2 py-1 border border-gray-700 rounded">Active: {{ active_backend }}</span>
+        </div>
+        <form id="infrastructure-form" class="grid grid-cols-1 gap-4">
+            <label class="text-sm text-gray-400">PostgreSQL connection URL
+                <input name="postgres_dsn" type="password" autocomplete="new-password" required placeholder="postgresql://user:password@host:5432/database" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-gray-100">
+            </label>
+            <label class="text-sm text-gray-400">Redis broker URL
+                <input name="redis_url" type="password" autocomplete="new-password" required placeholder="redis://:password@host:6379/0" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-gray-100">
+            </label>
+            <label class="text-sm text-gray-400">Celery result backend (optional)
+                <input name="result_backend" type="password" autocomplete="new-password" placeholder="Defaults to the Redis broker URL" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-gray-100">
+            </label>
+            <div class="flex flex-wrap gap-3">
+                <button type="button" onclick="testServices()" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm">Test connections</button>
+                <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium">Validate and save</button>
+            </div>
+        </form>
+        <p id="service-result" class="text-sm mt-3 text-gray-400">{% if settings.configured %}Credentials are encrypted. Status: {{ settings.status }}.{% else %}No scale-out services configured.{% endif %}</p>
+    </section>
+
+    <section class="border-b border-gray-800 pb-5">
+        <h3 class="font-semibold mb-2">Controlled migration</h3>
+        <p class="text-sm text-gray-400 mb-4">The target PostgreSQL database must be empty. The migration verifies a backup and row counts before staging the restart.</p>
+        <div class="flex gap-3 max-w-md">
+            <input id="migration-confirmation" placeholder="Type MIGRATE" class="flex-1 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-gray-100">
+            <button type="button" onclick="migrateDatabase()" class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg text-sm font-medium">Migrate</button>
+        </div>
+        <p id="migration-result" class="text-sm mt-3 text-gray-400"></p>
+    </section>
+
+    <section>
+        <h3 class="font-semibold mb-3">Migration history</h3>
+        <div class="border border-gray-800 rounded-lg overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead class="bg-gray-900 text-left text-xs text-gray-500 uppercase"><tr><th class="px-4 py-3">ID</th><th class="px-4 py-3">Status</th><th class="px-4 py-3">Phase</th><th class="px-4 py-3">Created</th></tr></thead>
+                <tbody>{% for migration in migrations %}<tr class="border-t border-gray-800"><td class="px-4 py-3">{{ migration.id }}</td><td class="px-4 py-3">{{ migration.status }}</td><td class="px-4 py-3">{{ migration.phase }}</td><td class="px-4 py-3 text-gray-400">{{ migration.created_at }}</td></tr>{% else %}<tr><td colspan="4" class="px-4 py-6 text-center text-gray-500">No migrations attempted.</td></tr>{% endfor %}</tbody>
+            </table>
+        </div>
+    </section>
+</div>
+<script>
+const csrf = document.querySelector('meta[name="csrf-token"]').content;
+const formData = () => Object.fromEntries(new FormData(document.getElementById('infrastructure-form')));
+async function callInfrastructure(url, payload) {
+    const response = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf}, body: JSON.stringify(payload)});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Request failed');
+    return data;
+}
+async function testServices() {
+    const output = document.getElementById('service-result');
+    output.textContent = 'Testing...';
+    try { await callInfrastructure('/api/admin/infrastructure/test', formData()); output.textContent = 'PostgreSQL and Redis are reachable.'; }
+    catch (error) { output.textContent = error.message; }
+}
+document.getElementById('infrastructure-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const output = document.getElementById('service-result');
+    output.textContent = 'Validating and encrypting settings...';
+    try { await callInfrastructure('/api/admin/infrastructure/settings', formData()); output.textContent = 'Settings validated and encrypted.'; }
+    catch (error) { output.textContent = error.message; }
+});
+async function migrateDatabase() {
+    const output = document.getElementById('migration-result');
+    output.textContent = 'Backing up and migrating. Keep this page open...';
+    try {
+        const data = await callInfrastructure('/api/admin/infrastructure/migrate', {confirmation: document.getElementById('migration-confirmation').value});
+        output.textContent = `Migration ${data.migration_id} verified. Restart web and worker services to activate PostgreSQL and Celery.`;
+    } catch (error) { output.textContent = error.message; }
+}
+</script>
+{% endblock %}

@@ -34,10 +34,9 @@ class LearningStore:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        return conn
+        from web.services.database import connect_database
+
+        return connect_database(self.db_path)
 
     def _init_schema(self) -> None:
         conn = self._connect()

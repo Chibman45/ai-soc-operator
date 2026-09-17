@@ -2,7 +2,14 @@
 {% block title %}Cases — AI SOC Operator{% endblock %}
 {% block content %}
 <div class="space-y-6">
-    <h2 class="text-xl font-bold">Cases</h2>
+    <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 class="text-xl font-bold">Cases</h2>
+        <div class="flex gap-1 text-sm" role="group" aria-label="Case assignment filter">
+            <a href="{{ url_for('cases', assignment='all') }}" class="px-3 py-1.5 rounded-lg {% if assignment == 'all' %}bg-blue-600{% else %}bg-gray-800 hover:bg-gray-700{% endif %}">All</a>
+            <a href="{{ url_for('cases', assignment='mine') }}" class="px-3 py-1.5 rounded-lg {% if assignment == 'mine' %}bg-blue-600{% else %}bg-gray-800 hover:bg-gray-700{% endif %}">Mine</a>
+            <a href="{{ url_for('cases', assignment='unassigned') }}" class="px-3 py-1.5 rounded-lg {% if assignment == 'unassigned' %}bg-blue-600{% else %}bg-gray-800 hover:bg-gray-700{% endif %}">Unassigned</a>
+        </div>
+    </div>
 
     <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
         <table class="w-full">
@@ -11,6 +18,7 @@
                     <th class="px-4 py-3">Title</th>
                     <th class="px-4 py-3">Severity</th>
                     <th class="px-4 py-3">Status</th>
+                    <th class="px-4 py-3">Assignee</th>
                     <th class="px-4 py-3">Created</th>
                     <th class="px-4 py-3"></th>
                 </tr>
@@ -36,6 +44,21 @@
                             {{ case.status }}
                         </span>
                     </td>
+                    <td class="px-4 py-3 text-sm">
+                        {% if can('case.assign') %}
+                        <select aria-label="Assign case {{ case.id }}" onchange="assignCase({{ case.id }}, {{ case.row_version or 0 }}, this.value)"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1 text-sm max-w-40">
+                            <option value="">Unassigned</option>
+                            {% for member in members %}<option value="{{ member.id }}" {% if case.assignee_id == member.id %}selected{% endif %}>{{ member.username }}</option>{% endfor %}
+                        </select>
+                        {% elif case.assignee_id == session.get('user_id') %}
+                        <button onclick="releaseCase({{ case.id }})" class="text-blue-400 hover:text-blue-300">You · release</button>
+                        {% elif not case.assignee_id and can('case.update') %}
+                        <button onclick="claimCase({{ case.id }})" class="text-blue-400 hover:text-blue-300">Claim</button>
+                        {% else %}
+                        <span class="text-gray-400">{{ case.assignee_name or 'Unassigned' }}</span>
+                        {% endif %}
+                    </td>
                     <td class="px-4 py-3 text-sm text-gray-500">{{ case.created_at }}</td>
                     <td class="px-4 py-3">
                         <a href="{{ url_for('case_detail', case_id=case.id) }}" class="text-blue-400 hover:text-blue-300 text-sm">View →</a>
@@ -44,7 +67,7 @@
                 {% endfor %}
                 {% if not cases %}
                 <tr>
-                    <td colspan="5" class="px-4 py-12 text-center text-gray-600">
+                    <td colspan="6" class="px-4 py-12 text-center text-gray-600">
                         No cases yet. Run a playbook to create one.
                     </td>
                 </tr>
@@ -53,4 +76,23 @@
         </table>
     </div>
 </div>
+{% endblock %}
+{% block scripts %}
+<script>
+async function caseAction(url, body = null) {
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: body ? {'Content-Type': 'application/json'} : {},
+        body: body ? JSON.stringify(body) : null
+    });
+    const result = await response.json();
+    if (!response.ok) return alert(result.error || 'Case update failed');
+    location.reload();
+}
+function claimCase(id) { return caseAction(`/api/cases/${id}/claim`); }
+function releaseCase(id) { return caseAction(`/api/cases/${id}/release`); }
+function assignCase(id, version, value) {
+    return caseAction(`/api/cases/${id}/assign`, {assignee_id: value ? Number(value) : null, expected_version: version});
+}
+</script>
 {% endblock %}

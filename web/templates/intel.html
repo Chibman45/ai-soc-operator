@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Threat Intel - AI SOC Operator{% endblock %}
+{% block content %}
+<div class="space-y-6">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+            <h2 class="text-xl font-bold">Threat intelligence</h2>
+            <p class="text-sm text-gray-400 mt-1">Organization-scoped MISP events and indicators.</p>
+        </div>
+        {% if can('alert.ingest') %}
+        <button onclick="syncMisp()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium">Sync MISP</button>
+        {% endif %}
+    </div>
+    {% if sync_state %}
+    <div class="text-xs text-gray-500">
+        Last completed: {{ sync_state.last_completed_at or 'never' }} · seen {{ sync_state.records_seen }} · changed {{ sync_state.records_changed }}
+        {% if sync_state.last_error %}<span class="text-red-400"> · {{ sync_state.last_error }}</span>{% endif %}
+    </div>
+    {% endif %}
+    <div class="border border-gray-800 rounded-lg overflow-x-auto">
+        <table class="w-full min-w-[760px]">
+            <thead class="bg-gray-900 text-left text-xs uppercase text-gray-500">
+                <tr><th class="px-4 py-3">Event</th><th class="px-4 py-3">Threat</th><th class="px-4 py-3">Published</th><th class="px-4 py-3">Date</th><th class="px-4 py-3">Updated</th></tr>
+            </thead>
+            <tbody>
+                {% for event in events %}
+                <tr class="border-t border-gray-800">
+                    <td class="px-4 py-3"><div class="font-medium">{{ event.title }}</div><div class="text-xs text-gray-500">MISP {{ event.external_id }}</div></td>
+                    <td class="px-4 py-3 text-sm">{{ event.threat_level or 'unknown' }}</td>
+                    <td class="px-4 py-3 text-sm">{{ 'Yes' if event.published else 'No' }}</td>
+                    <td class="px-4 py-3 text-sm text-gray-400">{{ event.event_date or '-' }}</td>
+                    <td class="px-4 py-3 text-sm text-gray-500">{{ event.updated_at }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="5" class="px-4 py-12 text-center text-gray-500">No MISP events synchronized.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+async function syncMisp() {
+    const response = await fetch('/api/integrations/sync/misp', {method: 'POST'});
+    const result = await response.json();
+    if (!response.ok) return alert(result.error || 'MISP sync failed');
+    alert(`MISP sync complete: ${result.changed} changed of ${result.seen} seen.`);
+    location.reload();
+}
+</script>
+{% endblock %}

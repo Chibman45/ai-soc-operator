@@ -100,6 +100,74 @@ CREATE TABLE IF NOT EXISTS organization_policies (
     FOREIGN KEY (approved_by) REFERENCES users(id)
 );
 
+CREATE TABLE IF NOT EXISTS integration_sync_state (
+    org_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    object_type TEXT NOT NULL,
+    cursor_value TEXT,
+    last_started_at TIMESTAMP,
+    last_completed_at TIMESTAMP,
+    last_error TEXT,
+    records_seen INTEGER NOT NULL DEFAULT 0,
+    records_changed INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (org_id, platform, object_type)
+);
+
+CREATE TABLE IF NOT EXISTS intel_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    threat_level TEXT,
+    analysis_status TEXT,
+    published INTEGER NOT NULL DEFAULT 0,
+    event_date TEXT,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    attributes_json TEXT NOT NULL DEFAULT '[]',
+    raw_payload TEXT NOT NULL DEFAULT '{}',
+    source_updated_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(org_id, platform, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS infrastructure_settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    postgres_dsn TEXT,
+    redis_url TEXT,
+    celery_result_backend TEXT,
+    requested_backend TEXT NOT NULL DEFAULT 'sqlite',
+    status TEXT NOT NULL DEFAULT 'sqlite',
+    last_tested_at TIMESTAMP,
+    last_test_result TEXT,
+    last_test_message TEXT,
+    updated_by INTEGER,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(org_id),
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS infrastructure_migrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    source_backend TEXT NOT NULL,
+    target_backend TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'requested',
+    phase TEXT NOT NULL DEFAULT 'requested',
+    backup_path TEXT,
+    verification_json TEXT,
+    error_message TEXT,
+    requested_by INTEGER NOT NULL,
+    started_at TIMESTAMP,
+    finished_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (requested_by) REFERENCES users(id)
+);
+
 CREATE TABLE IF NOT EXISTS api_rate_limits (
     bucket_key TEXT NOT NULL,
     window_start TIMESTAMP NOT NULL,
@@ -132,6 +200,27 @@ CREATE TABLE IF NOT EXISTS alerts (
     first_response_at TIMESTAMP,
     closed_at TIMESTAMP,
     FOREIGN KEY (case_id) REFERENCES cases(id)
+);
+
+-- External identifiers are created after alerts so PostgreSQL can resolve all
+-- foreign-key targets during first-time schema initialization.
+CREATE TABLE IF NOT EXISTS external_objects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    object_type TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    local_case_id INTEGER,
+    local_alert_id INTEGER,
+    external_updated_at TIMESTAMP,
+    payload_hash TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (local_case_id) REFERENCES cases(id),
+    FOREIGN KEY (local_alert_id) REFERENCES alerts(id),
+    UNIQUE(org_id, platform, object_type, external_id)
 );
 
 -- Feature 2: RBAC
@@ -273,6 +362,10 @@ CREATE INDEX IF NOT EXISTS idx_login_attempts_window ON login_attempts(username,
 CREATE INDEX IF NOT EXISTS idx_user_invitations_org_user ON user_invitations(org_id, user_id, expires_at);
 CREATE INDEX IF NOT EXISTS idx_org_policy_drafts_status ON organization_policy_drafts(org_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_org_policies_active ON organization_policies(org_id, active, version);
+CREATE INDEX IF NOT EXISTS idx_external_objects_local_case ON external_objects(org_id, local_case_id, platform);
+CREATE INDEX IF NOT EXISTS idx_external_objects_local_alert ON external_objects(org_id, local_alert_id, platform);
+CREATE INDEX IF NOT EXISTS idx_intel_events_org_updated ON intel_events(org_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_infrastructure_migrations_org ON infrastructure_migrations(org_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_delivery ON notifications(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_capability_proposals_org_status ON capability_proposals(org_id, status, created_at);
 """
@@ -397,6 +490,9 @@ def init_feature_db(conn) -> None:
             "closed_at": "TIMESTAMP",
             "first_response_at": "TIMESTAMP",
             "sla_due_at": "TIMESTAMP",
+            "row_version": "INTEGER NOT NULL DEFAULT 0",
+            "source_platform": "TEXT NOT NULL DEFAULT 'local'",
+            "source_updated_at": "TIMESTAMP",
         },
     )
     conn.execute("UPDATE cases SET opened_at = created_at WHERE opened_at IS NULL")
@@ -404,7 +500,7 @@ def init_feature_db(conn) -> None:
     # Seed default roles if empty
     import json
     default_roles = [
-        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "user.manage", "policy.manage", "policy.approve", "playbook.manage", "learning.review", "api_client.manage", "sla.view", "notification.manage", "capability.propose", "capability.approve", "capability.execute"]),
+        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "user.manage", "policy.manage", "policy.approve", "playbook.manage", "learning.review", "api_client.manage", "sla.view", "notification.manage", "capability.propose", "capability.approve", "capability.execute", "infrastructure.manage"]),
         ("manager", ["chat.read", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "sla.view", "learning.review", "notification.manage", "capability.approve"]),
         ("senior_analyst", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "tool.execute", "responder.approve", "learning.review", "sla.view", "capability.propose"]),
         ("analyst", ["chat.read", "chat.act", "case.update", "alert.ingest", "report.export"]),

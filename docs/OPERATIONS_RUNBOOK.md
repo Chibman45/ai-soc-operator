@@ -2,14 +2,17 @@
 
 ## Supported production profile
 
-The current deployable profile is a single Linux host using SQLite WAL, one
+The default deployable profile is a single Linux host using SQLite WAL, one
 Gunicorn process, the operations worker, and persistent Docker volumes. Bind the
 default Compose port to loopback and terminate TLS in a managed reverse proxy or
 load balancer. Do not expose port 5051 directly to an untrusted network.
 
-PostgreSQL row-level security and a Redis/Celery execution plane remain a later
-scale-out migration. They are required before running multiple web hosts or
-workers against shared data.
+PostgreSQL and a Redis/Celery execution plane are available through the
+administrator-only Infrastructure migration workflow. The workflow validates
+connections, creates and verifies a SQLite backup, requires an empty target,
+verifies row counts, and activates only after restart. PostgreSQL row-level
+security remains a later defense-in-depth control. PostgreSQL and Celery are
+required before running multiple web hosts or workers against shared data.
 
 ## Start
 

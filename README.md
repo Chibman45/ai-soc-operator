@@ -13,7 +13,8 @@ responder approvals, and controlled self-learning drafts and publication.
 
 Phase 8 notification/intel delivery, Phase 9 container/operations controls, and
 Phase 10 CI release assurance are implemented, but production approval still
-depends on environment evidence. PostgreSQL/Redis remain the scale-out path.
+depends on environment evidence. SQLite remains the default; PostgreSQL and
+Redis/Celery are available through a verified, restart-gated scale-out path.
 See [the production roadmap](docs/PRODUCTION_ROADMAP.md), [operations runbook](docs/OPERATIONS_RUNBOOK.md), and
 [security policy](SECURITY.md) before deploying beyond a controlled environment.
 
@@ -93,7 +94,7 @@ If installed to `~/.local/bin`, bootstrap adds it to your PATH in `~/.bashrc` an
 
 ## Setting Up Platform Connections
 
-Platform credentials are **never stored in config files**. They live in the local SQLite database and are managed through the web portal.
+Platform credentials are **never stored in config files**. They are encrypted in the active database and managed through the web portal.
 
 1. Start the platform: `ai-soc-operator`
 2. Open the URL in your browser and log in
@@ -135,6 +136,29 @@ organization must always retain at least one active administrator.
 Platform credentials belong to the organization, not to individual analysts.
 Authorized workflows load those encrypted credentials on the server. The API
 keys are never copied into an invited user's account, browser, prompt, or report.
+
+### Optional PostgreSQL and Redis/Celery cutover
+
+An administrator can open **Administration -> Infrastructure** to test and save
+PostgreSQL and Redis URLs. SQLite remains active while settings are tested. A
+migration is allowed only after connectivity validation and requires typing
+`MIGRATE`. The system then creates and verifies a SQLite backup, refuses a
+non-empty PostgreSQL target, copies all tables in foreign-key order, compares
+table row counts, encrypts the runtime settings, and requests a service restart.
+Failed migrations do not delete or deactivate SQLite.
+
+For the bundled optional services, start the scale-out profile before testing:
+
+```bash
+docker compose --profile scaleout up -d postgres redis
+```
+
+After the portal reports `restart_required`, restart the web and worker services
+and start the Celery worker:
+
+```bash
+docker compose --profile scaleout up -d --build
+```
 
 ### Organization playbook access policy
 
@@ -255,7 +279,7 @@ Three playbooks are included: identity compromise, phishing response, and malwar
 - **Audit trail**: every action logged to `audit/actions.jsonl`
 - **Session management**: evidence, artifacts, and reports tied to session IDs
 - **No destructive commands**: `rm -rf`, `shred`, `mkfs`, etc. are blocked
-- **Credential isolation**: API keys are encrypted at rest in SQLite and are never written to generated config files or logs
+- **Credential isolation**: API keys and infrastructure URLs are encrypted at rest and are never written to generated config files or logs
 - **Controlled learning**: learning evidence is redacted; skill publication, responder enablement, and allowlisted installs require an immutable proposal, an explanation, independent human approval, expiry, audit evidence, and explicit environment gates
 
 ## Project Structure

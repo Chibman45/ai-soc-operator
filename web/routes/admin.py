@@ -18,6 +18,7 @@ from werkzeug.security import generate_password_hash
 from scripts.common import ROOT, audit
 from web.security import current_org_id, permission_required
 from web.services.credential_vault import open_secret
+from web.services.database import connect_database
 from web.services.organization_policy import (
     active_policy,
     apply_active_policy_roles,
@@ -26,6 +27,13 @@ from web.services.organization_policy import (
     reject_policy_draft,
     roles_for_policy_username,
 )
+from web.services.infrastructure import (
+    configured_infrastructure,
+    migrate_to_postgresql,
+    save_infrastructure_settings,
+    validate_infrastructure,
+)
+from web.services.database import active_backend
 
 
 admin_bp = Blueprint("admin", __name__)
@@ -35,15 +43,91 @@ EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 def _get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
+    return connect_database(DB_PATH)
 
 
 def _request_data() -> dict:
     return request.get_json(silent=True) or request.form.to_dict(flat=True)
+
+
+@admin_bp.get("/admin/infrastructure")
+@permission_required("infrastructure.manage")
+def infrastructure_page():
+    conn = _get_db()
+    org_id = int(current_org_id(conn))
+    settings = configured_infrastructure(conn, org_id)
+    migrations = conn.execute(
+        "SELECT id, status, phase, backup_path, verification_json, error_message, created_at, finished_at "
+        "FROM infrastructure_migrations WHERE org_id = ? ORDER BY id DESC LIMIT 10",
+        (org_id,),
+    ).fetchall()
+    conn.close()
+    return render_template(
+        "admin_infrastructure.html",
+        settings=settings,
+        migrations=migrations,
+        active_backend=active_backend(),
+    )
+
+
+@admin_bp.post("/api/admin/infrastructure/test")
+@permission_required("infrastructure.manage")
+def test_infrastructure():
+    data = _request_data()
+    try:
+        result = validate_infrastructure(
+            str(data.get("postgres_dsn", "")).strip(),
+            str(data.get("redis_url", "")).strip(),
+            str(data.get("result_backend", "")).strip(),
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        return jsonify({"error": str(exc)[:500]}), 400
+    return jsonify(result)
+
+
+@admin_bp.post("/api/admin/infrastructure/settings")
+@permission_required("infrastructure.manage")
+def update_infrastructure():
+    data = _request_data()
+    postgres_dsn = str(data.get("postgres_dsn", "")).strip()
+    redis_url = str(data.get("redis_url", "")).strip()
+    result_backend = str(data.get("result_backend", "")).strip()
+    try:
+        test_result = validate_infrastructure(postgres_dsn, redis_url, result_backend)
+    except (ValueError, RuntimeError, OSError) as exc:
+        return jsonify({"error": str(exc)[:500]}), 400
+    conn = _get_db()
+    org_id = int(current_org_id(conn))
+    save_infrastructure_settings(
+        conn,
+        org_id=org_id,
+        user_id=int(session["user_id"]),
+        postgres_dsn=postgres_dsn,
+        redis_url=redis_url,
+        result_backend=result_backend,
+        test_result=test_result,
+    )
+    conn.commit()
+    conn.close()
+    audit("infrastructure_settings_validated", org_id=org_id, actor_id=session["user_id"])
+    return jsonify({"ok": True, "status": "validated"})
+
+
+@admin_bp.post("/api/admin/infrastructure/migrate")
+@permission_required("infrastructure.manage")
+def migrate_infrastructure():
+    data = _request_data()
+    if str(data.get("confirmation", "")) != "MIGRATE":
+        return jsonify({"error": "type MIGRATE to confirm the controlled cutover"}), 400
+    conn = _get_db()
+    org_id = int(current_org_id(conn))
+    try:
+        result = migrate_to_postgresql(conn, org_id=org_id, user_id=int(session["user_id"]))
+    except Exception as exc:
+        conn.close()
+        return jsonify({"error": str(exc)[:500]}), 409
+    conn.close()
+    return jsonify({"ok": True, **result})
 
 
 def _role_ids(data: dict) -> list[int]:
