@@ -62,22 +62,6 @@ CREATE TABLE IF NOT EXISTS user_invitations (
     FOREIGN KEY (created_by) REFERENCES users(id)
 );
 
-CREATE TABLE IF NOT EXISTS auth_identities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    provider TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    email TEXT,
-    claims_json TEXT NOT NULL DEFAULT '{}',
-    linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_login_at TIMESTAMP,
-    FOREIGN KEY (org_id) REFERENCES organizations(id),
-    FOREIGN KEY (user_id) REFERENCES users(id),
-    UNIQUE(provider, subject),
-    UNIQUE(org_id, user_id, provider)
-);
-
 CREATE TABLE IF NOT EXISTS organization_policy_drafts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     org_id INTEGER NOT NULL,
@@ -376,7 +360,6 @@ CREATE INDEX IF NOT EXISTS idx_memberships_user_org ON organization_memberships(
 CREATE INDEX IF NOT EXISTS idx_api_clients_org ON api_clients(org_id);
 CREATE INDEX IF NOT EXISTS idx_login_attempts_window ON login_attempts(username, ip_address, attempted_at);
 CREATE INDEX IF NOT EXISTS idx_user_invitations_org_user ON user_invitations(org_id, user_id, expires_at);
-CREATE INDEX IF NOT EXISTS idx_auth_identities_user ON auth_identities(org_id, user_id, provider);
 CREATE INDEX IF NOT EXISTS idx_org_policy_drafts_status ON organization_policy_drafts(org_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_org_policies_active ON organization_policies(org_id, active, version);
 CREATE INDEX IF NOT EXISTS idx_external_objects_local_case ON external_objects(org_id, local_case_id, platform);

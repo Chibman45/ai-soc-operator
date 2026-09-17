@@ -20,7 +20,6 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from flask import (
     Flask,
@@ -34,7 +33,6 @@ from flask import (
 )
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
-from authlib.integrations.flask_client import OAuth
 
 from scripts.job_queue import JobQueue
 from scripts.learning import LearningStore, learn_alert, learn_case, learn_playbook_result
@@ -54,7 +52,6 @@ ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "soc_operator.db"
 
 app = Flask(__name__)
-oauth = OAuth(app)
 
 # Forwarded headers are trusted only when deployment explicitly enables the
 # reverse-proxy boundary. The bootstrap binds Gunicorn to loopback in this mode,
@@ -81,60 +78,15 @@ def _session_secret() -> str:
 
 
 app.secret_key = _session_secret()
-_OPENAI_OAUTH_ENV_CONFIGURED = all(
-    os.environ.get(name, "").strip()
-    for name in (
-        "AI_SOC_OPENAI_OAUTH_CLIENT_ID",
-        "AI_SOC_OPENAI_OAUTH_CLIENT_SECRET",
-        "AI_SOC_OPENAI_OAUTH_METADATA_URL",
-    )
-) and urlparse(os.environ.get("AI_SOC_OPENAI_OAUTH_METADATA_URL", "").strip()).scheme == "https"
 app.config.update(
     MAX_CONTENT_LENGTH=int(os.environ.get("AI_SOC_MAX_REQUEST_BYTES", str(5 * 1024 * 1024))),
     SESSION_COOKIE_HTTPONLY=True,
-    # OAuth callbacks are cross-site top-level navigations. Lax permits the
-    # signed state/nonce session cookie while still blocking cross-site POSTs.
-    SESSION_COOKIE_SAMESITE="Lax" if _OPENAI_OAUTH_ENV_CONFIGURED else "Strict",
+    SESSION_COOKIE_SAMESITE="Strict",
     SESSION_COOKIE_SECURE=os.environ.get("AI_SOC_ENV", "development").lower() == "production",
     PERMANENT_SESSION_LIFETIME=int(os.environ.get("AI_SOC_SESSION_TTL_SECONDS", "28800")),
 )
 app.before_request(enforce_csrf)
 app.jinja_env.globals["csrf_token"] = csrf_token
-
-
-def openai_oauth_enabled() -> bool:
-    """Expose the button only after OpenAI has issued partner OIDC settings."""
-    required = (
-        "AI_SOC_OPENAI_OAUTH_CLIENT_ID",
-        "AI_SOC_OPENAI_OAUTH_CLIENT_SECRET",
-        "AI_SOC_OPENAI_OAUTH_METADATA_URL",
-    )
-    if not all(os.environ.get(name, "").strip() for name in required):
-        return False
-    return urlparse(os.environ["AI_SOC_OPENAI_OAUTH_METADATA_URL"].strip()).scheme == "https"
-
-
-def _openai_oauth_client():
-    if not openai_oauth_enabled():
-        return None
-    existing = oauth.create_client("openai_chatgpt")
-    if existing:
-        return existing
-    # Discovery metadata and credentials are deployment configuration, never
-    # user-supplied URLs, which keeps the authorization flow out of SSRF reach.
-    metadata_url = os.environ["AI_SOC_OPENAI_OAUTH_METADATA_URL"].strip()
-    if urlparse(metadata_url).scheme != "https":
-        raise RuntimeError("OpenAI OAuth metadata URL must use HTTPS")
-    return oauth.register(
-        name="openai_chatgpt",
-        client_id=os.environ["AI_SOC_OPENAI_OAUTH_CLIENT_ID"].strip(),
-        client_secret=os.environ["AI_SOC_OPENAI_OAUTH_CLIENT_SECRET"].strip(),
-        server_metadata_url=metadata_url,
-        client_kwargs={"scope": os.environ.get("AI_SOC_OPENAI_OAUTH_SCOPES", "openid email profile")},
-    )
-
-
-app.jinja_env.globals["openai_oauth_enabled"] = openai_oauth_enabled
 
 
 @app.context_processor
@@ -451,17 +403,6 @@ def login_required(f):
     return secure_login_required(f)
 
 
-def _establish_user_session(user, org_id: int, *, auth_method: str) -> None:
-    session.clear()
-    session.permanent = True
-    session["user_id"] = int(user["id"])
-    session["username"] = user["username"]
-    session["org_id"] = int(org_id)
-    session["session_version"] = int(user["session_version"] or 0)
-    session["auth_method"] = auth_method
-    csrf_token()
-
-
 # ── Routes: Auth ──
 
 @app.route("/login", methods=["GET", "POST"])
@@ -513,7 +454,13 @@ def login():
                     (hash_password(password), user["id"]),
                 )
             conn.commit()
-            _establish_user_session(user, int(membership["org_id"]), auth_method="password")
+            session.clear()
+            session.permanent = True
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            session["org_id"] = membership["org_id"]
+            session["session_version"] = int(user["session_version"] or 0)
+            csrf_token()
             audit("login_success", user_id=user["id"], org_id=membership["org_id"], ip_address=request.remote_addr)
             conn.close()
             return redirect(url_for("dashboard"))
@@ -522,121 +469,6 @@ def login():
         audit("login_failed", username=username, ip_address=request.remote_addr)
         flash("Invalid credentials", "error")
     return render_template("login.html")
-
-
-@app.get("/auth/openai")
-def openai_oauth_start():
-    client = _openai_oauth_client()
-    if not client:
-        return jsonify({"error": "Sign in with ChatGPT is not configured"}), 404
-    linking = request.args.get("link") == "1"
-    if linking and not session.get("user_id"):
-        return redirect(url_for("login"))
-    nonce = secrets.token_urlsafe(32)
-    session["openai_oauth_nonce"] = nonce
-    session["openai_oauth_intent"] = "link" if linking else "login"
-    redirect_uri = url_for("openai_oauth_callback", _external=True)
-    return client.authorize_redirect(redirect_uri, nonce=nonce)
-
-
-@app.get("/auth/openai/callback")
-def openai_oauth_callback():
-    client = _openai_oauth_client()
-    nonce = session.pop("openai_oauth_nonce", None)
-    intent = session.pop("openai_oauth_intent", "login")
-    if not client or not nonce:
-        audit("openai_oauth_rejected", reason="missing_configuration_or_nonce")
-        flash("The ChatGPT sign-in session is invalid or expired", "error")
-        return redirect(url_for("login"))
-    try:
-        token = client.authorize_access_token()
-        claims = client.parse_id_token(token, nonce=nonce)
-        subject = str(claims.get("sub", "")).strip()
-        email = str(claims.get("email", "")).strip().lower()
-        verified = claims.get("email_verified") is True
-        if not subject or not email or not verified:
-            raise ValueError("a verified email identity is required")
-
-        conn = get_db()
-        if intent == "link" and session.get("user_id"):
-            org_id = int(current_org_id(conn) or 0)
-            user = conn.execute(
-                "SELECT * FROM users WHERE id = ? AND disabled_at IS NULL",
-                (int(session["user_id"]),),
-            ).fetchone()
-            if not user or not org_id:
-                raise PermissionError("the local session is no longer active")
-        else:
-            linked = conn.execute(
-                """
-                SELECT u.*, ai.org_id FROM auth_identities ai
-                JOIN users u ON u.id = ai.user_id
-                JOIN organization_memberships om ON om.user_id = u.id AND om.org_id = ai.org_id
-                WHERE ai.provider = 'openai_chatgpt' AND ai.subject = ?
-                  AND om.status = 'active' AND u.disabled_at IS NULL
-                """,
-                (subject,),
-            ).fetchone()
-            if linked:
-                user, org_id = linked, int(linked["org_id"])
-            else:
-                candidates = conn.execute(
-                    """
-                    SELECT u.*, om.org_id FROM users u
-                    JOIN organization_memberships om ON om.user_id = u.id
-                    WHERE lower(u.email) = ? AND om.status = 'active' AND u.disabled_at IS NULL
-                    """,
-                    (email,),
-                ).fetchall()
-                if len(candidates) != 1:
-                    raise PermissionError("an administrator must provision this verified email first")
-                user, org_id = candidates[0], int(candidates[0]["org_id"])
-
-        safe_claims = {
-            key: claims.get(key)
-            for key in ("iss", "sub", "email", "email_verified", "name", "picture")
-            if claims.get(key) is not None
-        }
-        identity_owner = conn.execute(
-            "SELECT user_id FROM auth_identities WHERE provider = 'openai_chatgpt' AND subject = ?",
-            (subject,),
-        ).fetchone()
-        if identity_owner and int(identity_owner["user_id"]) != int(user["id"]):
-            raise PermissionError("this ChatGPT identity is already linked to another account")
-        user_identity = conn.execute(
-            "SELECT subject FROM auth_identities WHERE org_id = ? AND user_id = ? AND provider = 'openai_chatgpt'",
-            (org_id, user["id"]),
-        ).fetchone()
-        if user_identity and str(user_identity["subject"]) != subject:
-            raise PermissionError("this account already has a different ChatGPT identity")
-        conn.execute(
-            """
-            INSERT INTO auth_identities
-                (org_id, user_id, provider, subject, email, claims_json, last_login_at)
-            VALUES (?, ?, 'openai_chatgpt', ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(provider, subject) DO UPDATE SET
-                email = excluded.email, claims_json = excluded.claims_json,
-                last_login_at = CURRENT_TIMESTAMP
-            """,
-            (org_id, user["id"], subject, email, json.dumps(safe_claims, sort_keys=True)),
-        )
-        if intent == "link" and not user["email"]:
-            conn.execute("UPDATE users SET email = ? WHERE id = ?", (email, user["id"]))
-        conn.commit()
-        conn.close()
-        _establish_user_session(user, org_id, auth_method="openai_chatgpt")
-        audit("openai_oauth_login_success", user_id=user["id"], org_id=org_id, intent=intent)
-        return redirect(url_for("dashboard"))
-    except Exception as exc:
-        try:
-            if "conn" in locals():
-                conn.rollback()
-                conn.close()
-        except Exception:
-            pass
-        audit("openai_oauth_login_failed", reason=type(exc).__name__, intent=intent)
-        flash(str(exc) if isinstance(exc, PermissionError) else "ChatGPT sign-in could not be verified", "error")
-        return redirect(url_for("login"))
 
 
 @app.route("/setup", methods=["GET", "POST"])

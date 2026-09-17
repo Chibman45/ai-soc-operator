@@ -30,12 +30,6 @@
                 Sign In
             </button>
         </form>
-        {% if openai_oauth_enabled() %}
-        <div class="flex items-center gap-3 my-5 text-xs text-gray-500"><span class="h-px bg-gray-800 flex-1"></span><span>or</span><span class="h-px bg-gray-800 flex-1"></span></div>
-        <a href="{{ url_for('openai_oauth_start') }}" class="block w-full py-2 text-center bg-gray-100 hover:bg-white text-gray-900 rounded-lg font-medium transition">
-            Continue with ChatGPT
-        </a>
-        {% endif %}
     </div>
 </body>
 </html>
