@@ -137,6 +137,30 @@ Platform credentials belong to the organization, not to individual analysts.
 Authorized workflows load those encrypted credentials on the server. The API
 keys are never copied into an invited user's account, browser, prompt, or report.
 
+### Optional Sign in with ChatGPT
+
+Password login and encrypted organization API keys remain available. When
+OpenAI has issued this deployment a supported Sign in with ChatGPT client,
+configure `AI_SOC_OPENAI_OAUTH_CLIENT_ID`,
+`AI_SOC_OPENAI_OAUTH_CLIENT_SECRET`, and
+`AI_SOC_OPENAI_OAUTH_METADATA_URL`. The login page then displays **Continue
+with ChatGPT**.
+
+Register this callback URL with the issued OAuth client:
+
+```text
+https://<local-soc-host>/auth/openai/callback
+```
+
+The metadata URL must use HTTPS, and the local portal should be served through
+the HTTPS Nginx configuration before enabling OAuth.
+
+OAuth is identity only. It does not use a user's Plus subscription to pay for
+API calls. Model requests continue through the organization's encrypted
+`OPENAI_API_KEY`. An OAuth identity may sign in only after an administrator has
+provisioned the same verified email, or after an already authenticated user
+explicitly links the identity. OAuth tokens are not persisted.
+
 ### Optional PostgreSQL and Redis/Celery cutover
 
 An administrator can open **Administration -> Infrastructure** to test and save

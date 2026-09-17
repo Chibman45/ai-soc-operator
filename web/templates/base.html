@@ -64,6 +64,9 @@
             </nav>
             <div class="p-4 border-t border-gray-800">
                 <div class="text-xs text-gray-500">{{ session.get('username', 'user') }}</div>
+                {% if openai_oauth_enabled() %}
+                <a href="{{ url_for('openai_oauth_start', link=1) }}" class="block mt-2 text-xs text-blue-400 hover:text-blue-300">Link ChatGPT identity</a>
+                {% endif %}
                 <form method="POST" action="{{ url_for('logout') }}" class="mt-1">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit" class="text-xs text-red-400 hover:text-red-300">Logout</button>
