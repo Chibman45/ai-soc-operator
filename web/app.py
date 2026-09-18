@@ -1498,6 +1498,7 @@ from web.routes.export import export_bp
 from web.routes.operations import operations_bp
 from web.routes.admin import admin_bp
 from web.routes.ai_provider import ai_provider_bp
+from web.routes.assurance import assurance_bp
 
 app.register_blueprint(chat_bp)
 app.register_blueprint(webhooks_bp)
@@ -1506,6 +1507,7 @@ app.register_blueprint(export_bp)
 app.register_blueprint(operations_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(ai_provider_bp)
+app.register_blueprint(assurance_bp)
 
 # WSGI imports must initialize the schema too; production servers do not execute __main__.
 init_db()

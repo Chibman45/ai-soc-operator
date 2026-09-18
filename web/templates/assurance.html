@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}Detection Assurance · AI SOC Operator{% endblock %}
+{% block content %}
+<div class="max-w-7xl mx-auto space-y-8">
+    <header class="flex flex-wrap items-start justify-between gap-4">
+        <div>
+            <h2 class="text-2xl font-bold">Detection Assurance</h2>
+            <p class="text-sm text-gray-400 mt-1">Analyst-confirmed outcomes, architecture context, and read-only platform validation.</p>
+        </div>
+        <a href="{{ url_for('assurance.download_assurance_template') }}" class="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm font-medium">Download document template</a>
+    </header>
+
+    <section class="grid grid-cols-2 lg:grid-cols-6 gap-3">
+        {% set counts = metrics.counts %}
+        <div class="border border-gray-800 rounded-lg p-4"><div class="text-xs text-gray-500">True positives</div><div class="text-2xl font-semibold text-green-400 mt-1">{{ counts.true_positive }}</div></div>
+        <div class="border border-gray-800 rounded-lg p-4"><div class="text-xs text-gray-500">False positives</div><div class="text-2xl font-semibold text-yellow-400 mt-1">{{ counts.false_positive }}</div></div>
+        <div class="border border-gray-800 rounded-lg p-4"><div class="text-xs text-gray-500">False negatives</div><div class="text-2xl font-semibold text-red-400 mt-1">{{ counts.false_negative }}</div></div>
+        <div class="border border-gray-800 rounded-lg p-4"><div class="text-xs text-gray-500">True negatives</div><div class="text-2xl font-semibold text-blue-400 mt-1">{{ counts.true_negative }}</div></div>
+        <div class="border border-gray-800 rounded-lg p-4"><div class="text-xs text-gray-500">Precision</div><div class="text-2xl font-semibold mt-1">{{ '%.1f%%'|format(metrics.precision * 100) if metrics.precision is not none else '—' }}</div></div>
+        <div class="border border-gray-800 rounded-lg p-4"><div class="text-xs text-gray-500">Recall</div><div class="text-2xl font-semibold mt-1">{{ '%.1f%%'|format(metrics.recall * 100) if metrics.recall is not none else '—' }}</div></div>
+    </section>
+
+    <section class="border-t border-gray-800 pt-7">
+        <div class="flex flex-wrap justify-between gap-4 mb-4">
+            <div>
+                <h3 class="text-lg font-semibold">Organisation architecture</h3>
+                <p class="text-sm text-gray-400 mt-1">Uploaded content creates a review draft. Only an approved profile supplies detection context.</p>
+            </div>
+            {% if active_architecture %}<div class="text-sm text-green-400">Active profile v{{ active_architecture.version }}</div>{% else %}<div class="text-sm text-yellow-400">No approved profile</div>{% endif %}
+        </div>
+        {% if can('architecture.manage') %}
+        <form id="architecture-form" class="flex flex-wrap items-end gap-3" enctype="multipart/form-data">
+            <label class="text-sm text-gray-300">Architecture document
+                <input name="document" type="file" accept=".docx,.pdf,.json,.yaml,.yml,.md,.txt" required class="mt-1 block text-sm text-gray-400">
+            </label>
+            <button class="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm">Analyze document</button>
+            <span id="architecture-output" class="text-sm text-gray-400"></span>
+        </form>
+        {% endif %}
+        <div class="mt-4 space-y-2">
+            {% for draft in architecture_drafts %}
+            <div class="border border-gray-800 rounded-lg p-3 flex flex-wrap items-center justify-between gap-3">
+                <div class="min-w-0 flex-1"><div class="text-sm font-medium">{{ draft.source_name }}</div><div class="text-xs text-gray-500">{{ draft.created_at }} · {{ draft.extraction_model or 'unknown extractor' }} · {{ draft.status }}</div><details class="mt-2"><summary class="text-xs text-blue-400 cursor-pointer">Review extracted architecture</summary><pre class="mt-2 max-h-72 overflow-auto bg-gray-950 p-3 rounded text-xs text-gray-300 whitespace-pre-wrap">{{ draft.architecture_json }}</pre></details></div>
+                {% if draft.status == 'draft' and can('architecture.approve') %}
+                <div class="flex gap-2"><button onclick="architectureDecision({{ draft.id }}, 'approve')" class="px-3 py-1.5 bg-green-800 hover:bg-green-700 rounded-lg text-sm">Approve</button><button onclick="architectureDecision({{ draft.id }}, 'reject')" class="px-3 py-1.5 bg-red-900 hover:bg-red-800 rounded-lg text-sm">Reject</button></div>
+                {% endif %}
+            </div>
+            {% else %}<div class="text-sm text-gray-500">No architecture drafts have been submitted.</div>{% endfor %}
+        </div>
+    </section>
+
+    <section class="border-t border-gray-800 pt-7">
+        <div class="flex flex-wrap items-start justify-between gap-4 mb-4">
+            <div><h3 class="text-lg font-semibold">Alert verdict queue</h3><p class="text-sm text-gray-400 mt-1">AI recommendations are advisory. An analyst records the final ground truth.</p></div>
+        </div>
+        <div class="overflow-x-auto border border-gray-800 rounded-lg">
+            <table class="w-full text-sm">
+                <thead class="bg-gray-900 text-gray-400"><tr><th class="text-left p-3">Alert</th><th class="text-left p-3">Source</th><th class="text-left p-3">Severity</th><th class="text-left p-3">AI recommendation</th><th class="text-left p-3">Confirmed verdict</th><th class="text-right p-3">Actions</th></tr></thead>
+                <tbody class="divide-y divide-gray-800">
+                {% for alert in alerts %}
+                    <tr><td class="p-3"><div class="font-medium">{{ alert.title }}</div><div class="text-xs text-gray-500">#{{ alert.id }} · {{ alert.created_at }}</div></td><td class="p-3">{{ alert.source }}</td><td class="p-3">{{ alert.severity }}</td><td class="p-3">{{ alert.ai_classification or 'Not assessed' }}</td><td class="p-3">{{ alert.classification or 'Unlabeled' }}</td><td class="p-3 text-right whitespace-nowrap">{% if can('assurance.label') %}<button onclick="recommendAlert({{ alert.id }})" class="px-2 py-1 text-blue-400 hover:text-blue-300">AI assess</button><button onclick="labelAlert({{ alert.id }})" class="px-2 py-1 text-green-400 hover:text-green-300">Set verdict</button>{% endif %}</td></tr>
+                {% else %}<tr><td colspan="6" class="p-6 text-center text-gray-500">No alerts are available.</td></tr>{% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    {% if can('assurance.label') %}
+    <section class="border-t border-gray-800 pt-7">
+        <h3 class="text-lg font-semibold">Ground-truth event</h3>
+        <p class="text-sm text-gray-400 mt-1 mb-4">Use an independently verified benign or malicious event to measure true negatives and false negatives.</p>
+        <form id="ground-truth-form" class="grid md:grid-cols-3 gap-3">
+            <input name="title" required placeholder="Verified event title" class="px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg">
+            <select name="ground_truth" class="px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg"><option value="malicious">Confirmed malicious</option><option value="benign">Confirmed benign</option></select>
+            <select name="detection_occurred" class="px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg"><option value="true">SIEM alert generated</option><option value="false">No SIEM alert generated</option></select>
+            <input name="source" required placeholder="Evidence source, such as purple team" class="px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg">
+            <input name="rule_id" placeholder="Expected rule ID" class="px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg">
+            <input name="rule_name" placeholder="Expected rule name" class="px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg">
+            <div class="md:col-span-3 flex items-center gap-3"><button class="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm">Record event</button><span id="ground-truth-output" class="text-sm text-gray-400"></span></div>
+        </form>
+    </section>
+    {% endif %}
+
+    <section class="border-t border-gray-800 pt-7">
+        <div class="flex flex-wrap items-start justify-between gap-4 mb-4">
+            <div><h3 class="text-lg font-semibold">Platform validation</h3><p class="text-sm text-gray-400 mt-1">Runs bounded read-only checks against configured integrations.</p></div>
+            {% if can('assurance.manage') %}<div class="flex flex-wrap gap-2">{% for platform in ['wazuh','thehive','cortex','misp'] %}<button onclick="validatePlatform('{{ platform }}')" class="px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm">Validate {{ platform|title }}</button>{% endfor %}</div>{% endif %}
+        </div>
+        <div id="validation-output" class="text-sm text-gray-400 mb-3"></div>
+        <div class="space-y-2">
+            {% for finding in findings %}
+            <article class="border border-gray-800 rounded-lg p-4"><div class="flex justify-between gap-3"><h4 class="font-medium">{{ finding.title }}</h4><span class="text-xs uppercase {% if finding.severity == 'high' %}text-red-400{% elif finding.severity == 'medium' %}text-yellow-400{% else %}text-blue-400{% endif %}">{{ finding.severity }}</span></div><p class="text-sm text-gray-300 mt-2">{{ finding.detail }}</p><p class="text-sm text-gray-500 mt-2">Recommendation: {{ finding.recommendation }}</p></article>
+            {% else %}<div class="text-sm text-gray-500">No validation findings have been recorded.</div>{% endfor %}
+        </div>
+    </section>
+
+    <section class="border-t border-gray-800 pt-7">
+        <div class="flex flex-wrap items-start justify-between gap-4 mb-4"><div><h3 class="text-lg font-semibold">Rule recommendations</h3><p class="text-sm text-gray-400 mt-1">Generated only from confirmed labels. Production modification is not performed here.</p></div>{% if can('assurance.manage') %}<button onclick="generateRecommendations()" class="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm">Generate recommendations</button>{% endif %}</div>
+        <div class="space-y-3">
+            {% for item in recommendations %}
+            <article class="border border-gray-800 rounded-lg p-4"><div class="flex flex-wrap justify-between gap-3"><div><h4 class="font-medium">{{ item.title }}</h4><div class="text-xs text-gray-500 mt-1">{{ item.platform }} · {{ item.rule_name }} · {{ item.status }}</div></div>{% if can('assurance.manage') %}<button onclick="advanceRecommendation({{ item.id }}, '{{ item.status }}')" class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm">Advance review</button>{% endif %}</div><p class="text-sm text-gray-300 mt-3">{{ item.rationale }}</p><p class="text-sm text-gray-500 mt-2">{{ item.proposed_change }}</p></article>
+            {% else %}<div class="text-sm text-gray-500">No rule recommendations yet. At least three labeled samples are required per rule.</div>{% endfor %}
+        </div>
+    </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const show = (id, text, error=false) => { const el=document.getElementById(id); if(el){el.textContent=text; el.className=`text-sm ${error?'text-red-400':'text-gray-400'}`;} };
+document.getElementById('architecture-form')?.addEventListener('submit', async (event) => { event.preventDefault(); show('architecture-output','Analyzing...'); const response=await fetch('/admin/architecture/upload',{method:'POST',body:new FormData(event.target)}); const result=await response.json(); if(!response.ok) return show('architecture-output',result.error||'Analysis failed',true); location.reload(); });
+async function architectureDecision(id, action){ let body={}; if(action==='reject'){const reason=prompt('Reason for rejection:'); if(!reason)return; body={reason};} const response=await fetch(`/api/assurance/architecture/${id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const result=await response.json(); if(!response.ok)return alert(result.error||'Request failed'); location.reload(); }
+async function recommendAlert(id){ const response=await fetch(`/api/assurance/alerts/${id}/recommend`,{method:'POST'}); const result=await response.json(); if(!response.ok)return alert(result.error||'Assessment failed'); alert(`Recommendation: ${result.assessment.recommended_classification}\nConfidence: ${Math.round(result.assessment.confidence*100)}%\n\n${result.assessment.rationale}`); location.reload(); }
+async function labelAlert(id){ const ground_truth=prompt('Enter confirmed ground truth: malicious, benign, or unknown'); if(!ground_truth)return; const rationale=prompt('Evidence-based rationale:'); if(!rationale)return; const response=await fetch(`/api/assurance/alerts/${id}/verdict`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ground_truth,confidence:ground_truth==='unknown'?0.5:1,rationale})}); const result=await response.json(); if(!response.ok)return alert(result.error||'Verdict failed'); location.reload(); }
+document.getElementById('ground-truth-form')?.addEventListener('submit', async (event)=>{event.preventDefault(); const form=new FormData(event.target); const data=Object.fromEntries(form.entries()); data.detection_occurred=data.detection_occurred==='true'; const response=await fetch('/api/assurance/ground-truth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}); const result=await response.json(); if(!response.ok)return show('ground-truth-output',result.error||'Recording failed',true); show('ground-truth-output',`Recorded ${result.event.classification}.`); setTimeout(()=>location.reload(),700);});
+async function validatePlatform(platform){show('validation-output',`Validating ${platform}...`); const response=await fetch('/api/assurance/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform})}); const result=await response.json(); if(!response.ok)return show('validation-output',result.error||'Validation failed',true); show('validation-output',`${platform} validation saved with ${result.findings.length} finding(s).`); setTimeout(()=>location.reload(),700);}
+async function generateRecommendations(){const response=await fetch('/api/assurance/recommendations/generate',{method:'POST'}); const result=await response.json(); if(!response.ok)return alert(result.error||'Generation failed'); alert(`Created ${result.recommendations.length} recommendation(s).`); location.reload();}
+async function advanceRecommendation(id,status){const next={draft:'reviewed',reviewed:'approved_for_replay'}[status]; if(!next)return alert('This recommendation is waiting for the later replay and shadow executor to attach measured evidence.'); if(!confirm(`Move this recommendation from ${status} to ${next}? This records review state but does not change the live platform.`))return; const response=await fetch(`/api/assurance/recommendations/${id}/transition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:next})}); const result=await response.json(); if(!response.ok)return alert(result.error||'Transition failed'); location.reload();}
+</script>
+{% endblock %}

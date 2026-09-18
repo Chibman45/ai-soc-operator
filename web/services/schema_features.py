@@ -375,6 +375,162 @@ CREATE TABLE IF NOT EXISTS responder_capabilities (
     FOREIGN KEY (enabled_by_proposal_id) REFERENCES capability_proposals(id)
 );
 
+-- Detection assurance keeps architecture, evidence, verdicts, and recommendations
+-- versioned. AI output is stored as a draft or recommendation and never mutates
+-- production platform configuration directly.
+CREATE TABLE IF NOT EXISTS organization_architecture_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    source_name TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    evidence_path TEXT NOT NULL,
+    architecture_json TEXT NOT NULL,
+    architecture_digest TEXT NOT NULL,
+    extraction_model TEXT,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'approved', 'rejected')),
+    created_by INTEGER NOT NULL,
+    approved_by INTEGER,
+    approved_at TIMESTAMP,
+    rejected_by INTEGER,
+    rejected_at TIMESTAMP,
+    rejection_reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    FOREIGN KEY (approved_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS organization_architecture_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    architecture_json TEXT NOT NULL,
+    architecture_digest TEXT NOT NULL,
+    source_draft_id INTEGER NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    approved_by INTEGER NOT NULL,
+    approved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(org_id, version),
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (source_draft_id) REFERENCES organization_architecture_drafts(id),
+    FOREIGN KEY (approved_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS configuration_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'live_read_only',
+    configuration_json TEXT NOT NULL,
+    configuration_digest TEXT NOT NULL,
+    architecture_profile_id INTEGER,
+    collected_by INTEGER,
+    collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (architecture_profile_id) REFERENCES organization_architecture_profiles(id),
+    FOREIGN KEY (collected_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS validation_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    snapshot_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    recommendation TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'accepted', 'resolved', 'dismissed')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (snapshot_id) REFERENCES configuration_snapshots(id)
+);
+
+CREATE TABLE IF NOT EXISTS alert_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    alert_id INTEGER NOT NULL,
+    recommended_classification TEXT NOT NULL CHECK(recommended_classification IN ('true_positive', 'false_positive', 'needs_review')),
+    confidence REAL NOT NULL,
+    rationale TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    model TEXT,
+    created_by INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (alert_id) REFERENCES alerts(id),
+    FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS alert_verdicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    alert_id INTEGER,
+    case_id INTEGER,
+    detection_occurred INTEGER NOT NULL DEFAULT 1,
+    ground_truth TEXT NOT NULL CHECK(ground_truth IN ('malicious', 'benign', 'unknown')),
+    classification TEXT NOT NULL CHECK(classification IN ('true_positive', 'false_positive', 'true_negative', 'false_negative', 'needs_review')),
+    confidence REAL NOT NULL,
+    rationale TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    rule_id TEXT,
+    rule_name TEXT,
+    rule_version TEXT,
+    architecture_profile_id INTEGER,
+    decided_by INTEGER NOT NULL,
+    decided_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (alert_id) REFERENCES alerts(id),
+    FOREIGN KEY (case_id) REFERENCES cases(id),
+    FOREIGN KEY (architecture_profile_id) REFERENCES organization_architecture_profiles(id),
+    FOREIGN KEY (decided_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS ground_truth_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    ground_truth TEXT NOT NULL CHECK(ground_truth IN ('malicious', 'benign')),
+    detection_occurred INTEGER NOT NULL,
+    alert_id INTEGER,
+    case_id INTEGER,
+    source TEXT NOT NULL,
+    event_time TIMESTAMP,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    verdict_id INTEGER NOT NULL,
+    created_by INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (alert_id) REFERENCES alerts(id),
+    FOREIGN KEY (case_id) REFERENCES cases(id),
+    FOREIGN KEY (verdict_id) REFERENCES alert_verdicts(id),
+    FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS rule_recommendations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    rule_id TEXT,
+    rule_name TEXT NOT NULL,
+    recommendation_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    proposed_change TEXT NOT NULL,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    rollback_note TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'reviewed', 'approved_for_replay', 'replay_passed', 'shadow', 'canary', 'production_approved', 'rejected', 'rolled_back')),
+    created_by INTEGER,
+    reviewed_by INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    FOREIGN KEY (reviewed_by) REFERENCES users(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_observables_value ON observables(value);
 CREATE INDEX IF NOT EXISTS idx_observables_case_id ON observables(case_id);
 CREATE INDEX IF NOT EXISTS idx_observables_alert_id ON observables(alert_id);
@@ -395,6 +551,15 @@ CREATE INDEX IF NOT EXISTS idx_infrastructure_migrations_org ON infrastructure_m
 CREATE INDEX IF NOT EXISTS idx_codex_device_sessions_org ON codex_device_sessions(org_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_delivery ON notifications(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_capability_proposals_org_status ON capability_proposals(org_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_architecture_drafts_org_status ON organization_architecture_drafts(org_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_architecture_profiles_org_active ON organization_architecture_profiles(org_id, active, version);
+CREATE INDEX IF NOT EXISTS idx_config_snapshots_org_platform ON configuration_snapshots(org_id, platform, collected_at);
+CREATE INDEX IF NOT EXISTS idx_validation_findings_org_status ON validation_findings(org_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_alert_assessments_alert ON alert_assessments(org_id, alert_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_alert_verdicts_org_classification ON alert_verdicts(org_id, classification, decided_at);
+CREATE INDEX IF NOT EXISTS idx_alert_verdicts_rule ON alert_verdicts(org_id, rule_id, rule_name);
+CREATE INDEX IF NOT EXISTS idx_ground_truth_events_org_time ON ground_truth_events(org_id, event_time, created_at);
+CREATE INDEX IF NOT EXISTS idx_rule_recommendations_org_status ON rule_recommendations(org_id, status, created_at);
 """
 
 
@@ -527,11 +692,11 @@ def init_feature_db(conn) -> None:
     # Seed default roles if empty
     import json
     default_roles = [
-        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "user.manage", "policy.manage", "policy.approve", "playbook.manage", "learning.review", "api_client.manage", "sla.view", "notification.manage", "capability.propose", "capability.approve", "capability.execute", "infrastructure.manage"]),
-        ("manager", ["chat.read", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "sla.view", "learning.review", "notification.manage", "capability.approve"]),
-        ("senior_analyst", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "tool.execute", "responder.approve", "learning.review", "sla.view", "capability.propose"]),
-        ("analyst", ["chat.read", "chat.act", "case.update", "alert.ingest", "report.export"]),
-        ("read_only", ["chat.read", "report.export"]),
+        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "user.manage", "policy.manage", "policy.approve", "playbook.manage", "learning.review", "api_client.manage", "sla.view", "notification.manage", "capability.propose", "capability.approve", "capability.execute", "infrastructure.manage", "assurance.view", "assurance.label", "assurance.manage", "architecture.manage", "architecture.approve"]),
+        ("manager", ["chat.read", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "sla.view", "learning.review", "notification.manage", "capability.approve", "assurance.view", "assurance.label", "assurance.manage", "architecture.approve"]),
+        ("senior_analyst", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "tool.execute", "responder.approve", "learning.review", "sla.view", "capability.propose", "assurance.view", "assurance.label", "assurance.manage"]),
+        ("analyst", ["chat.read", "chat.act", "case.update", "alert.ingest", "report.export", "assurance.view", "assurance.label"]),
+        ("read_only", ["chat.read", "report.export", "assurance.view"]),
     ]
     for name, perms in default_roles:
         conn.execute(

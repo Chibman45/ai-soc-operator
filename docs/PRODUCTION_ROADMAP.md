@@ -26,3 +26,18 @@ The single-node profile now has non-root containers, Gunicorn, readiness probes,
 CI now runs the test matrix, coverage, SAST, dependency, container, and secret scans. Tagged releases produce an SBOM, keyless signature, and provenance attestation. Staging soak/load evidence and a practiced rollback remain release-environment gates.
 
 These controls provide a production-oriented single-node baseline. A release is not production-approved until the environment-specific TLS, backup restore, staging soak, load, notification, responder, and rollback gates have evidence.
+
+## Detection Assurance Baseline
+
+The portal now supports an approved organization architecture profile,
+AI-assisted alert assessment, analyst ground-truth labels, TP/FP/TN/FN metrics,
+read-only Wazuh/TheHive/Cortex/MISP snapshots, deterministic configuration
+findings, and evidence-bound rule recommendations. The downloadable Word
+template collects the architecture and governance information required by this
+workflow.
+
+The next implementation phase must add a sanitized replay corpus executor,
+measured replay results, shadow and canary deployment adapters, statistical
+drift monitoring, and approval-gated rollback. Until those controls exist, a
+recommendation cannot advance beyond `approved_for_replay`, and the platform
+does not write detection rules or platform configuration.

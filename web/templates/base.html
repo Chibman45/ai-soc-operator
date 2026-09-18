@@ -46,6 +46,11 @@
                 <a href="{{ url_for('threat_intel') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.endpoint == 'threat_intel' %}bg-gray-800 text-blue-400{% endif %}">
                     🔎 Threat Intel
                 </a>
+                {% if can('assurance.view') %}
+                <a href="{{ url_for('assurance.assurance_page') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.blueprint == 'assurance' %}bg-gray-800 text-blue-400{% endif %}">
+                    ✓ Detection Assurance
+                </a>
+                {% endif %}
                 {% if can('credential.manage') %}
                 <a href="{{ url_for('credentials') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.endpoint == 'credentials' %}bg-gray-800 text-blue-400{% endif %}">
                     🔑 Credentials

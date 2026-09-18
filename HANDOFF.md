@@ -1,6 +1,6 @@
 # Handoff — AI SOC Operator
 
-_Last updated: 2026-09-17_
+_Last updated: 2026-09-18_
 
 This document is a self-contained brief for the next agent/developer picking up
 this work. It covers **what the overall goal is**, **what has been implemented**,
@@ -15,6 +15,11 @@ hardening, encrypted stored credentials, authenticated alert ingestion, a live
 alert queue, SLA metrics, durable local job controls, approval-gated responder
 execution, notification delivery, verified backups, non-root containers, CI
 security checks, and reviewable self-learning promotion states.
+Detection assurance adds versioned organization architecture drafts,
+analyst-controlled TP/FP/TN/FN verdicts, advisory AI alert assessments,
+read-only Wazuh/TheHive/Cortex/MISP validation snapshots, deterministic
+findings, and rule recommendations capped at approval for replay. A
+downloadable Word input template is available from the assurance workspace.
 The interactive Linux bootstrap can also configure local HTTPS using a private
 CA, Nginx, loopback-only Gunicorn, and deployment-gated `ProxyFix` without a
 public domain.
@@ -27,7 +32,7 @@ approval activates policy-managed roles, allowed playbooks, and per-user target
 scope. AI extraction never changes authorization by itself, and organization
 credentials remain encrypted server-side rather than being distributed to users.
 
-The full local test suite passes with **236 tests** (plus one OpenSSL integration
+The full local test suite passes with **257 tests** (plus one OpenSSL integration
 test skipped on the Windows development host). This is not a claim that a
 specific environment is production-approved. Remaining deployment evidence and
 scale-out work are tracked in

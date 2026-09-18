@@ -18,6 +18,22 @@ Redis/Celery are available through a verified, restart-gated scale-out path.
 See [the production roadmap](docs/PRODUCTION_ROADMAP.md), [operations runbook](docs/OPERATIONS_RUNBOOK.md), and
 [security policy](SECURITY.md) before deploying beyond a controlled environment.
 
+### Detection assurance
+
+The **Detection Assurance** workspace adds analyst-confirmed true-positive,
+false-positive, true-negative, false-negative, and needs-review outcomes. It
+uses a versioned, administrator-approved organization architecture profile as
+context, stores read-only Wazuh/TheHive/Cortex/MISP configuration snapshots,
+redacts secret-shaped fields, and produces deterministic validation findings
+and rule-tuning recommendations. AI alert assessments remain advisory; only an
+analyst establishes ground truth.
+
+Download the organization input template from the Detection Assurance page,
+complete it without credentials or other secrets, and upload it to create a
+review draft. Recommendations can advance only to `approved_for_replay` in this
+release. Replay, shadow, canary, production change, and rollback execution are
+reserved for a later evidence-attaching subsystem.
+
 ## Quick Start
 
 ```bash
@@ -311,6 +327,7 @@ Three playbooks are included: identity compromise, phishing response, and malwar
 - **No destructive commands**: `rm -rf`, `shred`, `mkfs`, etc. are blocked
 - **Credential isolation**: API keys and infrastructure URLs are encrypted at rest and are never written to generated config files or logs
 - **Controlled learning**: learning evidence is redacted; skill publication, responder enablement, and allowlisted installs require an immutable proposal, an explanation, independent human approval, expiry, audit evidence, and explicit environment gates
+- **Detection assurance**: AI verdicts are recommendations, ground truth is analyst-controlled, architecture and configuration remain versioned, and no validation route changes a live platform
 
 ## Project Structure
 
