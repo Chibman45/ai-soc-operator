@@ -68,4 +68,4 @@ organization id. It never contains an API key or OAuth token.
 - Connection tests use short timeouts and catch errors per platform
 - Platform settings should be edited in the web portal, not by hand-editing TOML
 - Only users with `credential.manage` can connect, disconnect, or select an AI provider
-- ChatGPT OAuth requires the official `codex` CLI on the application host
+- Full bootstrap installs and verifies the official `codex` CLI on the application host

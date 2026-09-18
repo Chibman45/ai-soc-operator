@@ -46,16 +46,23 @@ Open the URL, log in with the credentials you created during bootstrap, and conf
 
 ## What Bootstrap Does
 
-Bootstrap runs 8 steps automatically:
+Bootstrap runs 9 steps automatically:
 
 1. **System check** — Python 3.10+ and required system tools
 2. **Virtual environment** — creates `.venv`, installs all Python dependencies into it
 3. **Tool detection and install** — detects security tools (nmap, masscan, nikto, tshark, pandoc, etc.); offers to install missing ones via `apt-get` on Linux (prints `brew install` instructions on macOS)
-4. **Codex skills** — installs SOC orchestrator and analyst skills to `~/.agents/skills/`
-5. **Target scope** — sets up `config/scope.toml` with your authorized hosts/CIDRs/domains
-6. **Web portal admin account** — creates your login for the web portal (hashed password stored in local SQLite DB)
-7. **Local HTTPS** — on Linux, offers to install Nginx, creates a private local CA, and configures trusted HTTPS without requiring a public domain
-8. **Self-test** — loads all playbooks and runs the full test suite
+4. **Codex CLI** — installs the official `@openai/codex` package into the current user's `~/.local` prefix and verifies the OAuth runtime capabilities
+5. **Codex skills** — installs SOC orchestrator and analyst skills to `~/.agents/skills/`
+6. **Target scope** — sets up `config/scope.toml` with your authorized hosts/CIDRs/domains
+7. **Web portal admin account** — creates your login for the web portal (hashed password stored in local SQLite DB)
+8. **Local HTTPS** — on Linux, offers to install Nginx, creates a private local CA, and configures trusted HTTPS without requiring a public domain
+9. **Self-test** — loads all playbooks and runs the full test suite
+
+The virtual environment, Python packages, Codex CLI, bundled skills, launcher,
+and self-test are mandatory completion gates. Bootstrap exits nonzero and does
+not print “Bootstrap Complete” if any of them fails. Security utilities and
+local HTTPS remain optional because they depend on the deployment's approved
+tooling and network design.
 
 ### Sudo handling
 
@@ -112,8 +119,9 @@ An administrator selects one shared AI mode from **Credentials -> AI Agent**:
   opens the displayed OpenAI verification page, enters the one-time code, and
   then selects a supported Codex model.
 
-ChatGPT OAuth requires the `codex` executable on the application host (or an
-explicit `AI_SOC_CODEX_BIN` path). Its login state is stored under the local
+Full bootstrap installs and verifies the `codex` executable on the application
+host. An operator may instead provide an explicit `AI_SOC_CODEX_BIN` path to a
+compatible installation. Its login state is stored under the local
 `data/codex-oauth/org-<id>/` directory and is never returned to analysts or
 written into generated configuration. OAuth inference runs in an empty
 temporary workspace with a read-only sandbox and a scrubbed environment. The

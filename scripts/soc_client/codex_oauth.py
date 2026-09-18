@@ -12,7 +12,6 @@ from pathlib import Path
 from scripts.common import ROOT, audit
 from scripts.soc_client.openai import OpenAIClient
 
-
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$")
 
 
@@ -34,7 +33,13 @@ def codex_executable() -> str | None:
     if configured:
         candidate = Path(configured).expanduser().resolve()
         return str(candidate) if candidate.is_file() else None
-    return shutil.which("codex") or shutil.which("codex.cmd") or shutil.which("codex.exe")
+    discovered = shutil.which("codex") or shutil.which("codex.cmd") or shutil.which("codex.exe")
+    if discovered:
+        return discovered
+    # Bootstrap installs into a user-owned npm prefix so no root-owned OAuth
+    # files or global package mutations are required.
+    local_bin = Path.home() / ".local" / ("codex.cmd" if os.name == "nt" else "bin/codex")
+    return str(local_bin.resolve()) if local_bin.is_file() else None
 
 
 def codex_command(*args: str) -> list[str]:

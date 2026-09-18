@@ -11,11 +11,12 @@ After cloning the repo, run this once. It will:
 1. Check Python version and system requirements
 2. Install Python dependencies
 3. Detect already-installed security tools
-4. Install the Codex skill to ~/.agents/skills/
-5. Configure target scope
-6. Configure the web portal admin account
-7. Optionally configure local HTTPS through Nginx
-8. Run a self-test
+4. Install and verify the mandatory Codex CLI
+5. Install the Codex skill to ~/.agents/skills/
+6. Configure target scope
+7. Configure the web portal admin account
+8. Optionally configure local HTTPS through Nginx
+9. Run a self-test
 """
 
 from __future__ import annotations
@@ -48,6 +49,9 @@ VENV_DIR = ROOT / ".venv"
 SKILLS_SRC = ROOT / "skills"
 SKILLS_DEST = Path.home() / ".agents" / "skills"
 VENV_PYTHON: Path | None = None
+# Pin the bootstrap artifact so repeated installations are reproducible. Update
+# this only after the OAuth adapter capability tests pass against a new release.
+CODEX_NPM_SPEC = "@openai/codex@0.155.0"
 
 # ── Colors ──
 
@@ -103,7 +107,7 @@ def print_manual_sudo(command: list[str]) -> None:
 # ── Step 1: System checks ──
 
 def check_python() -> bool:
-    header("Step 1/8 — System Requirements")
+    header("Step 1/9 — System Requirements")
     major, minor = sys.version_info[:2]
     if major < 3 or (major == 3 and minor < 10):
         error(f"Python {major}.{minor} detected. Python 3.10+ required.")
@@ -178,18 +182,25 @@ def create_venv() -> Path | None:
 def install_python_deps() -> bool:
     req = ROOT / "requirements.txt"
     if not req.is_file():
-        warn("requirements.txt not found, skipping pip install")
-        return True
+        error("requirements.txt not found")
+        return False
+    requirements = ["-r", str(req)]
+    dev_req = ROOT / "requirements-dev.txt"
+    if dev_req.is_file():
+        # Bootstrap runs the repository test suite as a completion gate, so its
+        # test runner is part of a complete local installation.
+        requirements.extend(["-r", str(dev_req)])
     python_bin = VENV_PYTHON or sys.executable
     result = subprocess.run(
-        [str(python_bin), "-m", "pip", "install", "-q", "-r", str(req)],
+        [str(python_bin), "-m", "pip", "install", "-q", *requirements],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         error(f"pip install failed:\n{result.stderr}")
         return False
-    status("Python dependencies installed")
+    status("Python runtime and bootstrap verification dependencies installed")
     return True
 
 
@@ -218,7 +229,7 @@ KNOWN_TOOLS = {
 
 
 def detect_tools() -> dict[str, bool]:
-    header("Step 2/8 — Installed Tools Detection")
+    header("Step 2/9 — Installed Tools Detection")
     found = {}
     for tool, meta in KNOWN_TOOLS.items():
         path = shutil.which(tool)
@@ -286,6 +297,168 @@ def install_tools(found: dict[str, bool]) -> None:
     status("Missing tools installed")
 
 
+# ── Mandatory Codex CLI runtime ──
+
+def _command_argv(executable: str, *args: str) -> list[str]:
+    """Run Windows command shims without enabling a general-purpose shell."""
+    if platform.system() == "Windows" and executable.lower().endswith((".cmd", ".bat")):
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", subprocess.list2cmdline([executable, *args])]
+    return [executable, *args]
+
+
+def _user_npm_prefix() -> Path:
+    return Path.home() / ".local"
+
+
+def _user_npm_bin() -> Path:
+    prefix = _user_npm_prefix()
+    return prefix if platform.system() == "Windows" else prefix / "bin"
+
+
+def _find_codex() -> str | None:
+    configured = os.environ.get("AI_SOC_CODEX_BIN", "").strip()
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        Path(shutil.which("codex") or "") if shutil.which("codex") else None,
+        _user_npm_bin() / ("codex.cmd" if platform.system() == "Windows" else "codex"),
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return str(candidate.resolve())
+    return None
+
+
+def _node_is_supported() -> bool:
+    executable = shutil.which("node")
+    if not executable:
+        return False
+    try:
+        result = subprocess.run(
+            _command_argv(executable, "--version"), capture_output=True, text=True, timeout=15, check=False
+        )
+        major = int(result.stdout.strip().lstrip("v").split(".", 1)[0])
+        return result.returncode == 0 and major >= 16
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def verify_codex_cli(*, report: bool = True) -> bool:
+    """Verify the CLI and the flags required by the OAuth inference adapter."""
+    executable = _find_codex()
+    if not executable:
+        if report:
+            error("Codex CLI is not installed")
+        return False
+    try:
+        version = subprocess.run(
+            _command_argv(executable, "--version"), capture_output=True, text=True, timeout=20, check=False
+        )
+        help_result = subprocess.run(
+            _command_argv(executable, "exec", "--help"), capture_output=True, text=True, timeout=20, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        if report:
+            error(f"Codex CLI verification failed: {exc}")
+        return False
+    help_text = f"{help_result.stdout}\n{help_result.stderr}"
+    required_flags = ("--ignore-user-config", "--disable", "--sandbox", "--output-last-message")
+    missing_flags = [flag for flag in required_flags if flag not in help_text]
+    if version.returncode != 0 or help_result.returncode != 0 or missing_flags:
+        if report:
+            detail = f"; missing required flags: {', '.join(missing_flags)}" if missing_flags else ""
+            error(f"Installed Codex CLI is incompatible{detail}")
+        return False
+    if report:
+        status(f"Codex CLI verified: {version.stdout.strip() or version.stderr.strip()}")
+    return True
+
+
+def _install_node_runtime() -> bool:
+    """Install Node.js/npm through an allowlisted host package manager."""
+    system = platform.system()
+    if system == "Linux":
+        command = _linux_package_command(["nodejs", "npm"])
+        if not command:
+            error("No supported package manager was found for Node.js/npm")
+            return False
+        print("Installing mandatory runtime packages: nodejs, npm")
+        if command[0] == "apt-get":
+            refreshed = _run_privileged(["apt-get", "update"], timeout=600)
+            if not refreshed or refreshed.returncode != 0:
+                error("apt package metadata refresh failed")
+                return False
+        result = _run_privileged(command, timeout=600)
+    elif system == "Darwin" and shutil.which("brew"):
+        result = subprocess.run(["brew", "install", "node"], capture_output=True, text=True, timeout=300, check=False)
+    elif system == "Windows" and shutil.which("winget"):
+        result = subprocess.run(
+            ["winget", "install", "--id", "OpenJS.NodeJS.LTS", "--exact", "--silent",
+             "--accept-package-agreements", "--accept-source-agreements"],
+            capture_output=True, text=True, timeout=600, check=False,
+        )
+    else:
+        error("Automatic Node.js/npm installation is unavailable on this platform")
+        return False
+    if not result or result.returncode != 0:
+        if result:
+            error(f"Node.js/npm installation failed: {result.stderr.strip()[-500:]}")
+        return False
+    if not _node_is_supported() or not shutil.which("npm"):
+        error("Node.js 16+ and npm are required, but the installed runtime did not pass verification")
+        return False
+    status("Node.js and npm verified")
+    return True
+
+
+def _ensure_user_bin_on_path(bin_dir: Path) -> None:
+    bin_text = str(bin_dir)
+    current = os.environ.get("PATH", "")
+    if bin_text not in current.split(os.pathsep):
+        os.environ["PATH"] = bin_text + os.pathsep + current
+    if platform.system() == "Windows":
+        return
+    path_line = 'export PATH="$HOME/.local/bin:$PATH"'
+    for shell_rc in (Path.home() / ".bashrc", Path.home() / ".zshrc"):
+        if shell_rc.name == ".zshrc" and not shell_rc.exists():
+            continue
+        content = shell_rc.read_text(encoding="utf-8") if shell_rc.exists() else ""
+        if path_line not in content:
+            with shell_rc.open("a", encoding="utf-8") as handle:
+                handle.write("\n" + path_line + "\n")
+
+
+def install_codex_cli() -> bool:
+    """Install Codex into a user-owned prefix and refuse incomplete setup."""
+    header("Step 4/9 — Mandatory Codex CLI")
+    if verify_codex_cli(report=False):
+        verify_codex_cli()
+        return True
+    if (not _node_is_supported() or not shutil.which("npm")) and not _install_node_runtime():
+        return False
+    npm = shutil.which("npm")
+    if not npm:
+        error("npm is unavailable after Node.js installation")
+        return False
+    prefix = _user_npm_prefix()
+    prefix.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        _command_argv(npm, "install", "--global", "--prefix", str(prefix), CODEX_NPM_SPEC, "--no-audit", "--no-fund"),
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    if result.returncode != 0:
+        error(f"Codex CLI installation failed: {result.stderr.strip()[-1000:]}")
+        return False
+    _ensure_user_bin_on_path(_user_npm_bin())
+    if not verify_codex_cli():
+        error("Codex CLI was downloaded but did not pass the required capability checks")
+        return False
+    status(f"Codex CLI installed from {CODEX_NPM_SPEC}")
+    return True
+
+
 # ── Local HTTPS: private CA + Nginx reverse proxy ──
 
 def _linux_package_command(packages: list[str]) -> list[str] | None:
@@ -304,7 +477,9 @@ def _linux_package_command(packages: list[str]) -> list[str] | None:
     return None
 
 
-def _run_privileged(command: list[str], *, capture_output: bool = True) -> subprocess.CompletedProcess[str] | None:
+def _run_privileged(
+    command: list[str], *, capture_output: bool = True, timeout: int = 120
+) -> subprocess.CompletedProcess[str] | None:
     """Run an exact privileged argv or print it for manual execution."""
     if platform.system() != "Linux":
         return None
@@ -315,7 +490,7 @@ def _run_privileged(command: list[str], *, capture_output: bool = True) -> subpr
     else:
         print_manual_sudo(["sudo", *command])
         return None
-    return subprocess.run(argv, capture_output=capture_output, text=True, timeout=120, check=False)
+    return subprocess.run(argv, capture_output=capture_output, text=True, timeout=timeout, check=False)
 
 
 def _local_network_identity() -> tuple[str, str]:
@@ -511,7 +686,7 @@ def _install_local_ca(ca_cert: Path) -> bool:
 
 def setup_local_https(*, ask_enable: bool = True) -> bool:
     """Configure local TLS after explicit consent to privileged host changes."""
-    header("Step 7/8 - Local HTTPS")
+    header("Step 8/9 - Local HTTPS")
     if platform.system() != "Linux":
         warn("Automatic Nginx HTTPS setup is currently available only on Linux")
         return False
@@ -622,15 +797,15 @@ PLATFORM_DEFAULTS = {
 }
 
 
-def write_blank_platform_config() -> None:
-    header("Step 3/8 — Platform Configuration")
+def write_blank_platform_config() -> bool:
+    header("Step 3/9 — Platform Configuration")
     output = CONFIG_DIR / "platforms.toml"
     # Ensure config/ exists and is owned by current user (not root from a sudo run)
     output.parent.mkdir(parents=True, exist_ok=True)
-    import os, stat
+    import os
     if not os.access(output.parent, os.W_OK):
-        warn(f"config/ is not writable. Run: sudo chown -R $USER {output.parent}")
-        return
+        error(f"config/ is not writable. Run: sudo chown -R $USER {output.parent}")
+        return False
     lines = [
         "# AI SOC Operator — Platform Configuration",
         "# Generated by bootstrap.py",
@@ -647,6 +822,7 @@ def write_blank_platform_config() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines), encoding="utf-8")
     status(f"Blank platform config written to {output}")
+    return True
 
 
 # ── Step 5: Validate connectivity ──
@@ -665,7 +841,6 @@ def validate_connectivity(config: dict[str, Any]) -> None:
             warn(f"{name}: no base_url configured")
             continue
         try:
-            parsed = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(base_url)
             context = ssl.create_default_context()
             request = urllib.request.Request(
                 base_url,
@@ -690,7 +865,7 @@ def validate_connectivity(config: dict[str, Any]) -> None:
 # ── Step 6: Install Codex skills ──
 
 def install_skills() -> bool:
-    header("Step 4/8 — Installing Codex Skills")
+    header("Step 5/9 — Installing Codex Skills")
     if not SKILLS_SRC.is_dir():
         warn(f"Skills source not found: {SKILLS_SRC}")
         return False
@@ -720,11 +895,11 @@ def install_skills() -> bool:
     return True
 
 
-def install_system_command() -> None:
+def install_system_command() -> bool:
     source = ROOT / "bin" / "ai-soc-operator"
     if not source.is_file():
-        warn(f"Command template not found: {source}")
-        return
+        error(f"Command template not found: {source}")
+        return False
 
     script = source.read_text(encoding="utf-8")
     script = script.replace('REPO_DIR="${AI_SOC_HOME:-$HOME/ai-soc-operator}"', f'REPO_DIR="{ROOT}"')
@@ -743,12 +918,20 @@ def install_system_command() -> None:
         tmp = Path("/tmp") / "ai-soc-operator"
         tmp.write_text(script, encoding="utf-8")
         tmp.chmod(0o755)
-        result = subprocess.run(["sudo", "cp", str(tmp), str(target)], capture_output=True, text=True)
+        result = subprocess.run(
+            ["sudo", "cp", str(tmp), str(target)], capture_output=True, text=True, check=False
+        )
         if result.returncode != 0:
             error(f"Failed to install command to {target}:\n{result.stderr}")
-            return
-        subprocess.run(["sudo", "chmod", "+x", str(target)], capture_output=True, text=True)
+            return False
+        chmod_result = subprocess.run(
+            ["sudo", "chmod", "+x", str(target)], capture_output=True, text=True, check=False
+        )
+        if chmod_result.returncode != 0:
+            error(f"Failed to make {target} executable:\n{chmod_result.stderr}")
+            return False
         status(f"Installed command to {target}")
+        installed_target = target
     else:
         write_target(local_target)
         bashrc = Path.home() / ".bashrc"
@@ -763,15 +946,20 @@ def install_system_command() -> None:
                     handle.write("\n" + path_line + "\n")
         print("Added ~/.local/bin to PATH — run: source ~/.bashrc")
         status(f"Installed command to {local_target}")
+        installed_target = local_target
 
     print("Command installed: ai-soc-operator")
     print("Run it from anywhere to start the web portal.")
+    if not installed_target.is_file() or not os.access(installed_target, os.X_OK):
+        error(f"Installed launcher did not pass executable verification: {installed_target}")
+        return False
+    return True
 
 
 # ── Step 7: Scope configuration ──
 
 def configure_scope() -> None:
-    header("Step 5/8 — Target Scope")
+    header("Step 6/9 — Target Scope")
     scope_file = CONFIG_DIR / "scope.toml"
     if scope_file.exists():
         status(f"Scope already configured: {scope_file}")
@@ -835,7 +1023,7 @@ def hash_password(password: str, salt: str | None = None) -> str:
 
 
 def setup_web_credentials() -> None:
-    header("Step 6/8 — Web Portal Admin Account")
+    header("Step 7/9 — Web Portal Admin Account")
     create_account = input("Create web portal admin account? [Y/n] ").strip().lower()
     if create_account in {"n", "no"}:
         warn("Skipping web portal setup")
@@ -886,56 +1074,54 @@ def setup_web_credentials() -> None:
 # ── Step 9: Self-test ──
 
 def run_self_test() -> bool:
-    header("Step 8/8 — Self-Test")
-    # Test playbook loading
-    try:
-        sys.path.insert(0, str(ROOT))
-        from scripts.playbook_engine import load_playbook
-        for pb_file in (ROOT / "playbooks").glob("*.yaml"):
-            load_playbook(pb_file)
-        status(f"Playbooks load successfully")
-    except Exception as e:
-        error(f"Playbook loading failed: {e}")
+    header("Step 9/9 — Self-Test")
+    python_bin = VENV_PYTHON or Path(sys.executable)
+    smoke_code = """
+from pathlib import Path
+from scripts.common import ROOT
+from scripts.playbook_engine import load_playbook
+from scripts.soc_client.thehive import TheHiveClient
+from scripts.soc_client.cortex import CortexClient
+from scripts.soc_client.wazuh import WazuhManagerClient, WazuhIndexerClient
+from scripts.soc_client.enrichment import EnrichmentClient
+from scripts.orchestrator import extract_iocs, auto_select_playbook
+for playbook in (ROOT / 'playbooks').glob('*.yaml'):
+    load_playbook(playbook)
+"""
+    smoke = subprocess.run(
+        [str(python_bin), "-c", smoke_code], capture_output=True, text=True, cwd=str(ROOT), check=False
+    )
+    if smoke.returncode != 0:
+        error(f"Runtime import/playbook validation failed: {(smoke.stderr or smoke.stdout).strip()[-1000:]}")
         return False
+    status("Playbooks and platform clients load successfully in the virtual environment")
 
-    # Test client imports
-    try:
-        from scripts.soc_client.thehive import TheHiveClient
-        from scripts.soc_client.cortex import CortexClient
-        from scripts.soc_client.wazuh import WazuhManagerClient, WazuhIndexerClient
-        from scripts.soc_client.enrichment import EnrichmentClient
-        status("All platform clients import successfully")
-    except Exception as e:
-        error(f"Client import failed: {e}")
-        return False
-
-    # Test orchestrator import
-    try:
-        from scripts.orchestrator import extract_iocs, auto_select_playbook
-        status("Orchestrator imports successfully")
-    except Exception as e:
-        error(f"Orchestrator import failed: {e}")
+    if not verify_codex_cli():
         return False
 
     # Run pytest if available
     test_dir = ROOT / "tests"
-    if test_dir.is_dir():
-        result = subprocess.run(
-            [sys.executable, "-m", "pytest", str(test_dir), "-q", "--tb=line"],
-            capture_output=True,
-            text=True,
-            cwd=str(ROOT),
-        )
-        if result.returncode == 0:
-            # Extract pass count from output
-            for line in result.stdout.strip().split("\n"):
-                if "passed" in line:
-                    status(f"Tests: {line.strip()}")
-                    break
-            else:
-                status("All tests passed")
+    if not test_dir.is_dir():
+        error(f"Mandatory test directory is missing: {test_dir}")
+        return False
+    result = subprocess.run(
+        [str(python_bin), "-m", "pytest", str(test_dir), "-q", "--tb=line"],
+        capture_output=True,
+        text=True,
+        cwd=str(ROOT),
+        check=False,
+    )
+    if result.returncode == 0:
+        # Extract pass count from output
+        for line in result.stdout.strip().split("\n"):
+            if "passed" in line:
+                status(f"Tests: {line.strip()}")
+                break
         else:
-            warn(f"Some tests failed (run pytest manually for details)")
+            status("All tests passed")
+    else:
+        error(f"Bootstrap tests failed:\n{(result.stdout + result.stderr)[-2000:]}")
+        return False
 
     return True
 
@@ -979,6 +1165,7 @@ def main() -> int:
     if args.check:
         ok = check_python()
         ok = check_dependencies() and ok
+        ok = verify_codex_cli() and ok
         detect_tools()
         return 0 if ok else 1
 
@@ -993,39 +1180,52 @@ def main() -> int:
     # ── Validate mode ──
     if args.validate:
         config = load_existing_config()
-        if config:
-                run_self_test()
-        return 0
+        return 0 if config and run_self_test() else 1
 
     # ── Full bootstrap ──
     if not check_python():
         return 1
     check_dependencies()
-    create_venv()
-    install_python_deps()
+    if create_venv() is None:
+        error("Bootstrap stopped: the Python virtual environment is required")
+        return 1
+    if not install_python_deps():
+        error("Bootstrap stopped: Python dependencies are incomplete")
+        return 1
     found = detect_tools()
     install_tools(found)
-    write_blank_platform_config()
-    install_skills()
-    install_system_command()
+    if not write_blank_platform_config():
+        error("Bootstrap stopped: platform configuration could not be initialized")
+        return 1
+    if not install_codex_cli():
+        error("Bootstrap stopped: Codex CLI is mandatory for ChatGPT OAuth")
+        return 1
+    if not install_skills():
+        error("Bootstrap stopped: bundled Codex skills could not be installed")
+        return 1
+    if not install_system_command():
+        error("Bootstrap stopped: the ai-soc-operator launcher could not be installed")
+        return 1
     configure_scope()
     setup_web_credentials()
     https_enabled = setup_local_https()
-    run_self_test()
+    if not run_self_test():
+        error("Bootstrap stopped: mandatory self-tests did not pass")
+        return 1
 
     header("Bootstrap Complete")
     print(f"{GREEN}AI SOC Operator is ready.{RESET}")
-    print(f"\nNext steps:")
-    print(f"  1. Review config/platforms.toml and config/scope.toml")
-    print(f"  2. Open the web portal → Settings → Platform Connections to add your API keys and base URLs")
+    print("\nNext steps:")
+    print("  1. Review config/platforms.toml and config/scope.toml")
+    print("  2. Open the web portal → Settings → Platform Connections to add your API keys and base URLs")
     if https_enabled:
-        print(f"     Portal URL: https://localhost")
-    print(f"  3. Activate the virtual environment:")
-    print(f"     source .venv/bin/activate")
-    print(f"  4. Run an alert through the orchestrator:")
-    print(f"     python3 -m scripts.orchestrator --alert alert.json")
-    print(f"  5. Or use a specific playbook:")
-    print(f"     python3 -m scripts.orchestrator --alert alert.json --playbook playbooks/identity-compromise.yaml")
+        print("     Portal URL: https://localhost")
+    print("  3. Activate the virtual environment:")
+    print("     source .venv/bin/activate")
+    print("  4. Run an alert through the orchestrator:")
+    print("     python3 -m scripts.orchestrator --alert alert.json")
+    print("  5. Or use a specific playbook:")
+    print("     python3 -m scripts.orchestrator --alert alert.json --playbook playbooks/identity-compromise.yaml")
     print()
     return 0
 
