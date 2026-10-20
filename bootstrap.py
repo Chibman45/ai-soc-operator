@@ -651,7 +651,6 @@ map $host $ai_soc_valid_host {{
 
 server {{
     listen 80;
-    listen [::]:80;
     server_name {server_names};
     if ($ai_soc_valid_host = 0) {{ return 444; }}
     return 301 https://$host$request_uri;
@@ -659,7 +658,6 @@ server {{
 
 server {{
     listen 443 ssl;
-    listen [::]:443 ssl;
     server_name {server_names};
     if ($ai_soc_valid_host = 0) {{ return 444; }}
 
@@ -803,6 +801,10 @@ def _start_or_reload_nginx() -> bool:
         result = _run_privileged(["nginx", "-s", "reload"])
         if result and result.returncode != 0:
             result = _run_privileged(["nginx"])
+    if result and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-1000:]
+        if detail:
+            error(f"Nginx service command failed: {detail}")
     return bool(result and result.returncode == 0)
 
 

@@ -16,7 +16,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 uses the maintained stdlib backport.
+    import tomli as tomllib  # type: ignore
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
