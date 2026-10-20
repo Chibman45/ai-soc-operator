@@ -6,6 +6,18 @@ Playbooks are YAML files that define how the AI SOC analyst responds to specific
 alert types. Organizations write their SOC SOPs as playbooks, and the agent
 executes them step by step.
 
+Administrators can download the guided Word form from the **Playbooks** page or
+use `docs/templates/ai-soc-operator-playbook-template.docx`. It captures
+triggers, inputs, scope, approval roles, ordered steps, evidence, failure paths,
+testing, rollback, and a parser-compatible YAML handoff. Never place credentials
+or secret values in a playbook document.
+
+The portal accepts YAML, YML, JSON, PDF, DOCX, Markdown, text, PNG, JPEG, TIFF,
+and WebP. Every upload is validated and preserved as evidence, then shown as an
+extraction preview. Selecting **Analyze into draft** is the explicit permission
+to send bounded untrusted text to the configured organization AI. A separate
+approval is required before a generated playbook is written to `playbooks/`.
+
 ## Schema
 
 ```yaml

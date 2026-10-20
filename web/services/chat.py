@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from web.services.platform_knowledge import platform_knowledge_context
+
 ROOT = Path(__file__).resolve().parents[2]
 
 # ── Schema (run once) ──
@@ -519,6 +521,18 @@ def chat_completion(
 
     try:
         system_prompt = GLOBAL_SYSTEM_PROMPT if global_mode else SOC_SYSTEM_PROMPT
+        # Select only vendor entries relevant to the question and current case.
+        # The bounded catalogue is reference material and never grants approval.
+        platform_hints = {
+            str(context.get("source", "")),
+            *(str(alert.get("source", "")) for alert in context.get("alerts", []) if isinstance(alert, dict)),
+        }
+        knowledge = platform_knowledge_context(
+            platforms={hint for hint in platform_hints if hint},
+            query=f"{user_message} {json.dumps(context, default=str)[:4000]}",
+        )
+        if knowledge:
+            system_prompt = f"{system_prompt}\n\n{knowledge}"
         context_str = json.dumps(context, indent=2)
         label = "SOC-wide context" if global_mode else "Case context"
         transcript = [f"{label}:\n{context_str}", "Conversation history:"]

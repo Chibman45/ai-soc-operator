@@ -2,6 +2,19 @@
 
 The web portal is the source of truth for platform settings.
 
+## Platform knowledge catalogue
+
+`knowledge/platforms/catalog.json` is the reviewed, source-linked operational
+knowledge used by copilot recommendations and detection assurance. It covers
+every configured integration and records capabilities, interpretation cautions,
+configuration checks, safety constraints, and official vendor documentation.
+It is intentionally bounded and is not a verbatim documentation mirror.
+
+Vendor content and API responses are untrusted reference data. They cannot
+change scope, permissions, approval requirements, playbooks, responders, or
+production configuration. Re-review the catalogue when upgrading a connected
+platform and retain the official source URLs in each entry.
+
 ## Stored settings
 
 Each platform can store:

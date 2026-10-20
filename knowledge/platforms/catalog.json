@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "reviewed_at": "2026-09-18",
+  "entries": [
+    {
+      "id": "wazuh",
+      "display_name": "Wazuh Manager and Indexer",
+      "aliases": ["wazuh", "wazuh manager", "wazuh indexer", "siem", "decoder", "rule id"],
+      "capabilities": [
+        "Manager API inventory for agents, rules, decoders, and manager status",
+        "Rule and decoder analysis for alert-generation and log-parsing coverage",
+        "Indexer-backed alert search and evidence retrieval"
+      ],
+      "interpretation": [
+        "A Wazuh alert is a detection signal, not ground truth; corroborate it with endpoint, identity, network, and case evidence.",
+        "Custom rule identifiers should use the documented 100000-120000 range and custom files under /var/ossec/etc/rules/.",
+        "Test rule changes with wazuh-logtest and representative events before controlled replay or deployment."
+      ],
+      "configuration_checks": [
+        "Confirm custom rules and decoders survive upgrades by keeping them outside the default ruleset directory.",
+        "Verify API permissions expose only the read operations required for assurance collection.",
+        "Review duplicate rule IDs, decoder availability, MITRE mappings, noisy rules, and missing telemetry from approved assets."
+      ],
+      "safety_constraints": [
+        "Do not modify rules, decoders, agents, or index data from a recommendation.",
+        "Require approved replay evidence and a separate production change approval before deployment."
+      ],
+      "sources": [
+        {"title": "Wazuh custom rules", "url": "https://documentation.wazuh.com/current/user-manual/ruleset/rules/custom.html"},
+        {"title": "Wazuh ruleset", "url": "https://documentation.wazuh.com/current/user-manual/ruleset/index.html"},
+        {"title": "Wazuh server API reference", "url": "https://documentation.wazuh.com/current/user-manual/api/reference.html"},
+        {"title": "Wazuh rules syntax", "url": "https://documentation.wazuh.com/current/user-manual/ruleset/ruleset-xml-syntax/rules.html"},
+        {"title": "Wazuh decoders syntax", "url": "https://documentation.wazuh.com/current/user-manual/ruleset/ruleset-xml-syntax/decoders.html"}
+      ]
+    },
+    {
+      "id": "thehive",
+      "display_name": "TheHive",
+      "aliases": ["thehive", "the hive", "case management", "observable", "case template"],
+      "capabilities": ["Alert triage and case management", "Observable, task, comment, and case-template workflows", "API-based synchronization with local cases"],
+      "interpretation": ["Keep external TheHive IDs distinct from local case IDs and make synchronization idempotent.", "Apply TLP and PAP markings to observables according to the organization's sharing policy."],
+      "configuration_checks": ["Review unassigned cases, incomplete alert-to-case flow, observable markings, case templates, and API permissions.", "Use read-only collection for validation and separate approval-gated routes for writes."],
+      "safety_constraints": ["Case creation, updates, comments, and observable attachment are write actions and require explicit approval."],
+      "sources": [
+        {"title": "TheHive API documentation", "url": "https://docs.strangebee.com/thehive/api-docs"},
+        {"title": "TheHive cases", "url": "https://docs.strangebee.com/thehive/user-guides/analyst-corner/cases/about-cases/"},
+        {"title": "TheHive observables", "url": "https://docs.strangebee.com/thehive/user-guides/analyst-corner/cases/observables/about-observables/"},
+        {"title": "TheHive case templates", "url": "https://docs.strangebee.com/thehive/user-guides/organization/configure-organization/manage-templates/case-templates/about-case-templates/"}
+      ]
+    },
+    {
+      "id": "cortex",
+      "display_name": "Cortex",
+      "aliases": ["cortex", "analyzer", "responder"],
+      "capabilities": ["Run analyzers against supported observable data types", "Expose responders for approved response workflows"],
+      "interpretation": ["Analyzer output is enrichment evidence and may be incomplete, stale, or conflicting; it does not independently prove maliciousness."],
+      "configuration_checks": ["Confirm analyzers and responders are enabled only for required organizations and observable types.", "Validate analyzer secrets, timeouts, resource limits, and output handling without storing secret values."],
+      "safety_constraints": ["Analyzer execution and every responder action require scope checks and approval; responders remain disabled until explicitly enabled."],
+      "sources": [
+        {"title": "Cortex documentation", "url": "https://docs.strangebee.com/cortex/"},
+        {"title": "Cortex API guide", "url": "https://docs.strangebee.com/cortex/api/api-guide/"},
+        {"title": "Cortex analyzer and responder configuration", "url": "https://docs.strangebee.com/cortex/installation-and-configuration/analyzers-responders/"},
+        {"title": "Cortex input and output", "url": "https://docs.strangebee.com/cortex/operations/input-output/"}
+      ]
+    },
+    {
+      "id": "misp",
+      "display_name": "MISP",
+      "aliases": ["misp", "threat intelligence", "taxonomy", "warning list", "stix"],
+      "capabilities": ["Search events and attributes", "Use taxonomies, warning lists, feeds, objects, and sharing controls", "Export case intelligence as STIX and propose approval-gated MISP publication"],
+      "interpretation": ["An indicator match is context, not proof of compromise; consider sighting age, confidence, distribution, warning lists, and local evidence."],
+      "configuration_checks": ["Review taxonomies, warning lists, feeds, sync servers, distribution, object templates, and API account permissions."],
+      "safety_constraints": ["Publishing attributes or events changes shared intelligence and requires explicit approval and an auditable preview."],
+      "sources": [
+        {"title": "MISP project documentation and training", "url": "https://www.misp-project.org/"},
+        {"title": "MISP REST API training", "url": "https://www.misp-project.org/misp-training/handout/a.7-rest-API_handout.pdf"},
+        {"title": "MISP taxonomy and tagging", "url": "https://www.misp-project.org/misp-training/handout/3-misp-taxonomy-tagging_handout.pdf"},
+        {"title": "MISP object templates", "url": "https://www.misp-project.org/misp-training/handout/3.3-misp-object-template_handout.pdf"}
+      ]
+    },
+    {
+      "id": "virustotal",
+      "display_name": "VirusTotal",
+      "aliases": ["virustotal", "virus total", "vt", "reputation"],
+      "capabilities": ["Retrieve file, URL, domain, and IP analysis and relationship data"],
+      "interpretation": ["Engine detections and reputation are supporting evidence; review timestamps, engine consensus, relationships, and local context."],
+      "configuration_checks": ["Respect the selected API tier, quotas, data-sharing terms, and organization policy before submitting samples or URLs."],
+      "safety_constraints": ["Do not upload private files, URLs, or internal indicators unless policy explicitly permits external submission."],
+      "sources": [
+        {"title": "VirusTotal API v3 overview", "url": "https://docs.virustotal.com/reference/overview"},
+        {"title": "VirusTotal API overview", "url": "https://docs.virustotal.com/docs/api-overview"},
+        {"title": "VirusTotal public and premium APIs", "url": "https://docs.virustotal.com/reference/public-vs-premium-api"}
+      ]
+    },
+    {
+      "id": "abuseipdb",
+      "display_name": "AbuseIPDB",
+      "aliases": ["abuseipdb", "abuse ip db", "abuse confidence"],
+      "capabilities": ["Check IP abuse reports and confidence data"],
+      "interpretation": ["Abuse confidence and report counts are reputation signals; shared infrastructure, NAT, VPNs, and data age can create misleading conclusions."],
+      "configuration_checks": ["Validate API quota handling, maximum-age selection, and redaction of internal addresses."],
+      "safety_constraints": ["Do not report an address to AbuseIPDB automatically; external reporting requires human approval and evidence."],
+      "sources": [{"title": "AbuseIPDB API v2", "url": "https://docs.abuseipdb.com/"}]
+    },
+    {
+      "id": "shodan",
+      "display_name": "Shodan",
+      "aliases": ["shodan", "internet exposure", "host search"],
+      "capabilities": ["Retrieve observed internet-facing host and service metadata"],
+      "interpretation": ["Shodan observations can be stale and do not prove current exposure; verify ownership, timestamps, and the live approved asset inventory."],
+      "configuration_checks": ["Constrain searches to approved assets and account for API plan limits."],
+      "safety_constraints": ["A lookup does not authorize active scanning; active tools require separate scope and approval checks."],
+      "sources": [{"title": "Shodan API introduction", "url": "https://developer.shodan.io/api/introduction"}, {"title": "Shodan REST API", "url": "https://developer.shodan.io/api"}]
+    },
+    {
+      "id": "urlscan",
+      "display_name": "urlscan.io",
+      "aliases": ["urlscan", "urlscan.io", "url scan"],
+      "capabilities": ["Search existing URL scan results and submit URLs when policy permits"],
+      "interpretation": ["Search results and verdicts are enrichment; confirm scan visibility, collection time, redirects, and local telemetry."],
+      "configuration_checks": ["Default to searching existing results and verify API quotas and submission visibility settings."],
+      "safety_constraints": ["Submitting an internal or tokenized URL can disclose it externally; submission requires explicit approval."],
+      "sources": [{"title": "urlscan.io API documentation", "url": "https://urlscan.io/docs/api/"}]
+    },
+    {
+      "id": "hybrid_analysis",
+      "display_name": "Hybrid Analysis",
+      "aliases": ["hybrid analysis", "hybrid-analysis", "sandbox", "malware analysis"],
+      "capabilities": ["Search file hashes and retrieve sandbox analysis metadata"],
+      "interpretation": ["Sandbox verdicts are supporting evidence; inspect behavioral detail, sample identity, environment, and analysis age."],
+      "configuration_checks": ["Validate API authentication, quotas, and the organization's sample-submission policy."],
+      "safety_constraints": ["The current integration performs hash search; sample upload must not be inferred or performed without separate approval."],
+      "sources": [{"title": "Hybrid Analysis API v2 changelog", "url": "https://www.hybrid-analysis.com/docs/api/v2-changelog"}]
+    },
+    {
+      "id": "phishtank",
+      "display_name": "PhishTank",
+      "aliases": ["phishtank", "phish tank", "phishing url"],
+      "capabilities": ["Check whether a URL appears in the PhishTank community database"],
+      "interpretation": ["A database match supports a phishing assessment; no match does not establish that a URL is benign."],
+      "configuration_checks": ["Use the application key when available and handle service limits and unavailable results."],
+      "safety_constraints": ["Do not submit private URLs or phishing reports automatically."],
+      "sources": [{"title": "PhishTank API information", "url": "https://phishtank.org/api_info.php"}]
+    },
+    {
+      "id": "openai_codex",
+      "display_name": "OpenAI API and Codex CLI",
+      "aliases": ["openai", "codex", "chatgpt", "oauth", "ai model", "llm"],
+      "capabilities": ["Provide organization-selected model inference through an API key or Codex CLI ChatGPT sign-in"],
+      "interpretation": ["Model output is advisory and may be incomplete; ground recommendations in case evidence, approved architecture, and cited vendor context."],
+      "configuration_checks": ["Keep API-key and ChatGPT sign-in modes separate, select an approved model, and verify the Codex CLI login state on the application host."],
+      "safety_constraints": ["Never include secrets in prompts; model output cannot grant scope, approval, permissions, or production-change authority."],
+      "sources": [
+        {"title": "Codex CLI and sign in with ChatGPT", "url": "https://help.openai.com/en/articles/11381614-api-codex-cli-and-sign-in-with-chatgpt"},
+        {"title": "Codex getting started", "url": "https://help.openai.com/en/articles/11096431"},
+        {"title": "OpenAI Codex repository", "url": "https://github.com/openai/codex/blob/main/README.md"}
+      ]
+    }
+  ]
+}
