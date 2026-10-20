@@ -223,15 +223,31 @@ class LocalHTTPSTests(unittest.TestCase):
         self.assertIn("return 444", config)
 
     def test_nginx_falls_back_when_systemd_is_not_pid_one(self):
-        failed = subprocess.CompletedProcess(["systemctl"], 1, "", "not running")
         reload_failed = subprocess.CompletedProcess(["nginx"], 1, "", "no pid")
         started = subprocess.CompletedProcess(["nginx"], 0, "", "")
         with (
             patch("bootstrap.shutil.which", return_value="/usr/bin/systemctl"),
-            patch("bootstrap._run_privileged", side_effect=[failed, reload_failed, started]) as privileged,
+            patch("bootstrap.Path.is_dir", return_value=False),
+            patch("bootstrap._run_privileged", side_effect=[reload_failed, started]) as privileged,
         ):
             self.assertTrue(_start_or_reload_nginx())
+        self.assertEqual(privileged.call_args_list[0], call(["nginx", "-s", "reload"]))
         self.assertEqual(privileged.call_args_list[-1], call(["nginx"]))
+
+    def test_nginx_falls_back_when_systemd_reload_fails(self):
+        enabled = subprocess.CompletedProcess(["systemctl"], 0, "", "")
+        reload_failed = subprocess.CompletedProcess(["systemctl"], 1, "", "not running")
+        direct_reload = subprocess.CompletedProcess(["nginx"], 0, "", "")
+        with (
+            patch("bootstrap.shutil.which", return_value="/usr/bin/systemctl"),
+            patch("bootstrap.Path.is_dir", return_value=True),
+            patch(
+                "bootstrap._run_privileged",
+                side_effect=[enabled, reload_failed, direct_reload],
+            ) as privileged,
+        ):
+            self.assertTrue(_start_or_reload_nginx())
+        self.assertEqual(privileged.call_args_list[-1], call(["nginx", "-s", "reload"]))
 
     def test_runtime_secrets_are_created_once(self):
         import tempfile

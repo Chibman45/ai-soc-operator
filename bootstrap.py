@@ -134,16 +134,14 @@ def check_python() -> bool:
 
 def check_dependencies() -> bool:
     missing = []
-    for pkg in ["yaml", "tomllib"]:
-        try:
-            __import__(pkg)
-        except ImportError:
-            if pkg == "yaml":
-                missing.append("pyyaml")
-            elif pkg == "tomllib":
-                # tomllib is stdlib in 3.11+, need tomli for 3.10
-                if sys.version_info < (3, 11):
-                    missing.append("tomli")
+    try:
+        __import__("yaml")
+    except ImportError:
+        missing.append("pyyaml")
+    try:
+        __import__("tomllib" if sys.version_info >= (3, 11) else "tomli")
+    except ImportError:
+        missing.append("tomli")
     if missing:
         warn(f"Missing packages: {', '.join(missing)}")
         return False
@@ -789,17 +787,15 @@ def _install_local_ca(ca_cert: Path) -> bool:
 
 def _start_or_reload_nginx() -> bool:
     """Use systemd when active, otherwise support PID-1-free containers."""
-    if shutil.which("systemctl"):
+    result = None
+    if shutil.which("systemctl") and Path("/run/systemd/system").is_dir():
         result = _run_privileged(["systemctl", "enable", "--now", "nginx"])
         if result and result.returncode == 0:
             result = _run_privileged(["systemctl", "reload", "nginx"])
-        else:
-            result = _run_privileged(["nginx", "-s", "reload"])
-            if result and result.returncode != 0:
-                result = _run_privileged(["nginx"])
-    else:
+    # Containers and chroots commonly ship systemctl without running systemd.
+    if not result or result.returncode != 0:
         result = _run_privileged(["nginx", "-s", "reload"])
-        if result and result.returncode != 0:
+        if not result or result.returncode != 0:
             result = _run_privileged(["nginx"])
     if result and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()[-1000:]
