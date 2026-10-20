@@ -15,9 +15,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 
 RUN groupadd --system --gid 10001 soc && useradd --system --uid 10001 --gid soc --home /app soc
 COPY requirements.txt ./
-# Upgrade the packaging toolchain before application dependencies so the final
-# runtime image does not retain vulnerable packages inherited from the base.
-RUN python -m pip install --upgrade pip "setuptools>=78.1.1" \
+# pip remains available for approved, isolated capability installs. Pin the
+# latest release before pip began bundling a vulnerable vendor SBOM, while
+# keeping the installed application libraries and setuptools fully patched.
+RUN python -m pip install --upgrade "pip==26.1.1" "setuptools>=78.1.1" \
     && python -m pip install --upgrade -r requirements.txt
 COPY --chown=soc:soc . .
 RUN mkdir -p data audit evidence reports/generated backups && chown -R soc:soc data audit evidence reports backups

@@ -38,6 +38,13 @@ jobs:
           context: .
           load: true
           tags: ai-soc-operator:${{ github.sha }}
+      - name: Smoke-test the runtime image
+        run: |
+          # Validate both web imports and the installer used by approved,
+          # isolated capability-install requests before the security gate.
+          docker run --rm ai-soc-operator:${{ github.sha }} \
+            python -c "import flask, gunicorn, requests, web.app"
+          docker run --rm ai-soc-operator:${{ github.sha }} python -m pip --version
       - uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ai-soc-operator:${{ github.sha }}
