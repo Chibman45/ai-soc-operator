@@ -37,10 +37,13 @@ jobs:
         with:
           context: .
           load: true
-          tags: ai-soc-operator:ci
+          tags: ai-soc-operator:${{ github.sha }}
       - uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ai-soc-operator:ci
+          image-ref: ai-soc-operator:${{ github.sha }}
+          # Release qualification must inspect the current image digest without
+          # accepting cached package results from an earlier build.
+          cache: false
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
