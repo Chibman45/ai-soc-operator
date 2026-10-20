@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,13 +20,16 @@ from bootstrap import (
     _ensure_local_runtime_secrets,
     _generate_local_certificate,
     _install_node_runtime,
+    _install_codex_standalone_linux,
     _linux_package_command,
     _render_local_nginx_config,
+    _start_or_reload_nginx,
     check_dependencies,
     check_python,
     detect_tools,
     install_codex_cli,
     main,
+    ensure_linux_runtime_packages,
     verify_codex_cli,
 )
 
@@ -49,6 +55,35 @@ class SystemCheckTests(unittest.TestCase):
         # Just verify the structure — nmap may or may not be found
         self.assertIn("nmap", result)
         self.assertIsInstance(result["nmap"], bool)
+
+    def test_supported_linux_installs_only_when_runtime_commands_are_missing(self):
+        completed = subprocess.CompletedProcess(["apt-get"], 0, "", "")
+        lookups = {"tesseract": 0}
+
+        def which(command):
+            if command == "tesseract":
+                lookups["tesseract"] += 1
+                return None if lookups["tesseract"] == 1 else "/usr/bin/tesseract"
+            return f"/usr/bin/{command}"
+
+        with (
+            patch("bootstrap.platform.system", return_value="Linux"),
+            patch("bootstrap.detect_distribution", return_value="debian-12"),
+            patch("bootstrap.shutil.which", side_effect=which),
+            patch("bootstrap._linux_package_command", return_value=["apt-get", "install", "-y", "tesseract-ocr"]),
+            patch("bootstrap._run_privileged", side_effect=[completed, completed]) as privileged,
+        ):
+            self.assertTrue(ensure_linux_runtime_packages(install_missing=True))
+        self.assertEqual(privileged.call_args_list[0], call(["apt-get", "update"], timeout=600))
+
+    def test_unsupported_linux_stops_before_installation(self):
+        with (
+            patch("bootstrap.platform.system", return_value="Linux"),
+            patch("bootstrap.detect_distribution", side_effect=RuntimeError("Unsupported Linux distribution")),
+            patch("bootstrap._run_privileged") as privileged,
+        ):
+            self.assertFalse(ensure_linux_runtime_packages(install_missing=True))
+        privileged.assert_not_called()
 
 
 class CodexBootstrapTests(unittest.TestCase):
@@ -83,6 +118,7 @@ class CodexBootstrapTests(unittest.TestCase):
             completed = subprocess.CompletedProcess(["npm"], 0, "", "")
             with (
                 patch("bootstrap.verify_codex_cli", side_effect=[False, True]) as verify,
+                patch("bootstrap.platform.system", return_value="Windows"),
                 patch("bootstrap._node_is_supported", return_value=True),
                 patch("bootstrap.shutil.which", return_value="/usr/bin/npm"),
                 patch("bootstrap._user_npm_prefix", return_value=prefix),
@@ -96,6 +132,36 @@ class CodexBootstrapTests(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertIn("@openai/codex@0.155.0", command)
             self.assertIn(str(prefix), command)
+
+    def test_linux_standalone_codex_is_hash_verified_before_install(self):
+        binary = b"#!/bin/sh\necho codex-cli 0.155.0\n"
+        archive_buffer = io.BytesIO()
+        with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+            info = tarfile.TarInfo("codex-x86_64-unknown-linux-musl")
+            info.size = len(binary)
+            archive.addfile(info, io.BytesIO(binary))
+        archive_bytes = archive_buffer.getvalue()
+
+        class Response(io.BytesIO):
+            def geturl(self):
+                return "https://github.com/openai/codex/releases/download/test/codex.tar.gz"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("bootstrap.platform.machine", return_value="x86_64"),
+                patch(
+                    "bootstrap.CODEX_LINUX_ARTIFACTS",
+                    {"x86_64": ("codex-x86_64-unknown-linux-musl.tar.gz", hashlib.sha256(archive_bytes).hexdigest())},
+                ),
+                patch("bootstrap.urllib.request.urlopen", return_value=Response(archive_bytes)),
+                patch("bootstrap._user_npm_bin", return_value=Path(tmp)),
+                patch("bootstrap._ensure_user_bin_on_path") as ensure_path,
+                patch("bootstrap.verify_codex_cli", return_value=True),
+            ):
+                self.assertTrue(_install_codex_standalone_linux())
+                installed = Path(tmp) / "codex"
+                self.assertEqual(installed.read_bytes(), binary)
+                ensure_path.assert_called_once_with(Path(tmp))
 
     def test_linux_node_install_refreshes_apt_and_verifies_runtime(self):
         completed = subprocess.CompletedProcess(["apt-get"], 0, "", "")
@@ -155,6 +221,17 @@ class LocalHTTPSTests(unittest.TestCase):
         self.assertIn("return 301 https://$host$request_uri", config)
         self.assertIn("$ai_soc_valid_host", config)
         self.assertIn("return 444", config)
+
+    def test_nginx_falls_back_when_systemd_is_not_pid_one(self):
+        failed = subprocess.CompletedProcess(["systemctl"], 1, "", "not running")
+        reload_failed = subprocess.CompletedProcess(["nginx"], 1, "", "no pid")
+        started = subprocess.CompletedProcess(["nginx"], 0, "", "")
+        with (
+            patch("bootstrap.shutil.which", return_value="/usr/bin/systemctl"),
+            patch("bootstrap._run_privileged", side_effect=[failed, reload_failed, started]) as privileged,
+        ):
+            self.assertTrue(_start_or_reload_nginx())
+        self.assertEqual(privileged.call_args_list[-1], call(["nginx"]))
 
     def test_runtime_secrets_are_created_once(self):
         import tempfile

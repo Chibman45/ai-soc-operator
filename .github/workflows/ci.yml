@@ -25,7 +25,7 @@ jobs:
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt pip-audit bandit
       - run: python -m compileall scripts tests web
       - run: python -m pytest tests -q --cov=scripts --cov=web --cov-report=term-missing
-      - run: python -m bandit -q -r scripts web -x tests
+      - run: python -m bandit -q -ll -r scripts web -x tests
       - run: python -m pip_audit -r requirements.txt
 
   container:
@@ -44,6 +44,50 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
+
+  linux-compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: ubuntu-22.04
+            image: ubuntu:22.04
+          - id: ubuntu-24.04
+            image: ubuntu:24.04
+          - id: debian-12
+            image: debian:12
+          - id: kali-rolling
+            image: kalilinux/kali-rolling@sha256:4be87f78671419c13dcf4f207ead1cfc0de178ea281b3f69c0f49b69ba4e79b1
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install bootstrap prerequisites
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y git python3 python3-venv python3-pip tesseract-ocr poppler-utils nginx openssl nodejs npm ca-certificates curl
+      - uses: actions/checkout@v4
+      - name: Install Codex CLI and Python dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+          .venv/bin/python -c "import bootstrap, sys; sys.exit(0 if bootstrap.install_codex_cli() else 1)"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Verify distribution and mandatory runtime
+        run: |
+          test "$(.venv/bin/python -m scripts.linux_compat --id)" = "${{ matrix.id }}"
+          .venv/bin/python bootstrap.py --check
+          printf 'n\n' | .venv/bin/python bootstrap.py --setup-local-https
+          printf 'n\n' | .venv/bin/python bootstrap.py --setup-local-https
+          tesseract --version
+          pdftoppm -v
+          nginx -t
+          openssl version
+          .venv/bin/gunicorn --version
+          codex --version
+      - name: Run compatibility regression tests
+        run: .venv/bin/python -m pytest tests/test_linux_compat.py tests/test_bootstrap.py tests/test_document_ingestion.py -q
 
   secrets:
     runs-on: ubuntu-latest

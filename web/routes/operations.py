@@ -350,15 +350,16 @@ def list_notifications():
     status = str(request.args.get("status", "")).strip()
     conn = _db()
     org_id = int(current_org_id(conn))
-    params: list[object] = [org_id]
-    where = "org_id = ?"
     if status:
-        where += " AND status = ?"
-        params.append(status)
-    rows = conn.execute(
-        f"SELECT * FROM notifications WHERE {where} ORDER BY created_at DESC LIMIT 200",
-        params,
-    ).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM notifications WHERE org_id = ? AND status = ? ORDER BY created_at DESC LIMIT 200",
+            (org_id, status),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM notifications WHERE org_id = ? ORDER BY created_at DESC LIMIT 200",
+            (org_id,),
+        ).fetchall()
     conn.close()
     notifications = []
     for row in rows:

@@ -112,36 +112,39 @@ def upload_architecture():
     if not upload or not upload.filename:
         return jsonify({"error": "architecture document is required"}), 400
     suffix = Path(upload.filename).suffix.lower()
-    if suffix not in {".yaml", ".yml", ".json", ".pdf", ".docx", ".md", ".txt"}:
-        return jsonify({"error": "unsupported architecture document format"}), 400
-    content = upload.read(10 * 1024 * 1024 + 1)
-    if len(content) > 10 * 1024 * 1024:
-        return jsonify({"error": "architecture document exceeds 10 MB"}), 413
     conn = _db()
     org_id = int(current_org_id(conn))
-    client = load_ai_client(conn, org_id)
-    config = provider_config(conn, org_id)
-    callback = (lambda system, prompt: client.chat(prompt, system=system)) if client else None
+    temp_path = None
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / f"architecture{suffix}"
-            source.write_bytes(content)
-            result = create_architecture_draft(
-                conn,
-                org_id=org_id,
-                source_path=source,
-                source_name=upload.filename,
-                created_by=int(session["user_id"]),
-                llm_callback=callback,
-                extraction_model=config["model"] if client else None,
-            )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+            upload.save(temp.name)
+            temp_path = Path(temp.name)
+        from web.services.document_ingestion import ingest_document
+
+        result = ingest_document(
+            conn,
+            org_id=org_id,
+            purpose="architecture",
+            source_path=temp_path,
+            source_name=upload.filename,
+            declared_mime=upload.mimetype,
+            created_by=int(session["user_id"]),
+            evidence_root=ROOT / "evidence",
+        )
         conn.commit()
     except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
         conn.rollback()
         conn.close()
         return jsonify({"error": str(exc)[:500]}), 400
+    finally:
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
     conn.close()
-    return jsonify({"ok": True, **result}), 201
+    if request.accept_mimetypes.best == "application/json":
+        return jsonify({"ok": True, **result, "preview_url": f"/documents/{result['id']}/preview"}), 201
+    from flask import redirect, url_for
+
+    return redirect(url_for("documents.preview_document", ingestion_id=result["id"]))
 
 
 @assurance_bp.post("/api/assurance/architecture/<int:draft_id>/approve")

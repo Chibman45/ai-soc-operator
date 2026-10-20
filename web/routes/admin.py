@@ -475,39 +475,28 @@ def upload_policy():
         flash("Select an organization playbook", "error")
         return redirect(url_for("admin.policy_page"))
     suffix = Path(uploaded.filename).suffix.lower()
-    if suffix not in {".yaml", ".yml", ".json", ".pdf", ".docx", ".md", ".txt"}:
-        flash("Unsupported organization playbook format", "error")
-        return redirect(url_for("admin.policy_page"))
     conn = _get_db()
     org_id = int(current_org_id(conn))
-    known_playbooks = sorted(path.name for path in (ROOT / "playbooks").glob("*.yaml"))
-    llm_callback = None
-    extraction_model = None
-    if suffix not in {".yaml", ".yml", ".json"}:
-        from web.services.ai_provider import load_ai_client, provider_config
-
-        client = load_ai_client(conn, org_id)
-        if client:
-            llm_callback = lambda system, prompt: client.chat(prompt, system=system)
-            extraction_model = provider_config(conn, org_id)["model"]
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
             uploaded.save(temp.name)
             temp_path = Path(temp.name)
-        result = create_policy_draft(
+        from web.services.document_ingestion import ingest_document
+
+        result = ingest_document(
             conn,
             org_id=org_id,
+            purpose="organization_policy",
             source_path=temp_path,
             source_name=uploaded.filename,
+            declared_mime=uploaded.mimetype,
             created_by=int(session["user_id"]),
-            llm_callback=llm_callback,
-            known_playbooks=known_playbooks,
-            extraction_model=extraction_model,
+            evidence_root=ROOT / "evidence",
         )
         conn.commit()
-        flash(f"Policy draft {result['id']} extracted. Review it before approval.", "success")
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return redirect(url_for("documents.preview_document", ingestion_id=result["id"]))
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
         conn.rollback()
         flash(str(exc)[:300], "error")
     finally:

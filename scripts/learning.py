@@ -236,30 +236,20 @@ class LearningStore:
         """Create or update reviewable skill drafts from repeated signals."""
         conn = self._connect()
         try:
-            where = []
-            params: list[Any] = []
-            if category:
-                where.append("category = ?")
-                params.append(category)
-            if subject:
-                where.append("subject = ?")
-                params.append(subject)
-            if org_id is not None:
-                where.append("org_id = ?")
-                params.append(org_id)
-            clause = "WHERE " + " AND ".join(where) if where else ""
             rows = conn.execute(
-                f"""
+                """
                 SELECT category, subject, COUNT(*) AS count,
                        MAX(severity) AS severity,
                        MAX(summary) AS latest_summary
                 FROM learning_events
-                {clause}
+                WHERE (? IS NULL OR category = ?)
+                  AND (? IS NULL OR subject = ?)
+                  AND (? IS NULL OR org_id = ?)
                 GROUP BY category, subject
                 HAVING COUNT(*) >= ?
                 ORDER BY count DESC, subject
                 """,
-                (*params, minimum_events),
+                (category, category, subject, subject, org_id, org_id, minimum_events),
             ).fetchall()
         finally:
             conn.close()

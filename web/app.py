@@ -28,6 +28,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    send_file,
     session,
     url_for,
 )
@@ -79,7 +80,7 @@ def _session_secret() -> str:
 
 app.secret_key = _session_secret()
 app.config.update(
-    MAX_CONTENT_LENGTH=int(os.environ.get("AI_SOC_MAX_REQUEST_BYTES", str(5 * 1024 * 1024))),
+    MAX_CONTENT_LENGTH=int(os.environ.get("AI_SOC_MAX_REQUEST_BYTES", str(20 * 1024 * 1024))),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Strict",
     SESSION_COOKIE_SECURE=os.environ.get("AI_SOC_ENV", "development").lower() == "production",
@@ -932,21 +933,33 @@ def cases():
     conn = get_db()
     org_id = current_org_id(conn)
     assignment = request.args.get("assignment", "all")
-    where = "org_id = ?"
-    params: list[Any] = [org_id]
     if assignment == "mine":
-        where += " AND assignee_id = ?"
-        params.append(session["user_id"])
+        cases = conn.execute(
+            """
+            SELECT c.*, u.username AS assignee_name
+            FROM cases c LEFT JOIN users u ON u.id = c.assignee_id
+            WHERE c.org_id = ? AND c.assignee_id = ? ORDER BY c.created_at DESC
+            """,
+            (org_id, session["user_id"]),
+        ).fetchall()
     elif assignment == "unassigned":
-        where += " AND assignee_id IS NULL"
-    cases = conn.execute(
-        f"""
-        SELECT c.*, u.username AS assignee_name
-        FROM cases c LEFT JOIN users u ON u.id = c.assignee_id
-        WHERE {where.replace('org_id', 'c.org_id')} ORDER BY c.created_at DESC
-        """,
-        params,
-    ).fetchall()
+        cases = conn.execute(
+            """
+            SELECT c.*, u.username AS assignee_name
+            FROM cases c LEFT JOIN users u ON u.id = c.assignee_id
+            WHERE c.org_id = ? AND c.assignee_id IS NULL ORDER BY c.created_at DESC
+            """,
+            (org_id,),
+        ).fetchall()
+    else:
+        cases = conn.execute(
+            """
+            SELECT c.*, u.username AS assignee_name
+            FROM cases c LEFT JOIN users u ON u.id = c.assignee_id
+            WHERE c.org_id = ? ORDER BY c.created_at DESC
+            """,
+            (org_id,),
+        ).fetchall()
     members = conn.execute(
         """
         SELECT u.id, u.username FROM organization_memberships om
@@ -1136,9 +1149,23 @@ def playbooks():
         user_id=int(session["user_id"]),
         available=available,
     )
+    drafts = conn.execute(
+        "SELECT id, source_name, playbook_id, status, created_at FROM playbook_drafts WHERE org_id = ? ORDER BY created_at DESC LIMIT 20",
+        (org_id,),
+    ).fetchall()
     conn.close()
     playbooks = [{"name": name, "path": str(pb_dir / name)} for name in permitted]
-    return render_template("playbooks.html", playbooks=playbooks)
+    return render_template("playbooks.html", playbooks=playbooks, drafts=drafts)
+
+
+@app.route("/downloads/playbook-authoring-template.docx")
+@permission_required("playbook.manage")
+def download_playbook_template():
+    """Download the reviewed authoring form used for new playbook drafts."""
+    template = ROOT / "docs" / "templates" / "ai-soc-operator-playbook-template.docx"
+    if not template.is_file():
+        return jsonify({"error": "playbook template has not been generated"}), 404
+    return send_file(template, as_attachment=True, download_name=template.name)
 
 
 # ── Routes: Playbook Upload ──
@@ -1146,103 +1173,44 @@ def playbooks():
 @app.route("/playbooks/upload", methods=["POST"])
 @permission_required("playbook.manage")
 def upload_playbook():
+    """Extract an upload into a preview; analysis is a separate user action."""
     if "playbook" not in request.files:
         flash("No file selected", "error")
         return redirect(url_for("playbooks"))
-
     file = request.files["playbook"]
     if not file.filename:
         flash("No file selected", "error")
         return redirect(url_for("playbooks"))
-
-    allowed = {".yaml", ".yml", ".pdf", ".docx", ".md", ".txt"}
-    suffix = Path(file.filename).suffix.lower()
-    if suffix not in allowed:
-        flash(f"Unsupported file type. Allowed: {', '.join(sorted(allowed))}", "error")
-        return redirect(url_for("playbooks"))
-
-    # Save uploaded file temporarily
     import tempfile
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    file.save(tmp.name)
-    tmp.close()
-
-    from scripts.playbook_parser import parse_playbook_document
-
-    # Non-structured documents use whichever organization AI provider the
-    # administrator selected, so OAuth and API-key behavior stays consistent.
-    openai_client = None
-    if suffix not in (".yaml", ".yml"):
-        conn = get_db()
-        try:
-            from web.services.ai_provider import load_ai_client
-
-            openai_client = load_ai_client(conn, int(current_org_id(conn)))
-        finally:
-            conn.close()
-
-    if openai_client:
-        def llm_callback(system_prompt, user_prompt):
-            return openai_client.chat(user_prompt, system=system_prompt)
-    else:
-        llm_callback = None
-
+    suffix = Path(file.filename).suffix.lower()
+    temp_path = None
+    conn = get_db()
     try:
-        if suffix in (".yaml", ".yml"):
-            # Direct YAML parse
-            import yaml
-            try:
-                content = Path(tmp.name).read_text(encoding="utf-8")
-                parsed = yaml.safe_load(content)
-                if not isinstance(parsed, dict) or "steps" not in parsed:
-                    flash("Invalid playbook: must have 'steps' key", "error")
-                    return redirect(url_for("playbooks"))
-                # Sanitize filename to prevent path traversal
-                safe_name = Path(file.filename).name
-                if ".." in safe_name or "/" in safe_name or "\\" in safe_name:
-                    flash("Invalid filename", "error")
-                    return redirect(url_for("playbooks"))
-                dest = ROOT / "playbooks" / safe_name
-                dest.write_text(content, encoding="utf-8")
-                file.filename = safe_name
-            except Exception as e:
-                flash(f"YAML parse error: {e}", "error")
-                return redirect(url_for("playbooks"))
-        else:
-            # Non-YAML: extract → LLM → validate → save
-            if not llm_callback:
-                flash("PDF/DOCX parsing requires a configured organization AI provider.", "error")
-                return redirect(url_for("playbooks"))
-            result = parse_playbook_document(Path(tmp.name), llm_callback)
-            if not result["valid"]:
-                flash(f"Parsing errors: {'; '.join(result['errors'])}", "error")
-                return redirect(url_for("playbooks"))
-            # Save parsed playbook as YAML
-            import yaml
-            safe_name = Path(file.filename).stem.replace(" ", "-").lower()
-            # Sanitize to prevent path traversal
-            if ".." in safe_name or "/" in safe_name or "\\" in safe_name:
-                flash("Invalid filename", "error")
-                return redirect(url_for("playbooks"))
-            dest = ROOT / "playbooks" / f"{safe_name}.yaml"
-            dest.write_text(yaml.dump(result["playbook"], default_flow_style=False), encoding="utf-8")
-            file.filename = f"{safe_name}.yaml"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+            file.save(temp.name)
+            temp_path = Path(temp.name)
+        from web.services.document_ingestion import ingest_document
 
-        # Record in DB
-        conn = get_db()
-        conn.execute(
-            "INSERT INTO activity_log (org_id, actor_id, run_id, step, status, detail) VALUES (?, ?, ?, ?, 'done', ?)",
-            (current_org_id(conn), session["user_id"], None, "upload_playbook", f"Uploaded playbook: {file.filename}"),
+        result = ingest_document(
+            conn,
+            org_id=int(current_org_id(conn)),
+            purpose="playbook",
+            source_path=temp_path,
+            source_name=file.filename,
+            declared_mime=file.mimetype,
+            created_by=int(session["user_id"]),
+            evidence_root=ROOT / "evidence",
         )
         conn.commit()
-        conn.close()
-
-        flash(f"Playbook uploaded: {file.filename}", "success")
+        return redirect(url_for("documents.preview_document", ingestion_id=result["id"]))
+    except (ValueError, RuntimeError, OSError) as exc:
+        conn.rollback()
+        flash(str(exc)[:500], "error")
         return redirect(url_for("playbooks"))
-
     finally:
-        # Cleanup temp file
-        Path(tmp.name).unlink(missing_ok=True)
+        conn.close()
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
 
 
 # ── Routes: Run Approve/Reject ──
@@ -1499,6 +1467,7 @@ from web.routes.operations import operations_bp
 from web.routes.admin import admin_bp
 from web.routes.ai_provider import ai_provider_bp
 from web.routes.assurance import assurance_bp
+from web.routes.documents import documents_bp
 
 app.register_blueprint(chat_bp)
 app.register_blueprint(webhooks_bp)
@@ -1508,6 +1477,7 @@ app.register_blueprint(operations_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(ai_provider_bp)
 app.register_blueprint(assurance_bp)
+app.register_blueprint(documents_bp)
 
 # WSGI imports must initialize the schema too; production servers do not execute __main__.
 init_db()

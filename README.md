@@ -4,6 +4,9 @@ A playbook-driven SOC automation platform. Organizations supply their SOC playbo
 
 All platform credentials and connections are managed through a built-in web portal. No secrets ever touch config files.
 
+For the project purpose, intended users, architecture, trust boundaries, and
+deployment use cases, see [About](About.md).
+
 ## Release Status
 
 Application hardening Phases 0-10 now have a single-node implementation baseline. This
@@ -34,6 +37,23 @@ review draft. Recommendations can advance only to `approved_for_replay` in this
 release. Replay, shadow, canary, production change, and rollback execution are
 reserved for a later evidence-attaching subsystem.
 
+### Source-linked platform knowledge
+
+The repository includes a curated operational knowledge catalogue for Wazuh,
+TheHive, Cortex, MISP, VirusTotal, AbuseIPDB, Shodan, urlscan.io, Hybrid
+Analysis, PhishTank, and OpenAI/Codex. It summarizes interpretation cautions,
+configuration checks, safety constraints, and official documentation links.
+The copilot and detection-assurance assessment paths select only relevant
+entries and place them in a bounded prompt section. Deterministic configuration
+findings also store the reviewed vendor sources in their evidence.
+
+This catalogue is deliberately not a verbatim offline copy of vendor manuals.
+External documentation is reference data, never an instruction channel, and it
+cannot authorize a command, platform write, responder, installation, scope
+change, or production rule change. Review and update
+[`knowledge/platforms/catalog.json`](knowledge/platforms/catalog.json) when a
+vendor release changes an API or operational recommendation.
+
 ## Quick Start
 
 ```bash
@@ -60,25 +80,88 @@ The terminal will print:
 
 Open the URL, log in with the credentials you created during bootstrap, and configure your platform connections from the Settings page.
 
+## Complete Linux Setup
+
+Use Ubuntu 22.04, Ubuntu 24.04, Debian 12, or the tested Kali rolling snapshot
+with Python 3.10+, outbound HTTPS, and an OS account permitted to install the
+approved prerequisites. Do not run the application as root. See the exact
+[Linux support and validation contract](docs/LINUX_SUPPORT.md).
+
+1. Clone the repository and enter it:
+
+   ```bash
+   git clone https://github.com/Chibman45/ai-soc-operator.git
+   cd ai-soc-operator
+   ```
+
+2. Run the fail-closed bootstrap and create the first administrator when
+   prompted:
+
+   ```bash
+   python3 bootstrap.py
+   ```
+
+3. For a local-network deployment without a public domain, accept the local
+   HTTPS option during bootstrap or run it later:
+
+   ```bash
+   python3 bootstrap.py --setup-local-https
+   ```
+
+4. Start the portal:
+
+   ```bash
+   ai-soc-operator
+   ```
+
+5. Sign in as the bootstrap administrator. In the portal:
+   - configure **Credentials -> AI Agent** with an OpenAI API key or the Codex
+     CLI ChatGPT sign-in flow;
+   - add platform base URLs and credentials, then run connection tests;
+   - upload and approve the organization access policy and architecture profile;
+   - create or invite users and assign roles;
+   - create a scoped ingestion token for Wazuh, Elastic, or another SIEM;
+   - keep response execution disabled until responder previews, approvals, and
+     rollback procedures have been validated in your environment.
+
+6. Import `data/tls/local-ca.crt` into each approved analyst workstation when
+   using the generated local CA. Never copy `data/tls/local-ca.key` off the
+   server.
+
+7. Validate the installation before operational use:
+
+   ```bash
+   source .venv/bin/activate
+   python3 -m compileall scripts tests web
+   python3 -m pytest tests -q
+   ```
+
+8. Follow [the operations runbook](docs/OPERATIONS_RUNBOOK.md) for backups,
+   service restarts, key rotation, worker operation, monitoring, and recovery.
+   A passing repository test suite confirms the code baseline; production
+   approval additionally requires live platform, TLS, backup/restore, load,
+   failover, and incident-response evidence for the target environment.
+
 ## What Bootstrap Does
 
 Bootstrap runs 9 steps automatically:
 
-1. **System check** — Python 3.10+ and required system tools
+1. **System check** — validates the supported Linux release and installs missing Python, OCR, reverse-proxy, TLS, and Node/npm runtime packages
 2. **Virtual environment** — creates `.venv`, installs all Python dependencies into it
 3. **Tool detection and install** — detects security tools (nmap, masscan, nikto, tshark, pandoc, etc.); offers to install missing ones via `apt-get` on Linux (prints `brew install` instructions on macOS)
-4. **Codex CLI** — installs the official `@openai/codex` package into the current user's `~/.local` prefix and verifies the OAuth runtime capabilities
+4. **Codex CLI** — installs a pinned, SHA-256-verified official standalone binary into the current user's `~/.local` prefix on Linux and verifies the OAuth runtime capabilities
 5. **Codex skills** — installs SOC orchestrator and analyst skills to `~/.agents/skills/`
 6. **Target scope** — sets up `config/scope.toml` with your authorized hosts/CIDRs/domains
 7. **Web portal admin account** — creates your login for the web portal (hashed password stored in local SQLite DB)
 8. **Local HTTPS** — on Linux, offers to install Nginx, creates a private local CA, and configures trusted HTTPS without requiring a public domain
 9. **Self-test** — loads all playbooks and runs the full test suite
 
-The virtual environment, Python packages, Codex CLI, bundled skills, launcher,
-and self-test are mandatory completion gates. Bootstrap exits nonzero and does
-not print “Bootstrap Complete” if any of them fails. Security utilities and
-local HTTPS remain optional because they depend on the deployment's approved
-tooling and network design.
+The supported host runtime, virtual environment, Python packages, Codex CLI,
+bundled skills, launcher, and self-test are mandatory completion gates.
+Bootstrap exits nonzero and does not print “Bootstrap Complete” if any of them
+fails. Optional analyst utilities remain consent-based. Nginx and OpenSSL are
+installed as runtime prerequisites, while enabling local HTTPS remains an
+explicit deployment choice.
 
 ### Sudo handling
 
@@ -160,6 +243,7 @@ Supported platforms:
 | Shodan | Host lookups and internet-wide search |
 | urlscan.io | URL scanning and result retrieval |
 | Hybrid Analysis | Hash search and sandbox reports |
+| PhishTank | Phishing URL database checks |
 | MISP | Internal threat intelligence attribute/event search |
 | OpenAI | GPT model for LLM steps in playbooks (classification, summarization) |
 
@@ -209,7 +293,7 @@ docker compose --profile scaleout up -d --build
 ### Organization playbook access policy
 
 Open **Administration -> Organization Policy** to submit YAML, JSON, PDF, DOCX,
-Markdown, or text. Structured YAML/JSON is parsed directly. Other document types
+Markdown, text, PNG, JPEG, TIFF, or WebP. Structured YAML/JSON is parsed directly. Other document types
 use the organization's configured OpenAI credential to extract a policy draft.
 AI output is untrusted and cannot grant access: an administrator must review the
 normalized JSON and approve its exact digest before it becomes active.
@@ -261,7 +345,7 @@ ai-soc-operator
 The web portal provides:
 - **Dashboard** — live alert queue, SLA metrics, active cases, recent runs, platform status
 - **Cases** — case list with status, severity, and timeline
-- **Playbooks** — upload, review, and approve playbook documents (PDF/DOCX/MD → YAML)
+- **Playbooks** — preview extraction, analyze into a draft, and explicitly approve YAML/JSON/PDF/DOCX/MD/TXT/image playbooks
 - **Reports** — SOC, incident, and executive reports per case
 - **Settings** — platform connections, API keys, connection testing
 - **SOC Copilot** — case-scoped AI assistant with approval-gated tool execution
@@ -284,7 +368,15 @@ python3 -m scripts.orchestrator --alert alert.json --dry-run
 
 ## Playbook Format
 
-Playbooks are YAML files in `playbooks/`. You can also upload existing SOC documents (PDF, DOCX, Markdown) through the web portal — they are converted to YAML automatically via GPT.
+Playbooks are YAML files in `playbooks/`. Uploaded YAML, JSON, PDF, DOCX,
+Markdown, text, or image documents first produce a provenance-aware extraction
+preview. AI analysis runs only after a user confirms the preview, and the
+resulting playbook draft does not enter `playbooks/` until an administrator
+explicitly approves it.
+
+Administrators can download the Word authoring form from **Playbooks -> Download
+authoring template**. The same file is available at
+[`docs/templates/ai-soc-operator-playbook-template.docx`](docs/templates/ai-soc-operator-playbook-template.docx).
 
 ```yaml
 id: identity-compromise-v1
@@ -370,13 +462,16 @@ ai-soc-operator/
 ├── skills/
 │   ├── soc-orchestrator/SKILL.md
 │   └── soc-analyst/SKILL.md
-├── tests/                    # 218 tests covering all components
+├── tests/                    # Unit, route, integration, and security regression tests
 ├── demo/
 │   └── brute-force-alert.json  # Sample alert for testing
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── PLAYBOOKS.md
-│   └── PLATFORMS.md
+│   ├── PLATFORMS.md
+│   └── templates/            # Downloadable organization and playbook forms
+├── knowledge/
+│   └── platforms/catalog.json # Curated official platform references
 ├── requirements.txt
 ├── AGENTS.md
 └── LICENSE

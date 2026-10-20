@@ -34,10 +34,15 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
+import tempfile
+import urllib.request
 import venv
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from scripts.linux_compat import REQUIRED_COMMANDS, detect_distribution, required_packages
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "config"
@@ -52,6 +57,17 @@ VENV_PYTHON: Path | None = None
 # Pin the bootstrap artifact so repeated installations are reproducible. Update
 # this only after the OAuth adapter capability tests pass against a new release.
 CODEX_NPM_SPEC = "@openai/codex@0.155.0"
+CODEX_RELEASE = "rust-v0.155.0"
+CODEX_LINUX_ARTIFACTS = {
+    "x86_64": (
+        "codex-x86_64-unknown-linux-musl.tar.gz",
+        "e415cc3adb94ade16e8d44b4dd58a9201cc34b2ee51a5d6eddf2a3a00aecb6c0",
+    ),
+    "aarch64": (
+        "codex-aarch64-unknown-linux-musl.tar.gz",
+        "8b4a9c356916c515f7c93f918a01b8fa1371bcc9758addbfa723b85fbec5694b",
+    ),
+}
 
 # ── Colors ──
 
@@ -433,6 +449,8 @@ def install_codex_cli() -> bool:
     if verify_codex_cli(report=False):
         verify_codex_cli()
         return True
+    if platform.system() == "Linux":
+        return _install_codex_standalone_linux()
     if (not _node_is_supported() or not shutil.which("npm")) and not _install_node_runtime():
         return False
     npm = shutil.which("npm")
@@ -456,6 +474,54 @@ def install_codex_cli() -> bool:
         error("Codex CLI was downloaded but did not pass the required capability checks")
         return False
     status(f"Codex CLI installed from {CODEX_NPM_SPEC}")
+    return True
+
+
+def _install_codex_standalone_linux() -> bool:
+    """Install a pinned, hash-verified official Linux Codex binary."""
+    architecture = platform.machine().lower()
+    architecture = "x86_64" if architecture in {"amd64", "x64"} else architecture
+    architecture = "aarch64" if architecture in {"arm64"} else architecture
+    artifact = CODEX_LINUX_ARTIFACTS.get(architecture)
+    if not artifact:
+        error(f"No pinned Codex binary is available for Linux architecture {architecture}")
+        return False
+    archive_name, expected_sha256 = artifact
+    url = f"https://github.com/openai/codex/releases/download/{CODEX_RELEASE}/{archive_name}"
+    bin_dir = _user_npm_bin()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    destination = bin_dir / "codex"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = Path(tmp) / archive_name
+            with urllib.request.urlopen(url, timeout=120) as response:  # nosec B310
+                if response.geturl().split(":", 1)[0].lower() != "https":
+                    raise RuntimeError("Codex download redirected to a non-HTTPS URL")
+                with archive_path.open("wb") as handle:
+                    shutil.copyfileobj(response, handle, length=1024 * 1024)
+            digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            if not secrets.compare_digest(digest, expected_sha256):
+                raise RuntimeError("Codex archive SHA-256 verification failed")
+            with tarfile.open(archive_path, "r:gz") as archive:
+                members = [member for member in archive.getmembers() if member.isfile()]
+                if len(members) != 1 or Path(members[0].name).name != archive_name.removesuffix(".tar.gz"):
+                    raise RuntimeError("Codex archive layout is not the expected single binary")
+                source = archive.extractfile(members[0])
+                if source is None:
+                    raise RuntimeError("Codex archive binary could not be read")
+                temporary_destination = destination.with_suffix(".new")
+                with temporary_destination.open("wb") as handle:
+                    shutil.copyfileobj(source, handle, length=1024 * 1024)
+                temporary_destination.chmod(0o755)
+                temporary_destination.replace(destination)
+    except (OSError, RuntimeError, tarfile.TarError) as exc:
+        error(f"Codex standalone installation failed: {exc}")
+        return False
+    _ensure_user_bin_on_path(bin_dir)
+    if not verify_codex_cli():
+        destination.unlink(missing_ok=True)
+        return False
+    status(f"Codex CLI installed from pinned release {CODEX_RELEASE}")
     return True
 
 
@@ -491,6 +557,45 @@ def _run_privileged(
         print_manual_sudo(["sudo", *command])
         return None
     return subprocess.run(argv, capture_output=capture_output, text=True, timeout=timeout, check=False)
+
+
+def ensure_linux_runtime_packages(*, install_missing: bool) -> bool:
+    """Validate the official distro and install only missing runtime packages."""
+    if platform.system() != "Linux":
+        warn("Production support is limited to Ubuntu 22.04/24.04, Debian 12, and Kali rolling")
+        return True
+    try:
+        distribution = detect_distribution()
+    except RuntimeError as exc:
+        error(str(exc))
+        return False
+    status(f"Supported Linux distribution detected: {distribution}")
+    missing = [package for command, package in REQUIRED_COMMANDS.items() if not shutil.which(command)]
+    if not missing:
+        status("Tesseract, Poppler, Nginx, OpenSSL, Node.js, and npm are available")
+        return True
+    warn(f"Missing mandatory runtime packages: {', '.join(sorted(set(missing)))}")
+    if not install_missing:
+        return False
+    command = _linux_package_command(list(required_packages(distribution)))
+    if not command or command[0] != "apt-get":
+        error("Official Linux targets require an apt-compatible package manager")
+        return False
+    refreshed = _run_privileged(["apt-get", "update"], timeout=600)
+    if not refreshed or refreshed.returncode != 0:
+        error("apt package metadata refresh failed")
+        return False
+    installed = _run_privileged(command, timeout=1200)
+    if not installed or installed.returncode != 0:
+        detail = installed.stderr.strip()[-1000:] if installed else "privileged execution unavailable"
+        error(f"mandatory runtime package installation failed: {detail}")
+        return False
+    still_missing = [command for command in REQUIRED_COMMANDS if not shutil.which(command)]
+    if still_missing:
+        error(f"runtime commands remain unavailable: {', '.join(still_missing)}")
+        return False
+    status("Mandatory Linux runtime packages installed and verified")
+    return True
 
 
 def _local_network_identity() -> tuple[str, str]:
@@ -684,6 +789,23 @@ def _install_local_ca(ca_cert: Path) -> bool:
     return bool(updated and updated.returncode == 0)
 
 
+def _start_or_reload_nginx() -> bool:
+    """Use systemd when active, otherwise support PID-1-free containers."""
+    if shutil.which("systemctl"):
+        result = _run_privileged(["systemctl", "enable", "--now", "nginx"])
+        if result and result.returncode == 0:
+            result = _run_privileged(["systemctl", "reload", "nginx"])
+        else:
+            result = _run_privileged(["nginx", "-s", "reload"])
+            if result and result.returncode != 0:
+                result = _run_privileged(["nginx"])
+    else:
+        result = _run_privileged(["nginx", "-s", "reload"])
+        if result and result.returncode != 0:
+            result = _run_privileged(["nginx"])
+    return bool(result and result.returncode == 0)
+
+
 def setup_local_https(*, ask_enable: bool = True) -> bool:
     """Configure local TLS after explicit consent to privileged host changes."""
     header("Step 8/9 - Local HTTPS")
@@ -748,15 +870,7 @@ def setup_local_https(*, ask_enable: bool = True) -> bool:
     if not nginx_dump or nginx_dump.returncode != 0 or "AI SOC Operator bootstrap" not in rendered:
         error("Nginx does not include the generated AI SOC Operator configuration")
         return False
-    if shutil.which("systemctl"):
-        reload_result = _run_privileged(["systemctl", "enable", "--now", "nginx"])
-        if reload_result and reload_result.returncode == 0:
-            reload_result = _run_privileged(["systemctl", "reload", "nginx"])
-    else:
-        reload_result = _run_privileged(["nginx", "-s", "reload"])
-        if reload_result and reload_result.returncode != 0:
-            reload_result = _run_privileged(["nginx"])
-    if not reload_result or reload_result.returncode != 0:
+    if not _start_or_reload_nginx():
         error("Nginx could not be started or reloaded")
         return False
 
@@ -1164,6 +1278,7 @@ def main() -> int:
     # ── Check mode ──
     if args.check:
         ok = check_python()
+        ok = ensure_linux_runtime_packages(install_missing=False) and ok
         ok = check_dependencies() and ok
         ok = verify_codex_cli() and ok
         detect_tools()
@@ -1175,6 +1290,8 @@ def main() -> int:
         return 0
 
     if args.setup_local_https:
+        if not ensure_linux_runtime_packages(install_missing=True):
+            return 1
         return 0 if setup_local_https(ask_enable=False) else 1
 
     # ── Validate mode ──
@@ -1184,6 +1301,9 @@ def main() -> int:
 
     # ── Full bootstrap ──
     if not check_python():
+        return 1
+    if not ensure_linux_runtime_packages(install_missing=True):
+        error("Bootstrap stopped: mandatory Linux runtime packages are incomplete")
         return 1
     check_dependencies()
     if create_venv() is None:

@@ -133,9 +133,10 @@ def create_policy_draft(
     llm_callback: Callable[[str, str], str] | None,
     known_playbooks: list[str],
     extraction_model: str | None = None,
+    extracted_text: str | None = None,
 ) -> dict[str, Any]:
     suffix = source_path.suffix.lower()
-    if suffix not in {".yaml", ".yml", ".json", ".pdf", ".docx", ".md", ".txt"}:
+    if suffix not in {".yaml", ".yml", ".json", ".pdf", ".docx", ".md", ".txt", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}:
         raise ValueError("unsupported organization playbook format")
     raw = source_path.read_bytes()
     source_digest = hashlib.sha256(raw).hexdigest()
@@ -152,7 +153,7 @@ def create_policy_draft(
         if not llm_callback:
             raise ValueError("an organization AI provider is required to analyze this document")
         extracted = extract_policy_with_ai(
-            extract_text(source_path),
+            extracted_text if extracted_text is not None else extract_text(source_path),
             llm_callback=llm_callback,
             known_playbooks=known_playbooks,
         )

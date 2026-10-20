@@ -7,6 +7,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# OCR is local and bounded; Poppler renders only pages that lack enough native
+# text, while Tesseract handles scanned pages and uploaded chart images.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    poppler-utils tesseract-ocr ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --system --gid 10001 soc && useradd --system --uid 10001 --gid soc --home /app soc
 COPY requirements.txt ./
 RUN python -m pip install --upgrade pip && python -m pip install -r requirements.txt

@@ -88,15 +88,26 @@ def notify_case_event(
 
 
 def dispatch_pending(conn, limit: int = 20, org_id: int | None = None) -> list[dict[str, Any]]:
-    where = "status IN ('pending', 'retrying', 'sending') AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)"
-    params: list[Any] = []
     if org_id is not None:
-        where += " AND org_id = ?"
-        params.append(org_id)
-    rows = conn.execute(
-        f"SELECT * FROM notifications WHERE {where} ORDER BY created_at LIMIT ?",
-        (*params, limit),
-    ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT * FROM notifications
+            WHERE status IN ('pending', 'retrying', 'sending')
+              AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
+              AND org_id = ? ORDER BY created_at LIMIT ?
+            """,
+            (org_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM notifications
+            WHERE status IN ('pending', 'retrying', 'sending')
+              AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
+            ORDER BY created_at LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
     results = []
     for row in rows:
         claimed = conn.execute(
@@ -158,7 +169,7 @@ def _dispatch(row: dict[str, Any]) -> None:
             raise RuntimeError("Slack webhook is not configured")
         body = json.dumps({"text": f"*{row['severity']}* {row['event_type']}: {row['message']}"}).encode("utf-8")
         req = urllib.request.Request(webhook, data=body, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=10):
+        with urllib.request.urlopen(req, timeout=10):  # nosec B310 - scheme is restricted to HTTPS above
             pass
         return
     if row["channel"] == "email":

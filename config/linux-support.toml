@@ -1,0 +1,19 @@
+# Production support contract. Kali is pinned to the image inspected on the
+# snapshot date so rolling changes do not silently redefine a passing build.
+
+[[distribution]]
+id = "ubuntu-22.04"
+container = "ubuntu:22.04"
+
+[[distribution]]
+id = "ubuntu-24.04"
+container = "ubuntu:24.04"
+
+[[distribution]]
+id = "debian-12"
+container = "debian:12"
+
+[[distribution]]
+id = "kali-rolling"
+container = "kalilinux/kali-rolling@sha256:4be87f78671419c13dcf4f207ead1cfc0de178ea281b3f69c0f49b69ba4e79b1"
+snapshot_date = "2026-10-20"

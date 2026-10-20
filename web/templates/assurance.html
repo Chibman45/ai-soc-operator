@@ -29,12 +29,12 @@
             {% if active_architecture %}<div class="text-sm text-green-400">Active profile v{{ active_architecture.version }}</div>{% else %}<div class="text-sm text-yellow-400">No approved profile</div>{% endif %}
         </div>
         {% if can('architecture.manage') %}
-        <form id="architecture-form" class="flex flex-wrap items-end gap-3" enctype="multipart/form-data">
+        <form method="POST" action="{{ url_for('assurance.upload_architecture') }}" class="flex flex-wrap items-end gap-3" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <label class="text-sm text-gray-300">Architecture document
-                <input name="document" type="file" accept=".docx,.pdf,.json,.yaml,.yml,.md,.txt" required class="mt-1 block text-sm text-gray-400">
+                <input name="document" type="file" accept=".docx,.pdf,.json,.yaml,.yml,.md,.txt,.png,.jpg,.jpeg,.tif,.tiff,.webp" required class="mt-1 block text-sm text-gray-400">
             </label>
-            <button class="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm">Analyze document</button>
-            <span id="architecture-output" class="text-sm text-gray-400"></span>
+            <button class="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm">Extract preview</button>
         </form>
         {% endif %}
         <div class="mt-4 space-y-2">
@@ -107,7 +107,6 @@
 {% block scripts %}
 <script>
 const show = (id, text, error=false) => { const el=document.getElementById(id); if(el){el.textContent=text; el.className=`text-sm ${error?'text-red-400':'text-gray-400'}`;} };
-document.getElementById('architecture-form')?.addEventListener('submit', async (event) => { event.preventDefault(); show('architecture-output','Analyzing...'); const response=await fetch('/admin/architecture/upload',{method:'POST',body:new FormData(event.target)}); const result=await response.json(); if(!response.ok) return show('architecture-output',result.error||'Analysis failed',true); location.reload(); });
 async function architectureDecision(id, action){ let body={}; if(action==='reject'){const reason=prompt('Reason for rejection:'); if(!reason)return; body={reason};} const response=await fetch(`/api/assurance/architecture/${id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const result=await response.json(); if(!response.ok)return alert(result.error||'Request failed'); location.reload(); }
 async function recommendAlert(id){ const response=await fetch(`/api/assurance/alerts/${id}/recommend`,{method:'POST'}); const result=await response.json(); if(!response.ok)return alert(result.error||'Assessment failed'); alert(`Recommendation: ${result.assessment.recommended_classification}\nConfidence: ${Math.round(result.assessment.confidence*100)}%\n\n${result.assessment.rationale}`); location.reload(); }
 async function labelAlert(id){ const ground_truth=prompt('Enter confirmed ground truth: malicious, benign, or unknown'); if(!ground_truth)return; const rationale=prompt('Evidence-based rationale:'); if(!rationale)return; const response=await fetch(`/api/assurance/alerts/${id}/verdict`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ground_truth,confidence:ground_truth==='unknown'?0.5:1,rationale})}); const result=await response.json(); if(!response.ok)return alert(result.error||'Verdict failed'); location.reload(); }

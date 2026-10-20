@@ -2,8 +2,17 @@
 {% block title %}Playbooks — AI SOC Operator{% endblock %}
 {% block content %}
 <div class="space-y-6">
-    <h2 class="text-xl font-bold">Playbooks</h2>
-    <p class="text-gray-400 text-sm">Select a playbook to run against an alert. Each playbook defines the step-by-step response procedure.</p>
+    <div class="flex items-center justify-between gap-4">
+        <div>
+            <h2 class="text-xl font-bold">Playbooks</h2>
+            <p class="text-gray-400 text-sm mt-1">Select a playbook to run against an alert. Each playbook defines the step-by-step response procedure.</p>
+        </div>
+        {% if can('playbook.manage') %}
+        <a href="{{ url_for('download_playbook_template') }}" class="shrink-0 px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-sm font-medium transition">
+            Download authoring template
+        </a>
+        {% endif %}
+    </div>
 
     <div class="grid grid-cols-3 gap-4">
         {% for pb in playbooks %}
@@ -25,7 +34,7 @@
             <div class="text-sm">Upload custom playbook</div>
             <form method="POST" action="{{ url_for('upload_playbook') }}" enctype="multipart/form-data" class="mt-3">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <input type="file" name="playbook" accept=".yaml,.yml,.pdf,.docx,.md,.txt" class="text-xs mb-2">
+                <input type="file" name="playbook" accept=".yaml,.yml,.json,.pdf,.docx,.md,.txt,.png,.jpg,.jpeg,.tif,.tiff,.webp" class="text-xs mb-2">
                 <button type="submit" class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs transition">Upload</button>
             </form>
         </div>
@@ -34,9 +43,30 @@
         <div class="col-span-3 py-10 text-center text-gray-500">No playbooks are allowed by your active organization policy.</div>
         {% endif %}
     </div>
+
+    {% if can('playbook.manage') and drafts %}
+    <section>
+        <h3 class="font-semibold mb-3">Playbook drafts</h3>
+        <div class="overflow-x-auto border border-gray-800 rounded-lg">
+            <table class="w-full text-sm">
+                <thead class="bg-gray-900 text-gray-400"><tr><th class="text-left p-3">Playbook</th><th class="text-left p-3">Source</th><th class="text-left p-3">Status</th><th class="text-right p-3">Review</th></tr></thead>
+                <tbody>
+                    {% for draft in drafts %}
+                    <tr class="border-t border-gray-800">
+                        <td class="p-3 font-medium">{{ draft.playbook_id }}</td>
+                        <td class="p-3 text-gray-400">{{ draft.source_name }}</td>
+                        <td class="p-3">{{ draft.status }}</td>
+                        <td class="p-3 text-right">{% if draft.status == 'draft' %}<button data-approve-draft="{{ draft.id }}" class="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded">Approve</button>{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+    {% endif %}
 </div>
 
-<script>
+<script nonce="{{ csp_nonce }}">
 function runPlaybook(name) {
     if (confirm('Run playbook ' + name + '?')) {
         const form = document.createElement('form');
@@ -48,5 +78,11 @@ function runPlaybook(name) {
         form.submit();
     }
 }
+document.querySelectorAll('[data-approve-draft]').forEach((button) => button.addEventListener('click', async () => {
+    const response = await fetch(`/api/playbook-drafts/${button.dataset.approveDraft}/approve`, {
+        method: 'POST', headers: {'X-CSRF-Token': '{{ csrf_token() }}'}
+    });
+    if (response.ok) window.location.reload();
+}));
 </script>
 {% endblock %}

@@ -38,11 +38,16 @@ def _db():
 def _update_session(session_id: int, **values) -> None:
     if not values:
         return
+    allowed = {"verification_uri", "user_code", "status", "error_message", "process_id"}
+    unknown = set(values) - allowed
+    if unknown:
+        raise ValueError(f"unsupported device-session fields: {', '.join(sorted(unknown))}")
     conn = _db()
     try:
         assignments = ", ".join(f"{name} = ?" for name in values)
+        # Column names are constrained to the fixed allowlist above.
         conn.execute(
-            f"UPDATE codex_device_sessions SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            f"UPDATE codex_device_sessions SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",  # nosec B608
             (*values.values(), session_id),
         )
         conn.commit()

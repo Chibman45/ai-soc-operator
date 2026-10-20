@@ -220,8 +220,10 @@ def _copy_sqlite_to_postgres(sqlite_path: Path, postgres_dsn: str) -> dict[str, 
                 target.execute(_translate_schema(ddl))
             target.execute("SET CONSTRAINTS ALL DEFERRED")
             for table in ordered:
-                columns = [row[1] for row in source.execute(f'PRAGMA table_info("{table}")').fetchall()]
-                rows = source.execute(f'SELECT * FROM "{table}"').fetchall()
+                # table is sourced from sqlite_master and quoted as an SQLite
+                # identifier; values are never interpolated into these queries.
+                columns = [row[1] for row in source.execute(f'PRAGMA table_info("{table}")').fetchall()]  # nosec B608
+                rows = source.execute(f'SELECT * FROM "{table}"').fetchall()  # nosec B608
                 if rows:
                     statement = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
                         sql.Identifier(table),
@@ -242,7 +244,8 @@ def _copy_sqlite_to_postgres(sqlite_path: Path, postgres_dsn: str) -> dict[str, 
                     ).fetchone()[0]
                     if sequence:
                         target.execute(
-                            "SELECT setval(%s, COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM "
+                            # psycopg renders the table name as an escaped SQL identifier.
+                            "SELECT setval(%s, COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM "  # nosec B608
                             + sql.Identifier(table).as_string(target),
                             (sequence,),
                         )

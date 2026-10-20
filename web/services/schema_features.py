@@ -416,6 +416,56 @@ CREATE TABLE IF NOT EXISTS organization_architecture_profiles (
     FOREIGN KEY (approved_by) REFERENCES users(id)
 );
 
+-- Uploads are extracted into a human-reviewable preview before an AI model is
+-- allowed to interpret them. The immutable evidence path points to the exact
+-- bytes received, while provenance records where each text fragment came from.
+CREATE TABLE IF NOT EXISTS document_ingestions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    purpose TEXT NOT NULL CHECK(purpose IN ('playbook', 'organization_policy', 'architecture')),
+    source_name TEXT NOT NULL,
+    suffix TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    evidence_path TEXT NOT NULL,
+    extraction_text TEXT NOT NULL,
+    preview_text TEXT NOT NULL,
+    provenance_json TEXT NOT NULL DEFAULT '[]',
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    ocr_used INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'preview' CHECK(status IN ('preview', 'analyzed', 'rejected')),
+    analysis_result_type TEXT,
+    analysis_result_id INTEGER,
+    created_by INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    analyzed_at TIMESTAMP,
+    rejected_at TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS playbook_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    ingestion_id INTEGER NOT NULL,
+    source_name TEXT NOT NULL,
+    playbook_id TEXT NOT NULL,
+    playbook_json TEXT NOT NULL,
+    playbook_digest TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'approved', 'rejected')),
+    created_by INTEGER NOT NULL,
+    approved_by INTEGER,
+    approved_at TIMESTAMP,
+    rejected_by INTEGER,
+    rejected_at TIMESTAMP,
+    rejection_reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id),
+    FOREIGN KEY (ingestion_id) REFERENCES document_ingestions(id),
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    FOREIGN KEY (approved_by) REFERENCES users(id)
+);
+
 CREATE TABLE IF NOT EXISTS configuration_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     org_id INTEGER NOT NULL,
@@ -553,6 +603,8 @@ CREATE INDEX IF NOT EXISTS idx_notifications_delivery ON notifications(status, c
 CREATE INDEX IF NOT EXISTS idx_capability_proposals_org_status ON capability_proposals(org_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_architecture_drafts_org_status ON organization_architecture_drafts(org_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_architecture_profiles_org_active ON organization_architecture_profiles(org_id, active, version);
+CREATE INDEX IF NOT EXISTS idx_document_ingestions_org_status ON document_ingestions(org_id, purpose, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_playbook_drafts_org_status ON playbook_drafts(org_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_config_snapshots_org_platform ON configuration_snapshots(org_id, platform, collected_at);
 CREATE INDEX IF NOT EXISTS idx_validation_findings_org_status ON validation_findings(org_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_alert_assessments_alert ON alert_assessments(org_id, alert_id, created_at);
@@ -583,6 +635,7 @@ def init_feature_db(conn) -> None:
     _add_missing_columns(conn, "user_roles", {"org_id": "INTEGER", "source": "TEXT NOT NULL DEFAULT 'manual'", "policy_id": "INTEGER"})
     _add_missing_columns(conn, "credentials", {"org_id": "INTEGER"})
     _add_missing_columns(conn, "platform_config", {"org_id": "INTEGER"})
+    _add_missing_columns(conn, "document_ingestions", {"mime_type": "TEXT NOT NULL DEFAULT 'application/octet-stream'"})
     _add_missing_columns(
         conn,
         "runs",
@@ -722,7 +775,7 @@ def init_feature_db(conn) -> None:
     conn.execute("UPDATE user_roles SET org_id = ? WHERE org_id IS NULL", (default_org_id,))
     for table in ("credentials", "platform_config", "runs", "cases", "alerts", "observables", "responder_actions", "notifications", "activity_log"):
         try:
-            conn.execute(f"UPDATE {table} SET org_id = ? WHERE org_id IS NULL", (default_org_id,))
+            conn.execute(f"UPDATE {table} SET org_id = ? WHERE org_id IS NULL", (default_org_id,))  # nosec B608
         except Exception:
             pass
 

@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Document Preview - AI SOC Operator{% endblock %}
+{% block content %}
+<div class="max-w-5xl space-y-6">
+    <div>
+        <h2 class="text-xl font-bold">Review extracted document</h2>
+        <p class="text-sm text-gray-400 mt-1">The original is preserved as evidence. AI analysis has not run yet.</p>
+    </div>
+
+    <section class="border border-gray-800 bg-gray-900 p-5 rounded-lg">
+        <dl class="grid grid-cols-2 gap-4 text-sm">
+            <div><dt class="text-gray-400">File</dt><dd class="mt-1">{{ document.source_name }}</dd></div>
+            <div><dt class="text-gray-400">Purpose</dt><dd class="mt-1">{{ document.purpose|replace('_', ' ')|title }}</dd></div>
+            <div><dt class="text-gray-400">SHA-256</dt><dd class="mt-1 font-mono text-xs break-all">{{ document.source_sha256 }}</dd></div>
+            <div><dt class="text-gray-400">MIME type</dt><dd class="mt-1">{{ document.mime_type }}</dd></div>
+            <div><dt class="text-gray-400">OCR</dt><dd class="mt-1">{{ 'Used' if document.ocr_used else 'Not required' }}</dd></div>
+        </dl>
+    </section>
+
+    {% if document.warnings %}
+    <section class="border border-amber-700 bg-amber-950/30 p-4 rounded-lg">
+        <h3 class="font-semibold text-amber-300">Extraction warnings</h3>
+        <ul class="mt-2 text-sm text-amber-100 space-y-1">{% for warning in document.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+    </section>
+    {% endif %}
+
+    <section>
+        <h3 class="font-semibold mb-2">Extracted text preview</h3>
+        <pre class="max-h-[32rem] overflow-auto whitespace-pre-wrap border border-gray-800 bg-gray-950 p-4 rounded-lg text-sm">{{ document.preview_text }}</pre>
+    </section>
+
+    <details>
+        <summary class="cursor-pointer text-sm text-blue-400">Extraction provenance ({{ document.provenance|length }} records)</summary>
+        <div class="mt-3 overflow-x-auto border border-gray-800 rounded-lg">
+            <table class="w-full text-sm">
+                <thead class="bg-gray-900 text-gray-400"><tr><th class="text-left p-3">Location</th><th class="text-left p-3">Method</th><th class="text-left p-3">Extract</th></tr></thead>
+                <tbody>{% for item in document.provenance[:200] %}<tr class="border-t border-gray-800"><td class="p-3 whitespace-nowrap">{{ item.location }}</td><td class="p-3">{{ item.method }}</td><td class="p-3 text-gray-300">{{ item.text }}</td></tr>{% endfor %}</tbody>
+            </table>
+        </div>
+    </details>
+
+    <div class="flex gap-3">
+        <form method="POST" action="{{ url_for('documents.analyze_document', ingestion_id=document.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded font-medium" type="submit">Analyze into draft</button>
+        </form>
+        <button id="reject-document" class="px-4 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded" type="button">Reject upload</button>
+    </div>
+</div>
+<script nonce="{{ csp_nonce }}">
+document.getElementById('reject-document').addEventListener('click', async () => {
+    const response = await fetch('{{ url_for("documents.reject_document", ingestion_id=document.id) }}', {
+        method: 'POST',
+        headers: {'X-CSRF-Token': '{{ csrf_token() }}'}
+    });
+    if (response.ok) window.location.href = '{{ url_for("dashboard") }}';
+});
+</script>
+{% endblock %}

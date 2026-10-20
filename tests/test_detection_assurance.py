@@ -20,6 +20,7 @@ from web.services.detection_assurance import (
     record_ground_truth_event,
     record_verdict,
     store_and_validate_configuration,
+    normalize_architecture,
 )
 from web.services.schema_features import init_feature_db
 
@@ -93,6 +94,44 @@ class ClassificationTests(unittest.TestCase):
 
 
 class ArchitectureTests(unittest.TestCase):
+    def test_visual_chart_fields_are_bounded_and_reviewable(self):
+        profile = normalize_architecture(
+            {
+                "organization_name": "Example SOC",
+                "organizational_units": [
+                    {
+                        "id": "soc",
+                        "name": "Security Operations",
+                        "type": "department",
+                        "leader": "Alice",
+                        "parent_id": "security",
+                        "security_responsibilities": ["Monitor alerts"],
+                    }
+                ],
+                "reporting_relationships": [
+                    {
+                        "from": "soc",
+                        "to": "security",
+                        "relationship": "reports_to",
+                        "confidence": 0.85,
+                        "evidence": "OCR region image-1",
+                    }
+                ],
+                "uncertain_relationships": [
+                    {
+                        "description": "Dotted line may indicate escalation",
+                        "confidence": 0.4,
+                        "evidence": "OCR region image-2",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(profile["organizational_units"][0]["leader"], "Alice")
+        self.assertEqual(profile["reporting_relationships"][0]["confidence"], 0.85)
+        self.assertEqual(profile["uncertain_relationships"][0]["confidence"], 0.4)
+        self.assertNotIn("users", profile)
+        self.assertNotIn("role_assignments", profile)
+
     def test_structured_profile_requires_approval_before_activation(self):
         conn, org_id = assurance_connection()
         with tempfile.TemporaryDirectory() as tmp, patch("web.services.detection_assurance.ROOT", Path(tmp)):
@@ -161,6 +200,16 @@ class ValidationAndRecommendationTests(unittest.TestCase):
         titles = {item["title"] for item in result["findings"]}
         self.assertIn("Remote service is not using HTTPS", titles)
         self.assertIn("Duplicate Wazuh rule identifiers", titles)
+        self.assertTrue(
+            all(item["evidence"]["documentation_sources"] for item in result["findings"])
+        )
+        self.assertTrue(
+            all(
+                source["url"].startswith("https://documentation.wazuh.com/")
+                for item in result["findings"]
+                for source in item["evidence"]["documentation_sources"]
+            )
+        )
 
     def test_recommendation_requires_repeated_confirmed_outcomes(self):
         conn, org_id = assurance_connection()
@@ -232,6 +281,12 @@ class AssuranceRouteTests(unittest.TestCase):
                 self.assertEqual(
                     client.get("/downloads/organization-assurance-template.docx").status_code,
                     200,
+                )
+                playbook_template = client.get("/downloads/playbook-authoring-template.docx")
+                self.assertEqual(playbook_template.status_code, 200)
+                self.assertEqual(
+                    playbook_template.headers["Content-Type"],
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
                 response = client.post(
                     f"/api/assurance/alerts/{alert_id}/verdict",
