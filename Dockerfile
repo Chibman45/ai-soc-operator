@@ -9,7 +9,8 @@ WORKDIR /app
 
 # OCR is local and bounded; Poppler renders only pages that lack enough native
 # text, while Tesseract handles scanned pages and uploaded chart images.
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     poppler-utils tesseract-ocr ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

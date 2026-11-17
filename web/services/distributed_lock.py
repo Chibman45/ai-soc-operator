@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import secrets
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 LOCK_SCHEMA = """
 CREATE TABLE IF NOT EXISTS worker_leases (
@@ -25,7 +25,7 @@ def acquire_lease(conn, lock_name: str, *, ttl_seconds: int = 300, owner_token: 
     if not lock_name.strip():
         raise ValueError("lock name is required")
     owner = owner_token or secrets.token_urlsafe(24)
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)  # noqa: UP017 - Python 3.10 support.
     expires = now + timedelta(seconds=max(15, int(ttl_seconds)))
     cursor = conn.execute(
         """

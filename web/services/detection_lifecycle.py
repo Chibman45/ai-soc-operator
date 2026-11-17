@@ -12,7 +12,7 @@ import json
 import math
 import re
 import secrets
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
@@ -217,7 +217,7 @@ def init_detection_lifecycle_db(conn) -> None:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)  # noqa: UP017 - Python 3.10 support.
 
 
 def _canonical(value: Any) -> str:

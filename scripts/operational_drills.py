@@ -16,7 +16,7 @@ import os
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
@@ -35,7 +35,8 @@ _SENSITIVE_MARKERS = ("secret", "password", "token", "api_key", "apikey", "crede
 
 
 def _utc_now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    # timezone.utc keeps operational evidence compatible with Python 3.10.
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")  # noqa: UP017
 
 
 def _canonical(value: Any) -> bytes:
