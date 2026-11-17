@@ -88,6 +88,15 @@ class PostgresConnection:
         self._conn = psycopg.connect(dsn, autocommit=False)
         self.row_factory = None
 
+    def set_tenant_context(self, org_id: int) -> None:
+        """Bind PostgreSQL RLS for this connection without interpolating values."""
+        cur = self._conn.cursor()
+        cur.execute("SELECT set_config('app.current_org_id', %s, false)", (str(int(org_id)),))
+
+    def clear_tenant_context(self) -> None:
+        cur = self._conn.cursor()
+        cur.execute("SELECT set_config('app.current_org_id', '', false)")
+
     def execute(self, sql: str, params: Sequence[Any] | None = None):
         pragma = _pragma_table(sql)
         if pragma:

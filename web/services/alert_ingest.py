@@ -172,7 +172,7 @@ def ingest_alert_record(
         )
         conn.commit()
 
-        dispatch_playbook_job(job_queue, job_id)
+        dispatch_playbook_job(job_queue, job_id, org_id)
 
     learn_alert(normalized, source=source, playbook=selected_playbook, org_id=org_id)
     audit(

@@ -106,6 +106,8 @@ def current_org_id(conn: sqlite3.Connection | None = None) -> int | None:
             ).fetchone()
         if row:
             session["org_id"] = int(row["org_id"])
+            if hasattr(conn, "set_tenant_context"):
+                conn.set_tenant_context(int(row["org_id"]))
             return int(row["org_id"])
         return None
     finally:

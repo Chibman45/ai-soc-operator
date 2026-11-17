@@ -11,17 +11,18 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 try:
-    from .common import ROOT, Session, audit, utc_now
+    from .common import ROOT, audit, utc_now
 except ImportError:
-    from scripts.common import ROOT, Session, audit, utc_now
+    from scripts.common import ROOT, audit, utc_now
 
 
 class JobStatus(str, Enum):
@@ -46,16 +47,20 @@ class JobCancelled(JobControlSignal):
     pass
 
 
+class JobLeaseLost(JobControlSignal):
+    """Raised when a replacement worker owns a newer lease generation."""
+
+
 @dataclass
 class JobResult:
     """Result of a job execution."""
     job_id: str
     status: JobStatus
-    result: Optional[dict[str, Any]] = None
-    error: Optional[str] = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
     progress: float = 0.0  # 0.0 to 1.0
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
+    started_at: str | None = None
+    finished_at: str | None = None
 
 
 class JobQueue:
@@ -68,6 +73,7 @@ class JobQueue:
         self._workers: dict[str, Future] = {}
         self._worker_lock = threading.Lock()
         self._executors: dict[str, Callable] = {}
+        self.lease_seconds = max(15, int(os.environ.get("AI_SOC_JOB_LEASE_SECONDS", "300")))
         self._init_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -81,6 +87,11 @@ class JobQueue:
         if isinstance(conn, sqlite3.Connection):
             conn.execute("PRAGMA foreign_keys = OFF")
         return conn
+
+    @staticmethod
+    def _bind_tenant(conn, org_id: int | None) -> None:
+        if org_id is not None and hasattr(conn, "set_tenant_context"):
+            conn.set_tenant_context(org_id)
 
     def _init_schema(self) -> None:
         """Initialize job queue schema."""
@@ -107,6 +118,7 @@ class JobQueue:
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL DEFAULT 3,
                     worker_id TEXT,
+                    lease_generation INTEGER NOT NULL DEFAULT 0,
                     lease_expires_at TIMESTAMP,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (run_id) REFERENCES runs(id)
@@ -122,6 +134,7 @@ class JobQueue:
                 "attempt_count": "INTEGER NOT NULL DEFAULT 0",
                 "max_attempts": "INTEGER NOT NULL DEFAULT 3",
                 "worker_id": "TEXT",
+                "lease_generation": "INTEGER NOT NULL DEFAULT 0",
                 "lease_expires_at": "TIMESTAMP",
                 "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
             }.items():
@@ -147,11 +160,11 @@ class JobQueue:
         Returns:
             Job ID
         """
-        import uuid
         job_id = str(uuid.uuid4())
 
         conn = self._get_conn()
         try:
+            self._bind_tenant(conn, org_id)
             if idempotency_key:
                 existing = conn.execute(
                     "SELECT id FROM jobs WHERE org_id = ? AND idempotency_key = ?",
@@ -183,10 +196,11 @@ class JobQueue:
         audit("job_created", job_id=job_id, run_id=run_id, playbook=playbook_path)
         return job_id
 
-    def get_job(self, job_id: str) -> JobResult:
+    def get_job(self, job_id: str, org_id: int | None = None) -> JobResult:
         """Get job status and result."""
         conn = self._get_conn()
         try:
+            self._bind_tenant(conn, org_id)
             job = conn.execute(
                 "SELECT * FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
@@ -213,24 +227,46 @@ class JobQueue:
         finally:
             conn.close()
 
-    def update_job_progress(self, job_id: str, progress: float) -> None:
-        """Update job progress (0.0 to 1.0)."""
+    def update_job_progress(
+        self,
+        job_id: str,
+        progress: float,
+        *,
+        worker_id: str | None = None,
+        lease_generation: int | None = None,
+        org_id: int | None = None,
+    ) -> bool:
+        """Update progress only while the caller still owns the active lease."""
         progress = max(0.0, min(1.0, progress))
         conn = self._get_conn()
         try:
-            conn.execute(
-                """
+            self._bind_tenant(conn, org_id)
+            params: list[Any] = [progress, f"+{self.lease_seconds} seconds", job_id]
+            if worker_id is not None and lease_generation is not None:
+                params.extend([worker_id, lease_generation])
+                query = """
                 UPDATE jobs
                 SET progress = ?, updated_at = CURRENT_TIMESTAMP,
                     lease_expires_at = CASE
-                        WHEN status = 'running' THEN datetime('now', '+5 minutes')
+                        WHEN status = 'running' THEN datetime('now', ?)
                         ELSE lease_expires_at
                     END
                 WHERE id = ?
-                """,
-                (progress, job_id),
-            )
+                  AND status = 'running' AND worker_id = ? AND lease_generation = ?
+                """
+            else:
+                query = """
+                UPDATE jobs
+                SET progress = ?, updated_at = CURRENT_TIMESTAMP,
+                    lease_expires_at = CASE
+                        WHEN status = 'running' THEN datetime('now', ?)
+                        ELSE lease_expires_at
+                    END
+                WHERE id = ?
+                """
+            updated = conn.execute(query, params).rowcount
             conn.commit()
+            return bool(updated)
         finally:
             conn.close()
 
@@ -238,35 +274,58 @@ class JobQueue:
         self,
         job_id: str,
         status: JobStatus,
-        result: Optional[dict[str, Any]] = None,
-        error: Optional[str] = None,
-    ) -> None:
-        """Update job status and result."""
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+        *,
+        worker_id: str | None = None,
+        lease_generation: int | None = None,
+        org_id: int | None = None,
+    ) -> bool:
+        """Update status, optionally fenced to the current lease owner."""
         conn = self._get_conn()
         try:
+            self._bind_tenant(conn, org_id)
             result_json = json.dumps(result) if result else None
             finished_at = utc_now() if status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED) else None
-
-            conn.execute(
-                """UPDATE jobs SET status = ?, result_json = ?, error_message = ?, 
-                   finished_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                (status.value, result_json, error, finished_at, job_id),
-            )
+            params: list[Any] = [status.value, result_json, error, finished_at, status.value, job_id]
+            if worker_id is not None and lease_generation is not None:
+                params.extend([worker_id, lease_generation])
+                query = """UPDATE jobs SET status = ?, result_json = ?, error_message = ?,
+                   finished_at = ?, updated_at = CURRENT_TIMESTAMP,
+                   lease_expires_at = CASE
+                       WHEN ? IN ('completed', 'failed', 'cancelled') THEN NULL
+                       ELSE lease_expires_at
+                   END
+                   WHERE id = ?
+                     AND status = 'running' AND worker_id = ? AND lease_generation = ?"""
+            else:
+                query = """UPDATE jobs SET status = ?, result_json = ?, error_message = ?,
+                   finished_at = ?, updated_at = CURRENT_TIMESTAMP,
+                   lease_expires_at = CASE
+                       WHEN ? IN ('completed', 'failed', 'cancelled') THEN NULL
+                       ELSE lease_expires_at
+                   END
+                   WHERE id = ?"""
+            updated = conn.execute(query, params).rowcount
             conn.commit()
 
+            if not updated:
+                return False
             if status == JobStatus.COMPLETED:
                 audit("job_completed", job_id=job_id)
             elif status == JobStatus.FAILED:
                 audit("job_failed", job_id=job_id, error=error)
             elif status == JobStatus.CANCELLED:
                 audit("job_cancelled", job_id=job_id)
+            return True
         finally:
             conn.close()
 
-    def pause_job(self, job_id: str) -> bool:
+    def pause_job(self, job_id: str, org_id: int | None = None) -> bool:
         """Pause a running job."""
         conn = self._get_conn()
         try:
+            self._bind_tenant(conn, org_id)
             job = conn.execute(
                 "SELECT status FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
@@ -283,10 +342,11 @@ class JobQueue:
         finally:
             conn.close()
 
-    def resume_job(self, job_id: str) -> bool:
+    def resume_job(self, job_id: str, org_id: int | None = None) -> bool:
         """Resume a paused job."""
         conn = self._get_conn()
         try:
+            self._bind_tenant(conn, org_id)
             job = conn.execute(
                 "SELECT status FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
@@ -301,15 +361,16 @@ class JobQueue:
             audit("job_resumed", job_id=job_id)
             executor = self._executors.get(job_id)
             if executor:
-                self.execute_job(job_id, executor)
+                self.execute_job(job_id, executor, org_id=org_id)
             return True
         finally:
             conn.close()
 
-    def cancel_job(self, job_id: str) -> bool:
+    def cancel_job(self, job_id: str, org_id: int | None = None) -> bool:
         """Cancel a job."""
         conn = self._get_conn()
         try:
+            self._bind_tenant(conn, org_id)
             job = conn.execute(
                 "SELECT status FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
@@ -331,12 +392,14 @@ class JobQueue:
 
     def list_jobs(
         self,
-        status: Optional[JobStatus] = None,
+        status: JobStatus | None = None,
         limit: int = 50,
+        org_id: int | None = None,
     ) -> list[JobResult]:
         """List jobs, optionally filtered by status."""
         conn = self._get_conn()
         try:
+            self._bind_tenant(conn, org_id)
             if status:
                 query = "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?"
                 rows = conn.execute(query, (status.value, limit)).fetchall()
@@ -364,6 +427,8 @@ class JobQueue:
         self,
         job_id: str,
         executor: Callable[[dict[str, Any], Callable[[float], None]], dict[str, Any]],
+        *,
+        org_id: int | None = None,
     ) -> None:
         """Execute a job in a thread pool (not daemon).
         
@@ -374,7 +439,7 @@ class JobQueue:
         self._executors[job_id] = executor
 
         def worker():
-            self.run_job(job_id, executor, worker_id=f"local-{threading.get_ident()}")
+            self.run_job(job_id, executor, worker_id=f"local-{threading.get_ident()}", org_id=org_id)
         # A bounded pool prevents an alert burst from creating one operating-
         # system thread per alert while preserving durable pending job rows.
         future = self._pool.submit(worker)
@@ -388,21 +453,30 @@ class JobQueue:
         executor: Callable[[dict[str, Any], Callable[[float], None]], dict[str, Any]],
         *,
         worker_id: str = "worker",
+        org_id: int | None = None,
     ) -> bool:
         """Atomically claim and execute one persisted job in the current process."""
         try:
             conn = self._get_conn()
             try:
+                self._bind_tenant(conn, org_id)
                 claimed = conn.execute(
                     """
                     UPDATE jobs
                     SET status = ?, started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
                         attempt_count = attempt_count + 1, worker_id = ?,
-                        lease_expires_at = datetime('now', '+5 minutes'), updated_at = CURRENT_TIMESTAMP
+                        lease_generation = lease_generation + 1,
+                        lease_expires_at = datetime('now', ?), updated_at = CURRENT_TIMESTAMP
                     WHERE id = ? AND status = ? AND cancel_requested = 0
                       AND attempt_count < max_attempts
                     """,
-                    (JobStatus.RUNNING.value, worker_id, job_id, JobStatus.PENDING.value),
+                    (
+                        JobStatus.RUNNING.value,
+                        worker_id,
+                        f"+{self.lease_seconds} seconds",
+                        job_id,
+                        JobStatus.PENDING.value,
+                    ),
                 ).rowcount
                 conn.commit()
             finally:
@@ -412,32 +486,90 @@ class JobQueue:
 
             conn = self._get_conn()
             try:
-                job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                self._bind_tenant(conn, org_id)
+                job = conn.execute(
+                    "SELECT * FROM jobs WHERE id = ? AND worker_id = ? AND status = 'running'",
+                    (job_id, worker_id),
+                ).fetchone()
                 if not job:
-                    self.update_job_status(job_id, JobStatus.FAILED, error="Job not found")
                     return False
                 alert = json.loads(job["alert_json"])
+                lease_generation = int(job["lease_generation"])
             finally:
                 conn.close()
 
+            heartbeat_stop = threading.Event()
+
+            def heartbeat() -> None:
+                # Lease renewal is independent of executor progress so a long
+                # platform call does not look like a dead worker.
+                interval = max(5.0, self.lease_seconds / 3)
+                while not heartbeat_stop.wait(interval):
+                    if not self.update_job_progress(
+                        job_id,
+                        self.get_job(job_id, org_id).progress,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        org_id=org_id,
+                    ):
+                        return
+
+            heartbeat_thread = threading.Thread(
+                target=heartbeat,
+                name=f"lease-{job_id[:8]}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
+
             def update_progress(progress: float):
                 if 0 <= progress <= 1.0:
-                    control = self.get_job(job_id).status
+                    control = self.get_job(job_id, org_id).status
                     if control == JobStatus.CANCELLED:
                         raise JobCancelled("Job cancellation requested")
                     if control == JobStatus.PAUSED:
                         raise JobPaused("Job pause requested")
-                    self.update_job_progress(job_id, progress)
+                    if not self.update_job_progress(
+                        job_id,
+                        progress,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        org_id=org_id,
+                    ):
+                        raise JobLeaseLost("Job lease is owned by a replacement worker")
 
-            result = executor(alert, update_progress)
-            self.update_job_status(job_id, JobStatus.COMPLETED, result=result)
-            return True
+            try:
+                result = executor(alert, update_progress)
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1)
+            updated = self.update_job_status(
+                job_id,
+                JobStatus.COMPLETED,
+                result=result,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                org_id=org_id,
+            )
+            if not updated:
+                audit("job_stale_completion_ignored", job_id=job_id, worker_id=worker_id)
+            return updated
         except JobPaused:
             audit("job_worker_paused", job_id=job_id)
+        except JobLeaseLost:
+            audit("job_worker_lease_lost", job_id=job_id, worker_id=worker_id)
         except JobCancelled:
-            self.update_job_status(job_id, JobStatus.CANCELLED, error="Cancelled by user")
-        except Exception as exc:
-            self.update_job_status(job_id, JobStatus.FAILED, error=str(exc)[:500])
+            audit("job_worker_cancelled", job_id=job_id, worker_id=worker_id)
+        # A job boundary must persist any executor failure instead of killing the worker.
+        except Exception as exc:  # noqa: BLE001
+            generation = locals().get("lease_generation")
+            self.update_job_status(
+                job_id,
+                JobStatus.FAILED,
+                error=str(exc)[:500],
+                worker_id=worker_id if generation is not None else None,
+                lease_generation=generation,
+                org_id=org_id,
+            )
         return False
 
     def _forget_worker(self, job_id: str) -> None:
@@ -450,10 +582,26 @@ class JobQueue:
             queued = sum(1 for future in self._workers.values() if not future.running() and not future.done())
         return {"max_workers": self.max_workers, "active": active, "queued": queued}
 
-    def recover_stale_jobs(self) -> int:
-        """Retry recoverable leases and fail jobs that exhausted their attempts."""
+    def recover_stale_jobs(
+        self,
+        dispatcher: Callable[[str], None] | None = None,
+        *,
+        org_id: int | None = None,
+    ) -> int:
+        """Retry expired leases and optionally redeliver them to the broker."""
         conn = self._get_conn()
         try:
+            self._bind_tenant(conn, org_id)
+            recoverable = [
+                str(row["id"])
+                for row in conn.execute(
+                    """
+                    SELECT id FROM jobs
+                    WHERE status = 'running' AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at < CURRENT_TIMESTAMP AND attempt_count < max_attempts
+                    """
+                ).fetchall()
+            ]
             recovered = conn.execute(
                 """
                 UPDATE jobs
@@ -477,16 +625,19 @@ class JobQueue:
         finally:
             conn.close()
         if recovered:
-            audit("stale_jobs_recovered", count=recovered)
+            audit("stale_jobs_recovered", count=recovered, job_ids=recoverable)
+            if dispatcher:
+                for recovered_job_id in recoverable:
+                    dispatcher(recovered_job_id)
         if exhausted:
             audit("stale_jobs_failed", count=exhausted)
         return int(recovered)
 
-    def wait_for_job(self, job_id: str, timeout: Optional[int] = None) -> JobResult:
+    def wait_for_job(self, job_id: str, timeout: int | None = None, *, org_id: int | None = None) -> JobResult:
         """Wait for a job to complete."""
         start_time = time.time()
         while True:
-            result = self.get_job(job_id)
+            result = self.get_job(job_id, org_id)
             if result.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
                 return result
 

@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Detection Lifecycle - AI SOC Operator{% endblock %}
+{% block content %}
+<div class="max-w-7xl mx-auto space-y-6" data-testid="detection-lifecycle">
+    <div>
+        <h1 class="text-2xl font-semibold">Detection Rule Lifecycle</h1>
+        <p class="text-sm text-gray-400 mt-1">Evidence-backed replay, staged observation, approval, drift, and rollback.</p>
+    </div>
+    <div class="grid grid-cols-2 lg:grid-cols-6 gap-3">
+        {% for label, rows in lifecycle.items() %}
+        <section class="border border-gray-800 bg-gray-900 rounded-lg p-4">
+            <div class="text-xs uppercase text-gray-500">{{ label|replace('_', ' ') }}</div>
+            <div class="text-2xl font-semibold mt-1">{{ rows|length }}</div>
+        </section>
+        {% endfor %}
+    </div>
+    <section class="border border-gray-800 bg-gray-900 rounded-lg overflow-hidden">
+        <div class="px-4 py-3 border-b border-gray-800"><h2 class="font-medium">Recent deployments</h2></div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead class="text-left text-gray-400 bg-gray-950"><tr><th class="p-3">ID</th><th class="p-3">Mode</th><th class="p-3">Status</th><th class="p-3">Artifact</th><th class="p-3">Created</th></tr></thead>
+                <tbody>
+                {% for row in lifecycle.deployments %}
+                    <tr class="border-t border-gray-800"><td class="p-3">{{ row.id }}</td><td class="p-3">{{ row.mode }}</td><td class="p-3">{{ row.status }}</td><td class="p-3 font-mono text-xs">{{ row.artifact_digest[:12] }}</td><td class="p-3">{{ row.created_at }}</td></tr>
+                {% else %}
+                    <tr><td colspan="5" class="p-6 text-center text-gray-500">No staged deployments yet.</td></tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+    <div class="text-xs text-gray-500">Production and rollback records are previews only until an approved platform adapter is configured.</div>
+</div>
+{% endblock %}

@@ -70,7 +70,7 @@ services:
 
   postgres:
     profiles: ["scaleout"]
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${AI_SOC_POSTGRES_DB:-ai_soc_operator}
@@ -86,7 +86,7 @@ services:
 
   redis:
     profiles: ["scaleout"]
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:

@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -14,12 +14,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 soc && useradd --system --uid 10001 --gid soc --home /app soc
-COPY requirements.txt ./
+COPY requirements.lock ./
 # pip remains available for approved, isolated capability installs. Pin the
 # latest release before pip began bundling a vulnerable vendor SBOM, while
 # keeping the installed application libraries and setuptools fully patched.
-RUN python -m pip install --upgrade "pip==26.1.1" "setuptools>=78.1.1" \
-    && python -m pip install --upgrade -r requirements.txt
+RUN python -m pip install --upgrade "pip==26.1.1" "setuptools==84.2.0" \
+    && python -m pip install --require-hashes -r requirements.lock
 COPY --chown=soc:soc . .
 RUN mkdir -p data audit evidence reports/generated backups && chown -R soc:soc data audit evidence reports backups
 

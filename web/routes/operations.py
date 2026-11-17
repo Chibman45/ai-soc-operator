@@ -289,7 +289,7 @@ def control_job(job_id: str, action: str):
     handler = controls.get(action)
     if not handler:
         return jsonify({"error": "unsupported job action"}), 400
-    changed = handler(job_id)
+    changed = handler(job_id, org_id)
     return jsonify({"ok": changed, "job_id": job_id, "action": action}), (200 if changed else 409)
 
 

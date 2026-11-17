@@ -14,21 +14,33 @@ from web.services.database import connect_database, runtime_queue_settings
 DB_PATH = ROOT / "data" / "soc_operator.db"
 
 
+def _bind_tenant(conn, org_id: int) -> None:
+    if hasattr(conn, "set_tenant_context"):
+        conn.set_tenant_context(org_id)
+
+
 def execute_persisted_playbook_job(
     job_id: str,
     alert: dict[str, Any],
     progress_cb: Callable[[float], None],
+    org_id: int | None = None,
 ) -> dict[str, Any]:
     """Rebuild execution context from durable rows instead of request closures."""
     from web.app import _execute_run_job, load_config_for_web
     from web.services.alert_ingest import _create_run_for_ingested_alert
 
     conn = connect_database(DB_PATH)
+    if org_id is not None:
+        _bind_tenant(conn, org_id)
     job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if not job:
         conn.close()
         raise ValueError("persisted job does not exist")
-    org_id = int(job["org_id"])
+    stored_org_id = int(job["org_id"])
+    if org_id is not None and stored_org_id != int(org_id):
+        conn.close()
+        raise PermissionError("job organization does not match dispatched tenant")
+    org_id = stored_org_id
     run_id = int(job["run_id"] or 0)
     alert_row = None
     if not run_id:
@@ -57,12 +69,14 @@ def execute_persisted_playbook_job(
     except Exception:
         if alert_row:
             conn = connect_database(DB_PATH)
+            _bind_tenant(conn, org_id)
             conn.execute("UPDATE alerts SET status = 'failed' WHERE id = ? AND org_id = ?", (alert_row["id"], org_id))
             conn.commit()
             conn.close()
         raise
     if alert_row:
         conn = connect_database(DB_PATH)
+        _bind_tenant(conn, org_id)
         case = conn.execute(
             "SELECT id FROM cases WHERE run_id = ? AND org_id = ? ORDER BY id DESC LIMIT 1", (run_id, org_id)
         ).fetchone()
@@ -81,15 +95,16 @@ def execute_persisted_playbook_job(
     return result
 
 
-def dispatch_playbook_job(job_queue: JobQueue, job_id: str) -> str:
+def dispatch_playbook_job(job_queue: JobQueue, job_id: str, org_id: int) -> str:
     """Send to Celery when configured, otherwise use the bounded local pool."""
     if runtime_queue_settings():
         from scripts.celery_app import celery_app
 
-        celery_app.send_task("ai_soc.execute_playbook_job", args=[job_id], task_id=f"playbook-{job_id}")
+        celery_app.send_task("ai_soc.execute_playbook_job", args=[job_id, org_id], task_id=f"playbook-{job_id}")
         return "celery"
     job_queue.execute_job(
         job_id,
-        lambda alert, progress: execute_persisted_playbook_job(job_id, alert, progress),
+        lambda alert, progress: execute_persisted_playbook_job(job_id, alert, progress, org_id),
+        org_id=org_id,
     )
     return "local"

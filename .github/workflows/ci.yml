@@ -8,35 +8,54 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r requirements.txt -r requirements-dev.txt pip-audit bandit
+          cache-dependency-path: requirements-ci.lock
+      - name: Install the hash-locked CI environment
+        run: python -m pip install --require-hashes -r requirements-ci.lock
+      - name: Reject stale dependency locks
+        if: matrix.python-version == '3.12'
+        run: |
+          # Seed uv with the reviewed versions so index churn alone cannot fail CI.
+          cp requirements.lock /tmp/requirements.lock
+          cp requirements-ci.lock /tmp/requirements-ci.lock
+          uv pip compile requirements.txt --python-version 3.10 --universal --generate-hashes --no-header --output-file /tmp/requirements.lock
+          uv pip compile requirements.txt requirements-dev.txt --python-version 3.10 --universal --generate-hashes --no-header --output-file /tmp/requirements-ci.lock
+          diff -u requirements.lock /tmp/requirements.lock
+          diff -u requirements-ci.lock /tmp/requirements-ci.lock
+      - run: python -m pip check
       - run: python -m compileall scripts tests web
       - run: python -m pytest tests -q --cov=scripts --cov=web --cov-report=term-missing
       - run: python -m bandit -q -ll -r scripts web -x tests
-      - run: python -m pip_audit -r requirements.txt
+      - run: python -m pip_audit -r requirements.lock
 
   container:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           load: true
+          pull: true
           tags: ai-soc-operator:${{ github.sha }}
       - name: Smoke-test the runtime image
         run: |
@@ -45,7 +64,7 @@ jobs:
           docker run --rm ai-soc-operator:${{ github.sha }} \
             python -c "import flask, gunicorn, requests, web.app"
           docker run --rm ai-soc-operator:${{ github.sha }} python -m pip --version
-      - uses: aquasecurity/trivy-action@v0.36.0
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ai-soc-operator:${{ github.sha }}
           # Release qualification must inspect the current image digest without
@@ -57,16 +76,17 @@ jobs:
 
   linux-compatibility:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - id: ubuntu-22.04
-            image: ubuntu:22.04
+            image: ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
           - id: ubuntu-24.04
-            image: ubuntu:24.04
+            image: ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
           - id: debian-12
-            image: debian:12
+            image: debian:12@sha256:854dd8ab51d62866dbd8f5431d15ce77b12983a2a4a1e1fe43a2395dc7ef9f61
           - id: kali-rolling
             image: kalilinux/kali-rolling@sha256:4be87f78671419c13dcf4f207ead1cfc0de178ea281b3f69c0f49b69ba4e79b1
     container:
@@ -76,12 +96,11 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y git python3 python3-venv python3-pip tesseract-ocr poppler-utils nginx openssl nodejs npm ca-certificates curl
-      - uses: actions/checkout@v4
-      - name: Install Codex CLI and Python dependencies
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Codex CLI and locked Python dependencies
         run: |
           python3 -m venv .venv
-          .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+          .venv/bin/python -m pip install --require-hashes -r requirements-ci.lock
           .venv/bin/python -c "import bootstrap, sys; sys.exit(0 if bootstrap.install_codex_cli() else 1)"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Verify distribution and mandatory runtime
@@ -101,10 +120,11 @@ jobs:
 
   secrets:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

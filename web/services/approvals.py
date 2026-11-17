@@ -61,6 +61,7 @@ def _describe_actions(actions: list[dict[str, Any]]) -> str:
 def make_approval_handler(
     run_id: int,
     *,
+    org_id: int,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> Callable[[dict[str, Any], list[dict[str, Any]], dict[str, Any]], dict[str, Any]]:
     """Build an ``approval_handler(step, actions, context)`` for ``PlaybookRunner``.
@@ -81,12 +82,14 @@ def make_approval_handler(
 
         conn = get_db()
         try:
+            if hasattr(conn, "set_tenant_context"):
+                conn.set_tenant_context(org_id)
             init_chat_db(conn)
-            run = conn.execute("SELECT org_id, requested_by FROM runs WHERE id = ?", (run_id,)).fetchone()
+            run = conn.execute("SELECT org_id, requested_by FROM runs WHERE id = ? AND org_id = ?", (run_id, org_id)).fetchone()
             if not run or run["org_id"] is None:
                 raise RuntimeError("Run has no organization context for approval")
-            org_id = int(run["org_id"])
-            thread_id = _get_global_thread(conn, org_id, run["requested_by"])
+            run_org_id = int(run["org_id"])
+            thread_id = _get_global_thread(conn, run_org_id, run["requested_by"])
 
             step_id = step.get("id", "approval")
             prompt = (
@@ -134,7 +137,7 @@ def make_approval_handler(
                         {"run_id": run_id, "step_id": step_id, "actions": actions}
                     ),
                     run["requested_by"],
-                    org_id,
+                    run_org_id,
                 ),
             )
             action_id = int(cursor.lastrowid)

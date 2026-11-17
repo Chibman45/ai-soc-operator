@@ -9,15 +9,17 @@ deployment use cases, see [About](About.md).
 
 ## Release Status
 
-Application hardening Phases 0-10 now have a single-node implementation baseline. This
+Application hardening Phases 0-10 now have a tested implementation baseline. This
 includes organization-scoped RBAC, authenticated SIEM ingestion, the live alert
 queue, SLA metrics, encrypted credentials, durable local jobs, approval-gated
 responder approvals, and controlled self-learning drafts and publication.
 
-Phase 8 notification/intel delivery, Phase 9 container/operations controls, and
-Phase 10 CI release assurance are implemented, but production approval still
-depends on environment evidence. SQLite remains the default; PostgreSQL and
-Redis/Celery are available through a verified, restart-gated scale-out path.
+Phases 5-10 add Chromium acceptance, signed staging and operational evidence,
+the detection-rule lifecycle, PostgreSQL tenant enforcement, worker fencing,
+credential rotation, tamper-evident audit storage, and digest-qualified release
+automation. Production approval still depends on live environment evidence.
+SQLite remains the default; PostgreSQL and Redis/Celery are available through a
+restart-gated scale-out path.
 See [the production roadmap](docs/PRODUCTION_ROADMAP.md), [operations runbook](docs/OPERATIONS_RUNBOOK.md), and
 [security policy](SECURITY.md) before deploying beyond a controlled environment.
 
@@ -33,9 +35,11 @@ analyst establishes ground truth.
 
 Download the organization input template from the Detection Assurance page,
 complete it without credentials or other secrets, and upload it to create a
-review draft. Recommendations can advance only to `approved_for_replay` in this
-release. Replay, shadow, canary, production change, and rollback execution are
-reserved for a later evidence-attaching subsystem.
+review draft. Recommendations can advance into sealed replay corpora and
+versioned rule artifacts. Replay metrics, shadow and canary observations, drift
+windows, independent approval, and rollback previews are available in
+**Detection Rule Lifecycle**. Production rule writes remain disabled until an
+approved live adapter is configured for the organization.
 
 ### Source-linked platform knowledge
 

@@ -745,11 +745,11 @@ def init_feature_db(conn) -> None:
     # Seed default roles if empty
     import json
     default_roles = [
-        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "user.manage", "policy.manage", "policy.approve", "playbook.manage", "learning.review", "api_client.manage", "sla.view", "notification.manage", "capability.propose", "capability.approve", "capability.execute", "infrastructure.manage", "assurance.view", "assurance.label", "assurance.manage", "architecture.manage", "architecture.approve"]),
-        ("manager", ["chat.read", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "sla.view", "learning.review", "notification.manage", "capability.approve", "assurance.view", "assurance.label", "assurance.manage", "architecture.approve"]),
-        ("senior_analyst", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "tool.execute", "responder.approve", "learning.review", "sla.view", "capability.propose", "assurance.view", "assurance.label", "assurance.manage"]),
-        ("analyst", ["chat.read", "chat.act", "case.update", "alert.ingest", "report.export", "assurance.view", "assurance.label"]),
-        ("read_only", ["chat.read", "report.export", "assurance.view"]),
+        ("admin", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "credential.manage", "alert.ingest", "report.export", "tool.execute", "responder.approve", "responder.execute", "role.manage", "user.manage", "policy.manage", "policy.approve", "playbook.manage", "learning.review", "api_client.manage", "sla.view", "notification.manage", "capability.propose", "capability.approve", "capability.execute", "infrastructure.manage", "assurance.view", "assurance.label", "assurance.manage", "architecture.manage", "architecture.approve", "detection.view", "detection.manage", "detection.approve"]),
+        ("manager", ["chat.read", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "sla.view", "learning.review", "notification.manage", "capability.approve", "assurance.view", "assurance.label", "assurance.manage", "architecture.approve", "detection.view", "detection.approve"]),
+        ("senior_analyst", ["chat.read", "chat.act", "case.assign", "case.update", "case.close", "alert.ingest", "report.export", "tool.execute", "responder.approve", "learning.review", "sla.view", "capability.propose", "assurance.view", "assurance.label", "assurance.manage", "detection.view", "detection.manage", "detection.approve"]),
+        ("analyst", ["chat.read", "chat.act", "case.update", "alert.ingest", "report.export", "assurance.view", "assurance.label", "detection.view"]),
+        ("read_only", ["chat.read", "report.export", "assurance.view", "detection.view"]),
     ]
     for name, perms in default_roles:
         conn.execute(

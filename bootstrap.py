@@ -194,16 +194,19 @@ def create_venv() -> Path | None:
 
 
 def install_python_deps() -> bool:
+    locked = ROOT / "requirements-ci.lock"
     req = ROOT / "requirements.txt"
     if not req.is_file():
         error("requirements.txt not found")
         return False
-    requirements = ["-r", str(req)]
-    dev_req = ROOT / "requirements-dev.txt"
-    if dev_req.is_file():
-        # Bootstrap runs the repository test suite as a completion gate, so its
-        # test runner is part of a complete local installation.
-        requirements.extend(["-r", str(dev_req)])
+    if locked.is_file():
+        # Bootstrap runs tests, so the signed release input includes runtime and verification tools.
+        requirements = ["--require-hashes", "-r", str(locked)]
+    else:
+        requirements = ["-r", str(req)]
+        dev_req = ROOT / "requirements-dev.txt"
+        if dev_req.is_file():
+            requirements.extend(["-r", str(dev_req)])
     python_bin = VENV_PYTHON or sys.executable
     result = subprocess.run(
         [str(python_bin), "-m", "pip", "install", "-q", *requirements],

@@ -207,6 +207,8 @@ def init_db() -> None:
     try:
         from web.services.schema_features import init_feature_db
         init_feature_db(conn)
+        from web.services.detection_lifecycle import init_detection_lifecycle_db
+        init_detection_lifecycle_db(conn)
         from web.services.credential_vault import migrate_plaintext_credentials
         migrated = migrate_plaintext_credentials(conn)
         if migrated:
@@ -332,6 +334,8 @@ def save_platform_settings(conn: sqlite3.Connection, form: Any, org_id: int) -> 
 def build_platforms_toml(org_id: int | None = None) -> str:
     conn = get_db()
     org_id = org_id or current_org_id(conn)
+    if org_id is not None and hasattr(conn, "set_tenant_context"):
+        conn.set_tenant_context(int(org_id))
     from web.services.ai_provider import provider_config
 
     ai_config = provider_config(conn, int(org_id))
@@ -750,7 +754,7 @@ def run_agent():
     learn_alert(alert, source="manual_run", playbook=playbook, org_id=int(org_id))
     from web.services.playbook_jobs import dispatch_playbook_job
 
-    dispatch_playbook_job(job_queue, job_id)
+    dispatch_playbook_job(job_queue, job_id, int(org_id))
 
     return jsonify({"run_id": run_id, "job_id": job_id, "status": "queued"})
 
@@ -798,6 +802,8 @@ def _execute_run_job(
 
     progress_cb(0.05)
     conn = get_db()
+    if hasattr(conn, "set_tenant_context"):
+        conn.set_tenant_context(org_id)
     try:
         credentials = {
             row["key_name"]: open_secret(row["key_value"])
@@ -829,7 +835,7 @@ def _execute_run_job(
             progress_cb(0.35)
             from web.services.approvals import make_approval_handler
 
-            approval_handler = make_approval_handler(run_id)
+            approval_handler = make_approval_handler(run_id, org_id=org_id)
             result = execute_playbook(
                 playbook_path, alert, clients, session_obj,
                 approval_handler=approval_handler,
@@ -1468,6 +1474,7 @@ from web.routes.admin import admin_bp
 from web.routes.ai_provider import ai_provider_bp
 from web.routes.assurance import assurance_bp
 from web.routes.documents import documents_bp
+from web.routes.detection_lifecycle import detection_lifecycle_bp
 
 app.register_blueprint(chat_bp)
 app.register_blueprint(webhooks_bp)
@@ -1478,6 +1485,7 @@ app.register_blueprint(admin_bp)
 app.register_blueprint(ai_provider_bp)
 app.register_blueprint(assurance_bp)
 app.register_blueprint(documents_bp)
+app.register_blueprint(detection_lifecycle_bp)
 
 # WSGI imports must initialize the schema too; production servers do not execute __main__.
 init_db()

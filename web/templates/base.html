@@ -51,6 +51,11 @@
                     ✓ Detection Assurance
                 </a>
                 {% endif %}
+                {% if can('detection.view') %}
+                <a href="{{ url_for('detection_lifecycle.lifecycle_page') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.blueprint == 'detection_lifecycle' %}bg-gray-800 text-blue-400{% endif %}">
+                    Detection Lifecycle
+                </a>
+                {% endif %}
                 {% if can('credential.manage') %}
                 <a href="{{ url_for('credentials') }}" class="block px-3 py-2 rounded-lg text-sm hover:bg-gray-800 {% if request.endpoint == 'credentials' %}bg-gray-800 text-blue-400{% endif %}">
                     🔑 Credentials

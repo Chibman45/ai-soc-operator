@@ -20,10 +20,11 @@ celery_app.conf.update(task_acks_late=True, worker_prefetch_multiplier=1, task_r
 
 
 @celery_app.task(name="ai_soc.execute_playbook_job", bind=True)
-def execute_playbook_job(self, job_id: str) -> bool:
+def execute_playbook_job(self, job_id: str, org_id: int) -> bool:
     queue = JobQueue(ROOT / "data" / "soc_operator.db")
     return queue.run_job(
         job_id,
-        lambda alert, progress: execute_persisted_playbook_job(job_id, alert, progress),
+        lambda alert, progress: execute_persisted_playbook_job(job_id, alert, progress, org_id),
         worker_id=f"celery-{self.request.id}",
+        org_id=org_id,
     )
