@@ -107,7 +107,7 @@ jobs:
           # Ubuntu 22.04's system Python cannot install the patched Pillow 13.
           uv python install 3.12
           uv venv --python 3.12 .venv
-          .venv/bin/python -m pip install --require-hashes -r requirements-ci.lock
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-ci.lock
           .venv/bin/python -c "import bootstrap, sys; sys.exit(0 if bootstrap.install_codex_cli() else 1)"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Verify distribution and mandatory runtime
