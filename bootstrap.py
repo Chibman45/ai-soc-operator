@@ -125,8 +125,12 @@ def print_manual_sudo(command: list[str]) -> None:
 def check_python() -> bool:
     header("Step 1/9 — System Requirements")
     major, minor = sys.version_info[:2]
-    if major < 3 or (major == 3 and minor < 10):
-        error(f"Python {major}.{minor} detected. Python 3.10+ required.")
+    if major < 3 or (major == 3 and minor < 11):
+        error(
+            f"Python {major}.{minor} detected. Python 3.11+ is required because "
+            "the patched Pillow 13 document decoder no longer supports Python 3.10. "
+            "On Ubuntu 22.04 use the Docker deployment or install Python 3.11+."
+        )
         return False
     status(f"Python {major}.{minor}.{sys.version_info[2]}")
     return True

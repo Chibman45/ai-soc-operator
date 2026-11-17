@@ -35,8 +35,8 @@ jobs:
           # Preserve reviewed transitive versions while checking source compatibility.
           cp requirements.lock /tmp/requirements.lock
           cp requirements-ci.lock /tmp/requirements-ci.lock
-          uv pip compile requirements.txt --python-version 3.10 --universal --generate-hashes --no-header --output-file /tmp/requirements.lock
-          uv pip compile requirements.txt requirements-dev.txt --python-version 3.10 --universal --generate-hashes --no-header --output-file /tmp/requirements-ci.lock
+          uv pip compile requirements.txt --python-version 3.11 --universal --generate-hashes --no-header --output-file /tmp/requirements.lock
+          uv pip compile requirements.txt requirements-dev.txt --python-version 3.11 --universal --generate-hashes --no-header --output-file /tmp/requirements-ci.lock
           diff -u requirements.lock /tmp/requirements.lock
           diff -u requirements-ci.lock /tmp/requirements-ci.lock
       - run: python -m pip check

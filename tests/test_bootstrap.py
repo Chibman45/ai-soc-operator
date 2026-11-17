@@ -36,7 +36,7 @@ from bootstrap import (
 
 class SystemCheckTests(unittest.TestCase):
     def test_check_python_passes(self):
-        # We're running Python 3.10+
+        # The supported runtime is Python 3.11+.
         self.assertTrue(check_python())
 
     def test_check_dependencies(self):

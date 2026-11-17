@@ -87,8 +87,9 @@ Open the URL, log in with the credentials you created during bootstrap, and conf
 ## Complete Linux Setup
 
 Use Ubuntu 22.04, Ubuntu 24.04, Debian 12, or the tested Kali rolling snapshot
-with Python 3.10+, outbound HTTPS, and an OS account permitted to install the
-approved prerequisites. Do not run the application as root. See the exact
+with Python 3.11+, outbound HTTPS, and an OS account permitted to install the
+approved prerequisites. Ubuntu 22.04 uses the pinned Docker runtime unless a
+Python 3.11+ runtime is installed. Do not run the application as root. See the exact
 [Linux support and validation contract](docs/LINUX_SUPPORT.md).
 
 1. Clone the repository and enter it:
@@ -491,7 +492,7 @@ python3 -m compileall scripts/ tests/ web/
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+ (Ubuntu 22.04 is supported through the pinned Docker runtime)
 - Linux (Kali, Ubuntu, Debian) or macOS
 - Internet access for threat intel platforms (optional — platform steps degrade gracefully if not configured)
 

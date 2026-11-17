@@ -4,7 +4,7 @@
 
 | Distribution | Supported release | CI image |
 |---|---|---|
-| Ubuntu | 22.04 LTS | `ubuntu:22.04` |
+| Ubuntu | 22.04 LTS (Docker, or Python 3.11+ installed) | `ubuntu:22.04` |
 | Ubuntu | 24.04 LTS | `ubuntu:24.04` |
 | Debian | 12 | `debian:12` |
 | Kali Linux | current rolling snapshot | Digest in `config/linux-support.toml` |
@@ -15,7 +15,10 @@ unsupported Linux release.
 
 ## Bootstrap prerequisites
 
-`python3 bootstrap.py` detects existing commands before installing packages.
+`python3 bootstrap.py` requires Python 3.11+ and detects existing commands before installing packages.
+Ubuntu 22.04's default Python 3.10 cannot use the patched Pillow 13 decoder, so
+that host must use the pinned Docker deployment or an administrator-provided
+Python 3.11+ runtime; the bootstrap fails closed on older interpreters.
 On a supported Linux host it installs only missing mandatory runtime packages:
 Python and venv support, Tesseract, Poppler, Nginx, OpenSSL, Node.js/npm, CA
 certificates, and curl. Python packages include Gunicorn and the bounded OCR
